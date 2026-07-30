@@ -1,0 +1,143 @@
+name: 'Validate Jira Issues'
+description: 'Validates that Jira issues referenced in a PR meet post-codefreeze criteria'
+
+inputs:
+  pr_body:
+    description: 'Pull request body/description text'
+    required: true
+  jira_version:
+    description: 'Expected Jira version string (e.g., "2.6 GA RHOAI RELEASE")'
+    required: true
+  jira_base_url:
+    description: 'Jira instance base URL'
+    required: true
+  jira_user_email:
+    description: 'Email for Jira REST API Basic Auth'
+    required: true
+  jira_api_token:
+    description: 'API token for Jira REST API Basic Auth'
+    required: true
+  release_blocker_field_id:
+    description: 'Custom field ID for "Release Blocker" (e.g., customfield_12345)'
+    required: true
+  target_version_field_id:
+    description: 'Custom field ID for "Target Version" (e.g., customfield_67890)'
+    required: true
+
+outputs:
+  pass:
+    description: '"true" if all checks passed, "false" otherwise'
+    value: ${{ steps.validate.outputs.pass }}
+  errors:
+    description: 'Multiline markdown of all validation failures'
+    value: ${{ steps.validate.outputs.errors }}
+  details:
+    description: 'Multiline markdown of passed checks'
+    value: ${{ steps.validate.outputs.details }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: Validate Jira issues
+      id: validate
+      shell: bash
+      env:
+        PR_BODY: ${{ inputs.pr_body }}
+        JIRA_VERSION: ${{ inputs.jira_version }}
+        JIRA_BASE_URL: ${{ inputs.jira_base_url }}
+        JIRA_USER: ${{ inputs.jira_user_email }}
+        JIRA_TOKEN: ${{ inputs.jira_api_token }}
+        RELEASE_BLOCKER_FIELD: ${{ inputs.release_blocker_field_id }}
+        TARGET_VERSION_FIELD: ${{ inputs.target_version_field_id }}
+      run: |
+        set +e
+
+        ERRORS=""
+        DETAILS=""
+        OVERALL_PASS=true
+
+        KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG)-[0-9]+' | sort -u || true)
+
+        if [ -z "$KEYS" ]; then
+          ERRORS="- **No Jira issue found** in PR description. Expected format: \`RHOAIENG-1234\` or \`RHAIENG-1234\`"
+          OVERALL_PASS=false
+        else
+          while IFS= read -r KEY; do
+            [ -z "$KEY" ] && continue
+            ISSUE_ERRORS=""
+
+            TMPFILE=$(mktemp)
+            HTTP_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" \
+              -u "${JIRA_USER}:${JIRA_TOKEN}" \
+              -H "Content-Type: application/json" \
+              "${JIRA_BASE_URL}/rest/api/2/issue/${KEY}?fields=fixVersions,${RELEASE_BLOCKER_FIELD},${TARGET_VERSION_FIELD},project")
+
+            if [ "$HTTP_CODE" != "200" ]; then
+              ISSUE_ERRORS="  - Could not fetch issue (HTTP ${HTTP_CODE}). Issue may not exist or Jira may be unreachable."
+              OVERALL_PASS=false
+              ERRORS="${ERRORS}
+        - **${KEY}**:
+        ${ISSUE_ERRORS}"
+              rm -f "$TMPFILE"
+              continue
+            fi
+
+            PROJECT_KEY=$(jq -r '.fields.project.key // "unknown"' "$TMPFILE")
+            if [[ "$PROJECT_KEY" != "RHOAIENG" && "$PROJECT_KEY" != "RHAIENG" ]]; then
+              ISSUE_ERRORS="${ISSUE_ERRORS}
+          - Project is \`${PROJECT_KEY}\`, expected \`RHOAIENG\` or \`RHAIENG\`"
+              OVERALL_PASS=false
+            fi
+
+            FIX_VERSIONS=$(jq -r '[.fields.fixVersions[]?.name // empty] | join(", ")' "$TMPFILE")
+            FIX_VERSION_MATCH=$(jq -r --arg v "$JIRA_VERSION" \
+              '[.fields.fixVersions[]?.name // empty] | any(. == $v)' "$TMPFILE")
+            if [ "$FIX_VERSION_MATCH" != "true" ]; then
+              ISSUE_ERRORS="${ISSUE_ERRORS}
+          - fixVersion does not include \`${JIRA_VERSION}\` (found: ${FIX_VERSIONS:-none})"
+              OVERALL_PASS=false
+            fi
+
+            TARGET_VERSIONS=$(jq -r --arg f "$TARGET_VERSION_FIELD" \
+              '(if (.fields[$f] | type) == "array" then [.fields[$f][]?.name // empty] elif (.fields[$f] | type) == "object" then [.fields[$f].name // .fields[$f].value // empty] else [.fields[$f] // empty] end) | join(", ")' "$TMPFILE" 2>/dev/null || echo "")
+            TARGET_MATCH=$(jq -r --arg f "$TARGET_VERSION_FIELD" --arg v "$JIRA_VERSION" \
+              '(if (.fields[$f] | type) == "array" then [.fields[$f][]?.name // empty] elif (.fields[$f] | type) == "object" then [.fields[$f].name // .fields[$f].value // empty] else [.fields[$f] // empty] end) | any(. == $v)' "$TMPFILE" 2>/dev/null || echo "false")
+            if [ "$TARGET_MATCH" != "true" ]; then
+              ISSUE_ERRORS="${ISSUE_ERRORS}
+          - Target Version does not include \`${JIRA_VERSION}\` (found: ${TARGET_VERSIONS:-none})"
+              OVERALL_PASS=false
+            fi
+
+            BLOCKER_VALUE=$(jq -r --arg f "$RELEASE_BLOCKER_FIELD" \
+              '(.fields[$f].value // .fields[$f] // "not set") | tostring' "$TMPFILE" 2>/dev/null || echo "not set")
+            if [ "$BLOCKER_VALUE" != "Approved" ]; then
+              ISSUE_ERRORS="${ISSUE_ERRORS}
+          - Release Blocker is \`${BLOCKER_VALUE}\`, expected \`Approved\`"
+              OVERALL_PASS=false
+            fi
+
+            if [ -n "$ISSUE_ERRORS" ]; then
+              ERRORS="${ERRORS}
+        - **${KEY}**:${ISSUE_ERRORS}"
+            else
+              DETAILS="${DETAILS}
+        - **${KEY}**: All checks passed"
+            fi
+
+            rm -f "$TMPFILE"
+          done <<< "$KEYS"
+        fi
+
+        echo "pass=${OVERALL_PASS}" >> "$GITHUB_OUTPUT"
+
+        {
+          echo 'errors<<GATE_DELIM'
+          echo "$ERRORS"
+          echo 'GATE_DELIM'
+        } >> "$GITHUB_OUTPUT"
+
+        {
+          echo 'details<<GATE_DELIM'
+          echo "$DETAILS"
+          echo 'GATE_DELIM'
+        } >> "$GITHUB_OUTPUT"
