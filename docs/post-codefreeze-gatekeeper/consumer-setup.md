@@ -10,7 +10,7 @@ This guide explains how to adopt the post-codefreeze gatekeeper in your reposito
 
 ## Step 1: Add the Caller Workflow
 
-Copy [`caller-gate.yml.example`](caller-gate.yml.example) to `.github/workflows/post-codefreeze-gate.yml` in your repo.
+Copy [`caller-gate.yml.example`](post-codefreeze-gatekeeper.yaml.example) to `.github/workflows/post-codefreeze-gate.yml` in your repo.
 
 No configuration needed — all defaults (Jira field IDs, base URL) are baked into the central reusable workflow. The caller is a thin boilerplate that just invokes the central workflow.
 
