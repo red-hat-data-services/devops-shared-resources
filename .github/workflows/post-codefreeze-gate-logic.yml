@@ -36,42 +36,16 @@ jobs:
           ref: gatekeeper
           path: shared-resources
 
-      - name: Resolve PR context
-        id: pr-context
+      - name: Remove re-run label
+        if: github.event.action == 'labeled' && github.event.label.name == 'run-gatekeeper'
         env:
           GH_TOKEN: ${{ github.token }}
-          EVENT_NAME: ${{ github.event_name }}
-          PR_NUMBER_COMMENT: ${{ github.event.issue.number }}
-          PR_NUMBER_PR: ${{ github.event.pull_request.number }}
-          PR_BASE_REF_PR: ${{ github.event.pull_request.base.ref }}
-          PR_BODY_PR: ${{ github.event.pull_request.body }}
-          REPO: ${{ github.repository }}
-        run: |
-          if [ "$EVENT_NAME" = "issue_comment" ]; then
-            PR_NUMBER="$PR_NUMBER_COMMENT"
-            PR_JSON=$(gh pr view "$PR_NUMBER" --repo "$REPO" --json baseRefName,body,headRefOid)
-            PR_BASE_REF=$(echo "$PR_JSON" | jq -r '.baseRefName')
-            PR_BODY=$(echo "$PR_JSON" | jq -r '.body // ""')
-            HEAD_SHA=$(echo "$PR_JSON" | jq -r '.headRefOid')
-          else
-            PR_NUMBER="$PR_NUMBER_PR"
-            PR_BASE_REF="$PR_BASE_REF_PR"
-            PR_BODY="$PR_BODY_PR"
-            HEAD_SHA=""
-          fi
-          echo "pr_number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
-          echo "pr_base_ref=$PR_BASE_REF" >> "$GITHUB_OUTPUT"
-          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
-          {
-            echo "pr_body<<PREOF"
-            echo "$PR_BODY"
-            echo "PREOF"
-          } >> "$GITHUB_OUTPUT"
+        run: gh pr edit "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --remove-label run-gatekeeper
 
       - name: Validate branch and derive Jira version
         id: branch-info
         run: |
-          BRANCH="${{ steps.pr-context.outputs.pr_base_ref }}"
+          BRANCH="${{ github.event.pull_request.base.ref }}"
           if [[ "$BRANCH" =~ ^rhoai-([0-9])\.([0-9])$ ]]; then
             MAJOR="${BASH_REMATCH[1]}"
             MINOR="${BASH_REMATCH[2]}"
@@ -94,7 +68,7 @@ jobs:
         if: steps.branch-info.outputs.skip != 'true'
         id: extract-jira
         env:
-          PR_BODY: ${{ steps.pr-context.outputs.pr_body }}
+          PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG)-[0-9]+' | sort -u || true)
           if [ -z "$KEYS" ]; then
@@ -112,7 +86,7 @@ jobs:
         id: validate
         uses: ./shared-resources/.github/actions/validate-jira-issues
         with:
-          pr_body: ${{ steps.pr-context.outputs.pr_body }}
+          pr_body: ${{ github.event.pull_request.body }}
           jira_version: ${{ steps.branch-info.outputs.jira_version }}
           jira_base_url: ${{ inputs.jira_base_url || 'https://redhat.atlassian.net' }}
           jira_user_email: ${{ secrets.JIRA_USER_EMAIL }}
@@ -125,7 +99,7 @@ jobs:
         uses: peter-evans/find-comment@v3
         id: find-comment
         with:
-          issue-number: ${{ steps.pr-context.outputs.pr_number }}
+          issue-number: ${{ github.event.pull_request.number }}
           body-includes: '<!-- post-codefreeze-gatekeeper -->'
 
       - name: Post gate result comment
@@ -133,13 +107,13 @@ jobs:
         uses: peter-evans/create-or-update-comment@v5
         with:
           comment-id: ${{ steps.find-comment.outputs.comment-id }}
-          issue-number: ${{ steps.pr-context.outputs.pr_number }}
+          issue-number: ${{ github.event.pull_request.number }}
           edit-mode: replace
           body: |
             <!-- post-codefreeze-gatekeeper -->
             ## Post-Codefreeze Gatekeeper ${{ steps.validate.outputs.pass == 'true' && '— PASSED' || '— FAILED' }}
 
-            **Target branch:** `${{ steps.pr-context.outputs.pr_base_ref }}`
+            **Target branch:** `${{ github.event.pull_request.base.ref }}`
             **Required Jira version:** `${{ steps.branch-info.outputs.jira_version }}`
 
             ${{ steps.validate.outputs.pass == 'true' && '✅ All checks passed.' || '❌ The following issues were found:' }}
@@ -148,7 +122,7 @@ jobs:
             ${{ steps.validate.outputs.details }}
 
             ---
-            <sub>After resolving issues, push a commit, re-edit the PR description, or comment <code>/run-gatekeeper</code> to re-trigger this check.</sub>
+            <sub>After resolving issues, push a commit, re-edit the PR description, or add the <code>run-gatekeeper</code> label to re-trigger this check.</sub>
 
       - name: Fail if validation failed
         if: steps.branch-info.outputs.skip != 'true' && steps.validate.outputs.pass != 'true'
