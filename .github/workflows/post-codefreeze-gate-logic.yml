@@ -25,8 +25,8 @@ on:
         required: true
 
 jobs:
-  post-codefreeze-gate:
-    name: post-codefreeze-gate
+  post-codefreeze-gatekeeper:
+    name: post-codefreeze-gatekeeper
     runs-on: ubuntu-latest
     steps:
       - name: Determine shared resources ref
