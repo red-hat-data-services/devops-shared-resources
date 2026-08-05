@@ -29,19 +29,11 @@ jobs:
     name: post-codefreeze-gatekeeper
     runs-on: ubuntu-latest
     steps:
-      - name: Determine shared resources ref
-        id: workflow-ref
-        run: |
-          REF="${{ github.workflow_ref }}"
-          REF="${REF##*@}"
-          echo "ref=$REF" >> "$GITHUB_OUTPUT"
-          echo "::notice::Checking out shared-resources at ref: $REF"
-
       - name: Checkout shared resources
         uses: actions/checkout@v4
         with:
           repository: red-hat-data-services/devops-shared-resources
-          ref: ${{ steps.workflow-ref.outputs.ref }}
+          ref: gatekeeper
           path: shared-resources
 
       - name: Validate branch and derive Jira version
