@@ -1,36 +1,26 @@
-# Consumer Repo Setup Guide
+# Consumer Repo Setup Guide (Evaluation)
+
+> **Evaluation mode:** The gatekeeper is currently advisory only — it posts a PR comment with pass/fail results but does not block merges.
 
 This guide explains how to adopt the post-codefreeze gatekeeper in your repository.
 
 ## Prerequisites
 
 - Your repo is in the `red-hat-data-services` GitHub organization
-- The org-level ruleset `release-branch-codefreeze` is active (contact your org admin)
-- Jira API secrets are available (org-level or repo-level)
+- Jira API secrets are available (org-level, managed by DevTestOps)
 
 ## Step 1: Add the Caller Workflow
 
-Copy [`caller-gate.yml.example`](post-codefreeze-gatekeeper.yaml.example) to `.github/workflows/post-codefreeze-gate.yml` in your repo.
+Copy [`post-codefreeze-gatekeeper.yaml.example`](post-codefreeze-gatekeeper.yaml.example) to `.github/workflows/post-codefreeze-gatekeeper.yaml` on the `rhoai-3.5` branch in your repo.
 
 No configuration needed — all defaults (Jira field IDs, base URL) are baked into the central reusable workflow. The caller is a thin boilerplate that just invokes the central workflow.
 
-**Important:** Do not rename the job key `post-codefreeze-gate`. The status check name depends on it.
+## Step 2: Verify
 
-## Step 2: Configure Secrets
-
-Ensure these secrets are available to your repo (org-level secrets are recommended):
-
-| Secret | Description |
-|--------|-------------|
-| `JIRA_USER_EMAIL` | Email address for Jira REST API authentication |
-| `JIRA_API_TOKEN` | API token for Jira REST API authentication |
-
-## Step 3: Verify
-
-1. Create a test branch matching the pattern (e.g., `rhoai-9.9`)
-2. Open a PR targeting that branch
+1. Open a PR targeting the `rhoai-3.5` branch
+2. Include a Jira issue key (e.g., `RHOAIENG-12345`) in the PR description
 3. Verify the gate check runs and posts a comment
-4. Clean up the test branch
+4. The check result is informational — it will not prevent merging
 
 ## How It Works
 
@@ -53,7 +43,7 @@ All checks run regardless of earlier failures — the PR comment reports every i
 
 ## Troubleshooting
 
-**Status check not appearing:**
+**Check not appearing:**
 The check only triggers for PRs targeting branches matching `rhoai-[0-9].[0-9]` or `rhoai-[0-9].[0-9]-ea.[0-9]`. Multi-digit versions (e.g., `rhoai-2.16`) are not supported.
 
 **"No Jira issue found" error:**

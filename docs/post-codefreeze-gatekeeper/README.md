@@ -1,10 +1,12 @@
-# Post-Codefreeze Gatekeeper
+# Post-Codefreeze Gatekeeper (Evaluation)
 
-A reusable GitHub Actions workflow that enforces post-code-freeze policies on RHOAI release branches by validating that all PRs are backed by approved Jira release blockers.
+A reusable GitHub Actions workflow that validates post-code-freeze policies on RHOAI release branches by checking that PRs are backed by approved Jira release blockers.
+
+> **Evaluation mode:** This is currently deployed as an advisory check only. It reports pass/fail via a PR comment but does **not** block merges. No org-level ruleset is enforced. This allows teams to evaluate the check and resolve any issues before it becomes mandatory in a future release.
 
 ## Overview
 
-After code freeze, only changes tied to approved release blockers should land on release branches. This workflow runs as a CI status check on PRs and validates:
+After code freeze, only changes tied to approved release blockers should land on release branches. This workflow runs as a CI check on PRs and validates:
 
 - A Jira issue (`RHOAIENG-*` / `RHAIENG-*`) is referenced in the PR description
 - The issue belongs to the correct Jira project
@@ -20,7 +22,7 @@ Consumer Repo                          devops-shared-resources
 ┌──────────────────────────┐          ┌───────────────────────────────────┐
 │ .github/workflows/       │          │ .github/workflows/                │
 │   post-codefreeze-       │          │   post-codefreeze-gate-logic.yml  │
-│   gate.yml               │─call───▶ │       │                           │
+│   gatekeeper.yaml        │─call───▶ │       │                           │
 │   (thin caller,          │          │       ▼                           │
 │    no logic)             │          │ .github/actions/                  │
 └──────────────────────────┘          │   validate-jira-issues/           │
@@ -31,16 +33,11 @@ Consumer Repo                          devops-shared-resources
                                       └───────────────────────────────────┘
 ```
 
-All logic lives in the central repo. The per-repo caller is a thin boilerplate (~12 lines) that never needs updating.
-
-Combined with an org-level GitHub **ruleset** requiring this status check on `rhoai-*` branches, the system enforces that:
-- Direct pushes to release branches are blocked
-- All changes go through PRs
-- PRs cannot merge unless the gatekeeper passes
+All logic lives in the central repo. The per-repo caller is a thin boilerplate that never needs updating.
 
 ## Quick Start
 
-See [consumer-setup.md](consumer-setup.md) for step-by-step adoption instructions.
+See [post-code-freeze-gatekeeper-user-guide.md](post-code-freeze-gatekeeper-user-guide.md) for step-by-step adoption instructions.
 
 ## Components
 
@@ -48,9 +45,7 @@ See [consumer-setup.md](consumer-setup.md) for step-by-step adoption instruction
 |------|---------|
 | `.github/workflows/post-codefreeze-gate-logic.yml` | Reusable gate-check workflow (all logic) |
 | `.github/actions/validate-jira-issues/action.yml` | Composite action with Jira validation logic |
-| `scripts/discover-jira-fields.sh` | Helper to find Jira custom field IDs |
-| `docs/post-codefreeze-gatekeeper/caller-gate.yml.example` | Template caller workflow for consumer repos |
-| `docs/post-codefreeze-gatekeeper/ruleset-config.json.example` | Reference GitHub ruleset configuration |
+| `docs/post-codefreeze-gatekeeper/post-codefreeze-gatekeeper.yaml.example` | Template caller workflow for consumer repos |
 
 ## Supported Branch Patterns
 
@@ -61,16 +56,6 @@ See [consumer-setup.md](consumer-setup.md) for step-by-step adoption instruction
 
 X, Y, and N are single digits (0-9).
 
-## GitHub Ruleset
-
-An org-level ruleset targeting `rhoai-*` branches should be configured with:
-- **Restrict updates** — blocks direct pushes
-- **Require pull request** — enforces PR workflow
-- **Require status checks** — requires `post-codefreeze-gate / post-codefreeze-gate` to pass
-- **Block force pushes**
-
-See [ruleset-config.json.example](ruleset-config.json.example) for the full configuration.
-
 ## Secrets Required
 
 | Secret | Description |
@@ -78,4 +63,4 @@ See [ruleset-config.json.example](ruleset-config.json.example) for the full conf
 | `JIRA_USER_EMAIL` | Email for Jira REST API Basic Auth |
 | `JIRA_API_TOKEN` | API token for Jira REST API Basic Auth |
 
-These should be configured as org-level GitHub Actions secrets.
+These are configured as org-level GitHub Actions secrets for red-hat-data-services repos.

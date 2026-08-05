@@ -1,4 +1,6 @@
-# Post-Codefreeze Gatekeeper — User Guide
+# Post-Codefreeze Gatekeeper — User Guide (Evaluation)
+
+> **Note:** This is the evaluation version of the gatekeeper. The check is **advisory only** — it does not block PR merges. It reports pass/fail as a PR comment to help teams validate their Jira issues before merging, but PRs can still be merged regardless of the result.
 
 This check runs on every PR targeting the `rhoai-3.5` branch and validates that the PR is backed by an approved Jira release blocker.
 
@@ -29,3 +31,5 @@ All referenced issues must pass every check. The results are posted as a comment
    - Push a new commit
    - Edit the PR description
    - Add the `run-gatekeeper` label to the PR (it is auto-removed after each run)
+
+4. Even if the check fails, you can still merge the PR. Use the comment to verify your Jira issue is correctly configured before merging.
