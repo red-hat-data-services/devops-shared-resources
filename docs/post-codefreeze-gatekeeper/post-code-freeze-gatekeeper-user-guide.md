@@ -14,16 +14,15 @@ This check runs on every PR targeting the `rhoai-3.5` branch and validates that 
 
 For each Jira issue referenced in the PR description, the gatekeeper verifies:
 
-- The issue belongs to the `RHOAIENG` or `RHAIENG` project
+- The issue belongs to the `RHOAIENG`, `RHAIENG`, or `AIPCC` project
 - `fixVersion` includes `3.5 GA RHOAI RELEASE`
-- `Target Version` includes `3.5 GA RHOAI RELEASE`
 - `Release Blocker` is set to `Approved`
 
 All referenced issues must pass every check. The results are posted as a comment on the PR.
 
 ## How to use
 
-1. Include a Jira issue key in your PR description (e.g., `RHOAIENG-12345`). Multiple keys are supported — all must pass. You can also provide the full jira url like https://redhat.atlassian.net/browse/RHOAIENG-1234
+1. Include the Jira issue key for the issue that went through the post-code-freeze exception process and has its `Release Blocker` field set to `Approved` (e.g., `RHOAIENG-12345`). Multiple keys are supported — all must pass. You can also provide the full Jira URL like https://redhat.atlassian.net/browse/RHOAIENG-1234
 
 2. The check runs automatically when the PR is opened, updated, the description is edited or `run-gatekeeper` label is added.
 

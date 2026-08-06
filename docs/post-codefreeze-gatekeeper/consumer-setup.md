@@ -26,11 +26,10 @@ No configuration needed — all defaults (Jira field IDs, base URL) are baked in
 
 The gatekeeper runs on every PR opened/updated/edited against `rhoai-X.Y` or `rhoai-X.Y-ea.N` branches and checks:
 
-1. A Jira issue key (`RHOAIENG-*` or `RHAIENG-*`) is present in the PR description
-2. The Jira issue belongs to the `RHOAIENG` or `RHAIENG` project
+1. A Jira issue key (`RHOAIENG-*`, `RHAIENG-*`, or `AIPCC-*`) is present in the PR description
+2. The Jira issue belongs to the `RHOAIENG`, `RHAIENG`, or `AIPCC` project
 3. The issue's `fixVersion` matches the expected release version
-4. The issue's `Target Version` matches the expected release version
-5. The issue's `Release Blocker` field is set to `Approved`
+4. The issue's `Release Blocker` field is set to `Approved`
 
 All checks run regardless of earlier failures — the PR comment reports every issue at once.
 
@@ -47,7 +46,7 @@ All checks run regardless of earlier failures — the PR comment reports every i
 The check only triggers for PRs targeting branches matching `rhoai-[0-9].[0-9]` or `rhoai-[0-9].[0-9]-ea.[0-9]`. Multi-digit versions (e.g., `rhoai-2.16`) are not supported.
 
 **"No Jira issue found" error:**
-The PR description must contain a Jira key in the format `RHOAIENG-1234` or `RHAIENG-1234`. URLs to Jira issues also work since the key is extracted from the URL text.
+The PR description must contain a Jira key in the format `RHOAIENG-1234`, `RHAIENG-1234`, or `AIPCC-1234`. URLs to Jira issues also work since the key is extracted from the URL text.
 
 **"Could not fetch issue" error:**
 Check that the `JIRA_USER_EMAIL` and `JIRA_API_TOKEN` secrets are correct and the Jira user has read access to the issue.

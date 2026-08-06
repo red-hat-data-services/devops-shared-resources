@@ -8,11 +8,6 @@ on:
         type: string
         required: false
         default: 'customfield_10847'
-      jira_target_version_field_id:
-        description: 'Custom field ID for "Target Version"'
-        type: string
-        required: false
-        default: 'customfield_10855'
       jira_base_url:
         description: 'Jira instance base URL'
         type: string
@@ -70,7 +65,7 @@ jobs:
         env:
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
-          KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG)-[0-9]+' | sort -u || true)
+          KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG|AIPCC)-[0-9]+' | sort -u || true)
           if [ -z "$KEYS" ]; then
             echo "::warning::No Jira issue keys found in PR description"
             echo "keys=" >> "$GITHUB_OUTPUT"
@@ -92,7 +87,6 @@ jobs:
           jira_user_email: ${{ secrets.JIRA_USER_EMAIL }}
           jira_api_token: ${{ secrets.JIRA_API_TOKEN }}
           release_blocker_field_id: ${{ inputs.jira_release_blocker_field_id || 'customfield_10847' }}
-          target_version_field_id: ${{ inputs.jira_target_version_field_id || 'customfield_10855' }}
 
       - name: Find existing gate comment
         if: steps.branch-info.outputs.skip != 'true'
@@ -128,6 +122,17 @@ jobs:
 
       - name: Fail if validation failed
         if: steps.branch-info.outputs.skip != 'true' && steps.validate.outputs.pass != 'true'
+        env:
+          ERRORS: ${{ steps.validate.outputs.errors }}
+          DETAILS: ${{ steps.validate.outputs.details }}
         run: |
-          echo "::error::Post-codefreeze gate check failed. See the PR comment for details."
+          echo "::error::Post-codefreeze gate check failed."
+          echo ""
+          echo "=== Validation Errors ==="
+          echo "$ERRORS"
+          if [ -n "$DETAILS" ]; then
+            echo ""
+            echo "=== Passed Checks ==="
+            echo "$DETAILS"
+          fi
           exit 1

@@ -20,10 +20,6 @@ inputs:
   release_blocker_field_id:
     description: 'Custom field ID for "Release Blocker" (e.g., customfield_12345)'
     required: true
-  target_version_field_id:
-    description: 'Custom field ID for "Target Version" (e.g., customfield_67890)'
-    required: true
-
 outputs:
   pass:
     description: '"true" if all checks passed, "false" otherwise'
@@ -48,7 +44,6 @@ runs:
         JIRA_USER: ${{ inputs.jira_user_email }}
         JIRA_TOKEN: ${{ inputs.jira_api_token }}
         RELEASE_BLOCKER_FIELD: ${{ inputs.release_blocker_field_id }}
-        TARGET_VERSION_FIELD: ${{ inputs.target_version_field_id }}
       run: |
         set +e
 
@@ -56,10 +51,10 @@ runs:
         DETAILS=""
         OVERALL_PASS=true
 
-        KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG)-[0-9]+' | sort -u || true)
+        KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG|AIPCC)-[0-9]+' | sort -u || true)
 
         if [ -z "$KEYS" ]; then
-          ERRORS="- **No Jira issue found** in PR description. Expected format: \`RHOAIENG-1234\` or \`RHAIENG-1234\`"
+          ERRORS="- **No Jira issue found** in PR description. Expected format: \`RHOAIENG-1234\`, \`RHAIENG-1234\`, or \`AIPCC-1234\`"
           OVERALL_PASS=false
         else
           while IFS= read -r KEY; do
@@ -70,7 +65,7 @@ runs:
             HTTP_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" \
               -u "${JIRA_USER}:${JIRA_TOKEN}" \
               -H "Content-Type: application/json" \
-              "${JIRA_BASE_URL}/rest/api/2/issue/${KEY}?fields=fixVersions,${RELEASE_BLOCKER_FIELD},${TARGET_VERSION_FIELD},project")
+              "${JIRA_BASE_URL}/rest/api/2/issue/${KEY}?fields=fixVersions,${RELEASE_BLOCKER_FIELD},project")
 
             if [ "$HTTP_CODE" != "200" ]; then
               ISSUE_ERRORS="  - Could not fetch issue (HTTP ${HTTP_CODE}). Issue may not exist or Jira may be unreachable."
@@ -83,9 +78,9 @@ runs:
             fi
 
             PROJECT_KEY=$(jq -r '.fields.project.key // "unknown"' "$TMPFILE")
-            if [[ "$PROJECT_KEY" != "RHOAIENG" && "$PROJECT_KEY" != "RHAIENG" ]]; then
+            if [[ "$PROJECT_KEY" != "RHOAIENG" && "$PROJECT_KEY" != "RHAIENG" && "$PROJECT_KEY" != "AIPCC" ]]; then
               ISSUE_ERRORS="${ISSUE_ERRORS}
-          - Project is \`${PROJECT_KEY}\`, expected \`RHOAIENG\` or \`RHAIENG\`"
+          - Project is \`${PROJECT_KEY}\`, expected \`RHOAIENG\`, \`RHAIENG\`, or \`AIPCC\`"
               OVERALL_PASS=false
             fi
 
@@ -95,16 +90,6 @@ runs:
             if [ "$FIX_VERSION_MATCH" != "true" ]; then
               ISSUE_ERRORS="${ISSUE_ERRORS}
           - fixVersion does not include \`${JIRA_VERSION}\` (found: ${FIX_VERSIONS:-none})"
-              OVERALL_PASS=false
-            fi
-
-            TARGET_VERSIONS=$(jq -r --arg f "$TARGET_VERSION_FIELD" \
-              '(if (.fields[$f] | type) == "array" then [.fields[$f][]?.name // empty] elif (.fields[$f] | type) == "object" then [.fields[$f].name // .fields[$f].value // empty] else [.fields[$f] // empty] end) | join(", ")' "$TMPFILE" 2>/dev/null || echo "")
-            TARGET_MATCH=$(jq -r --arg f "$TARGET_VERSION_FIELD" --arg v "$JIRA_VERSION" \
-              '(if (.fields[$f] | type) == "array" then [.fields[$f][]?.name // empty] elif (.fields[$f] | type) == "object" then [.fields[$f].name // .fields[$f].value // empty] else [.fields[$f] // empty] end) | any(. == $v)' "$TMPFILE" 2>/dev/null || echo "false")
-            if [ "$TARGET_MATCH" != "true" ]; then
-              ISSUE_ERRORS="${ISSUE_ERRORS}
-          - Target Version does not include \`${JIRA_VERSION}\` (found: ${TARGET_VERSIONS:-none})"
               OVERALL_PASS=false
             fi
 
