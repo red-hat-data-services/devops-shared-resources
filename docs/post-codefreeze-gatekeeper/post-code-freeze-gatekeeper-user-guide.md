@@ -8,7 +8,7 @@ This check runs on every PR targeting the `rhoai-3.5` branch and validates that 
 
 1. Copy [`post-codefreeze-gatekeeper.yaml.example`](post-codefreeze-gatekeeper.yaml.example) into your repo as `.github/workflows/post-codefreeze-gatekeeper.yaml` on the `rhoai-3.5` branch. (will be taken care by the DevTestOps team for this evaluation phase)
 
-2. Ensure the org-level secret `JIRA_API_TOKEN` is available to your repo (taken care by DevTestOps for red-hat-data-services repos).
+2. Ensure the org-level secrets `JIRA_USER_EMAIL` and `JIRA_API_TOKEN` are available to your repo (taken care by DevTestOps for red-hat-data-services repos).
 
 ## What it checks
 

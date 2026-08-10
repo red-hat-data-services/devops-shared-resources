@@ -11,8 +11,11 @@ inputs:
   jira_base_url:
     description: 'Jira instance base URL'
     required: true
+  jira_user_email:
+    description: 'Email of the Atlassian account that owns the API token'
+    required: true
   jira_api_token:
-    description: 'OAuth 2.0 Bearer token for Jira REST API'
+    description: 'Atlassian API token for Jira REST API (Basic Auth)'
     required: true
   release_blocker_field_id:
     description: 'Custom field ID for "Release Blocker" (e.g., customfield_12345)'
@@ -38,6 +41,7 @@ runs:
         PR_BODY: ${{ inputs.pr_body }}
         JIRA_VERSION: ${{ inputs.jira_version }}
         JIRA_BASE_URL: ${{ inputs.jira_base_url }}
+        JIRA_USER: ${{ inputs.jira_user_email }}
         JIRA_TOKEN: ${{ inputs.jira_api_token }}
         RELEASE_BLOCKER_FIELD: ${{ inputs.release_blocker_field_id }}
       run: |
@@ -46,6 +50,20 @@ runs:
         ERRORS=""
         DETAILS=""
         OVERALL_PASS=true
+
+        # Resolve Atlassian Cloud ID from site URL (required for scoped API tokens)
+        CLOUD_ID=$(curl -s "${JIRA_BASE_URL}/_edge/tenant_info" | jq -r '.cloudId // empty')
+        if [ -z "$CLOUD_ID" ]; then
+          echo "::error::Could not resolve Atlassian Cloud ID from ${JIRA_BASE_URL}/_edge/tenant_info"
+          echo "pass=false" >> "$GITHUB_OUTPUT"
+          echo 'errors<<GATE_DELIM' >> "$GITHUB_OUTPUT"
+          echo "- **Configuration error**: Could not resolve Atlassian Cloud ID" >> "$GITHUB_OUTPUT"
+          echo 'GATE_DELIM' >> "$GITHUB_OUTPUT"
+          echo 'details<<GATE_DELIM' >> "$GITHUB_OUTPUT"
+          echo 'GATE_DELIM' >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+        JIRA_API_URL="https://api.atlassian.com/ex/jira/${CLOUD_ID}"
 
         KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG|AIPCC)-[0-9]+' | sort -u || true)
 
@@ -59,9 +77,9 @@ runs:
 
             TMPFILE=$(mktemp)
             HTTP_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" \
-              -H "Authorization: Bearer ${JIRA_TOKEN}" \
-              -H "Content-Type: application/json" \
-              "${JIRA_BASE_URL}/rest/api/2/issue/${KEY}?fields=fixVersions,${RELEASE_BLOCKER_FIELD},project")
+              -u "${JIRA_USER}:${JIRA_TOKEN}" \
+              -H "Accept: application/json" \
+              "${JIRA_API_URL}/rest/api/2/issue/${KEY}?fields=fixVersions,${RELEASE_BLOCKER_FIELD},project")
 
             if [ "$HTTP_CODE" != "200" ]; then
               ISSUE_ERRORS="  - Could not fetch issue (HTTP ${HTTP_CODE}). Issue may not exist or Jira may be unreachable."

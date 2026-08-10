@@ -60,6 +60,7 @@ X, Y, and N are single digits (0-9).
 
 | Secret | Description |
 |--------|-------------|
-| `JIRA_API_TOKEN` | OAuth 2.0 Bearer token for Jira REST API (scoped to read-only Jira access) |
+| `JIRA_USER_EMAIL` | Email of the Atlassian account that owns the API token |
+| `JIRA_API_TOKEN` | Atlassian API token (Basic Auth) |
 
 These are configured as org-level GitHub Actions secrets for red-hat-data-services repos.
