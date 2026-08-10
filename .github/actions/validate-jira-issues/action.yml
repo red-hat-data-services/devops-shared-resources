@@ -11,11 +11,8 @@ inputs:
   jira_base_url:
     description: 'Jira instance base URL'
     required: true
-  jira_user_email:
-    description: 'Email for Jira REST API Basic Auth'
-    required: true
   jira_api_token:
-    description: 'API token for Jira REST API Basic Auth'
+    description: 'OAuth 2.0 Bearer token for Jira REST API'
     required: true
   release_blocker_field_id:
     description: 'Custom field ID for "Release Blocker" (e.g., customfield_12345)'
@@ -41,7 +38,6 @@ runs:
         PR_BODY: ${{ inputs.pr_body }}
         JIRA_VERSION: ${{ inputs.jira_version }}
         JIRA_BASE_URL: ${{ inputs.jira_base_url }}
-        JIRA_USER: ${{ inputs.jira_user_email }}
         JIRA_TOKEN: ${{ inputs.jira_api_token }}
         RELEASE_BLOCKER_FIELD: ${{ inputs.release_blocker_field_id }}
       run: |
@@ -63,7 +59,7 @@ runs:
 
             TMPFILE=$(mktemp)
             HTTP_CODE=$(curl -s -o "$TMPFILE" -w "%{http_code}" \
-              -u "${JIRA_USER}:${JIRA_TOKEN}" \
+              -H "Authorization: Bearer ${JIRA_TOKEN}" \
               -H "Content-Type: application/json" \
               "${JIRA_BASE_URL}/rest/api/2/issue/${KEY}?fields=fixVersions,${RELEASE_BLOCKER_FIELD},project")
 

@@ -60,7 +60,6 @@ X, Y, and N are single digits (0-9).
 
 | Secret | Description |
 |--------|-------------|
-| `JIRA_USER_EMAIL` | Email for Jira REST API Basic Auth |
-| `JIRA_API_TOKEN` | API token for Jira REST API Basic Auth |
+| `JIRA_API_TOKEN` | OAuth 2.0 Bearer token for Jira REST API (scoped to read-only Jira access) |
 
 These are configured as org-level GitHub Actions secrets for red-hat-data-services repos.

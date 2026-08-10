@@ -14,8 +14,6 @@ on:
         required: false
         default: 'https://redhat.atlassian.net'
     secrets:
-      JIRA_USER_EMAIL:
-        required: true
       JIRA_API_TOKEN:
         required: true
 
@@ -84,7 +82,6 @@ jobs:
           pr_body: ${{ github.event.pull_request.body }}
           jira_version: ${{ steps.branch-info.outputs.jira_version }}
           jira_base_url: ${{ inputs.jira_base_url || 'https://redhat.atlassian.net' }}
-          jira_user_email: ${{ secrets.JIRA_USER_EMAIL }}
           jira_api_token: ${{ secrets.JIRA_API_TOKEN }}
           release_blocker_field_id: ${{ inputs.jira_release_blocker_field_id || 'customfield_10847' }}
 
