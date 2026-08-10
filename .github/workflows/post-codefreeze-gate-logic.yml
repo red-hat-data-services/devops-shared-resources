@@ -1,0 +1,138 @@
+name: Post-Codefreeze Gatekeeper
+
+on:
+  workflow_call:
+    inputs:
+      jira_release_blocker_field_id:
+        description: 'Custom field ID for "Release Blocker"'
+        type: string
+        required: false
+        default: 'customfield_10847'
+      jira_base_url:
+        description: 'Jira instance base URL'
+        type: string
+        required: false
+        default: 'https://redhat.atlassian.net'
+    secrets:
+      JIRA_USER_EMAIL:
+        required: true
+      JIRA_API_TOKEN:
+        required: true
+
+jobs:
+  post-codefreeze-gatekeeper:
+    name: post-codefreeze-gatekeeper
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout shared resources
+        uses: actions/checkout@v4
+        with:
+          repository: red-hat-data-services/devops-shared-resources
+          ref: gatekeeper
+          path: shared-resources
+
+      - name: Remove re-run label
+        if: github.event.action == 'labeled' && github.event.label.name == 'run-gatekeeper'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr edit "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --remove-label run-gatekeeper
+
+      - name: Validate branch and derive Jira version
+        id: branch-info
+        run: |
+          BRANCH="${{ github.event.pull_request.base.ref }}"
+          if [[ "$BRANCH" =~ ^rhoai-([0-9])\.([0-9])$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            JIRA_VERSION="${MAJOR}.${MINOR} GA RHOAI RELEASE"
+          elif [[ "$BRANCH" =~ ^rhoai-([0-9])\.([0-9])-ea\.([0-9])$ ]]; then
+            MAJOR="${BASH_REMATCH[1]}"
+            MINOR="${BASH_REMATCH[2]}"
+            EA_NUM="${BASH_REMATCH[3]}"
+            JIRA_VERSION="${MAJOR}.${MINOR} EA${EA_NUM} RHOAI RELEASE"
+          else
+            echo "::notice::Branch '$BRANCH' does not match release pattern (rhoai-X.Y or rhoai-X.Y-ea.N). Skipping."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "jira_version=$JIRA_VERSION" >> "$GITHUB_OUTPUT"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "::notice::Derived Jira version: $JIRA_VERSION"
+
+      - name: Extract Jira issues from PR description
+        if: steps.branch-info.outputs.skip != 'true'
+        id: extract-jira
+        env:
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG|AIPCC)-[0-9]+' | sort -u || true)
+          if [ -z "$KEYS" ]; then
+            echo "::warning::No Jira issue keys found in PR description"
+            echo "keys=" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found Jira issues:"
+            echo "$KEYS" | while read -r k; do echo "  - $k"; done
+            KEYS_CSV=$(echo "$KEYS" | paste -sd ',' -)
+            echo "keys=${KEYS_CSV}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Validate Jira issues
+        if: steps.branch-info.outputs.skip != 'true'
+        id: validate
+        uses: ./shared-resources/.github/actions/validate-jira-issues
+        with:
+          pr_body: ${{ github.event.pull_request.body }}
+          jira_version: ${{ steps.branch-info.outputs.jira_version }}
+          jira_base_url: ${{ inputs.jira_base_url || 'https://redhat.atlassian.net' }}
+          jira_user_email: ${{ secrets.JIRA_USER_EMAIL }}
+          jira_api_token: ${{ secrets.JIRA_API_TOKEN }}
+          release_blocker_field_id: ${{ inputs.jira_release_blocker_field_id || 'customfield_10847' }}
+
+      - name: Find existing gate comment
+        if: steps.branch-info.outputs.skip != 'true'
+        uses: peter-evans/find-comment@v3
+        id: find-comment
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          body-includes: '<!-- post-codefreeze-gatekeeper -->'
+
+      - name: Post gate result comment
+        if: steps.branch-info.outputs.skip != 'true'
+        uses: peter-evans/create-or-update-comment@v5
+        with:
+          comment-id: ${{ steps.find-comment.outputs.comment-id }}
+          issue-number: ${{ github.event.pull_request.number }}
+          edit-mode: replace
+          body: |
+            <!-- post-codefreeze-gatekeeper -->
+            ## Post-Codefreeze Gatekeeper ${{ steps.validate.outputs.pass == 'true' && '— PASSED' || '— FAILED' }} _(evaluation)_
+
+            > **Advisory only** — this check does not block merging. Please review the results before merging.
+
+            **Target branch:** `${{ github.event.pull_request.base.ref }}`
+            **Required Jira version:** `${{ steps.branch-info.outputs.jira_version }}`
+
+            ${{ steps.validate.outputs.pass == 'true' && '✅ All checks passed.' || '❌ The following issues were found:' }}
+
+            ${{ steps.validate.outputs.errors }}
+            ${{ steps.validate.outputs.details }}
+
+            ---
+            <sub>After resolving issues, push a commit, re-edit the PR description, or add the <code>run-gatekeeper</code> label to re-trigger this check.</sub>
+
+      - name: Fail if validation failed
+        if: steps.branch-info.outputs.skip != 'true' && steps.validate.outputs.pass != 'true'
+        env:
+          ERRORS: ${{ steps.validate.outputs.errors }}
+          DETAILS: ${{ steps.validate.outputs.details }}
+        run: |
+          echo "::error::Post-codefreeze gate check failed."
+          echo ""
+          echo "=== Validation Errors ==="
+          echo "$ERRORS"
+          if [ -n "$DETAILS" ]; then
+            echo ""
+            echo "=== Passed Checks ==="
+            echo "$DETAILS"
+          fi
+          exit 1
