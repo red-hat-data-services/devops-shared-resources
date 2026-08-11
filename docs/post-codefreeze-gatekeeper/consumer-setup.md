@@ -49,7 +49,7 @@ The check only triggers for PRs targeting branches matching `rhoai-[0-9].[0-9]` 
 The PR description must contain a Jira key in the format `RHOAIENG-1234`, `RHAIENG-1234`, or `AIPCC-1234`. URLs to Jira issues also work since the key is extracted from the URL text.
 
 **"Could not fetch issue" error:**
-Check that the `JIRA_USER_EMAIL` and `JIRA_API_TOKEN` secrets are correct and the Jira user has read access to the issue.
+Check that the `JIRA_USER_EMAIL` and `JIRA_API_TOKEN` secrets are correct. The email must match the Atlassian account that generated the API token, and the token must be active.
 
 **Comment not updating (duplicates appearing):**
 Ensure only one caller workflow file exists. The comment is identified by an HTML marker and should be idempotent.
