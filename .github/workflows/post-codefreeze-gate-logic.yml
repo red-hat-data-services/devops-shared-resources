@@ -28,7 +28,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: red-hat-data-services/devops-shared-resources
-          ref: gatekeeper
+          ref: main
           path: shared-resources
 
       - name: Remove re-run label
