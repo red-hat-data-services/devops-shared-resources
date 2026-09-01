@@ -65,6 +65,16 @@ runs:
         fi
         JIRA_API_URL="https://api.atlassian.com/ex/jira/${CLOUD_ID}"
 
+        # Build the regex used to match a fixVersion name. For GA releases we also
+        # accept patch/z-stream versions (e.g. "3.5.1 GA RHOAI" for a "3.5" GA branch),
+        # which additionally drop the "RELEASE" suffix; everything else must match exactly.
+        if [[ "$JIRA_VERSION" =~ ^([0-9]+)\.([0-9]+)\ GA\ RHOAI\ RELEASE$ ]]; then
+          JIRA_VERSION_REGEX="^${BASH_REMATCH[1]}\\.${BASH_REMATCH[2]}(\\.[0-9]+)? GA RHOAI( RELEASE)?$"
+        else
+          # Escape regex metacharacters so the value is matched literally.
+          JIRA_VERSION_REGEX="^$(printf '%s' "$JIRA_VERSION" | sed 's/[.[\*^$()+?{|]/\\&/g')$"
+        fi
+
         KEYS=$(echo "$PR_BODY" | grep -oE '(RHOAIENG|RHAIENG|AIPCC)-[0-9]+' | sort -u || true)
 
         if [ -z "$KEYS" ]; then
@@ -99,8 +109,8 @@ runs:
             fi
 
             FIX_VERSIONS=$(jq -r '[.fields.fixVersions[]?.name // empty] | join(", ")' "$TMPFILE")
-            FIX_VERSION_MATCH=$(jq -r --arg v "$JIRA_VERSION" \
-              '[.fields.fixVersions[]?.name // empty] | any(. == $v)' "$TMPFILE")
+            FIX_VERSION_MATCH=$(jq -r --arg re "$JIRA_VERSION_REGEX" \
+              '[.fields.fixVersions[]?.name // empty] | any(test($re))' "$TMPFILE")
             if [ "$FIX_VERSION_MATCH" != "true" ]; then
               ISSUE_ERRORS="${ISSUE_ERRORS}
           - fixVersion does not include \`${JIRA_VERSION}\` (found: ${FIX_VERSIONS:-none})"
