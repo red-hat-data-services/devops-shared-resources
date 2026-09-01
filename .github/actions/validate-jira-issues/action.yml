@@ -109,9 +109,9 @@ runs:
             fi
 
             FIX_VERSIONS=$(jq -r '[.fields.fixVersions[]?.name // empty] | join(", ")' "$TMPFILE")
-            FIX_VERSION_MATCH=$(jq -r --arg re "$JIRA_VERSION_REGEX" \
-              '[.fields.fixVersions[]?.name // empty] | any(test($re))' "$TMPFILE")
-            if [ "$FIX_VERSION_MATCH" != "true" ]; then
+            MATCHED_VERSION=$(jq -r --arg re "$JIRA_VERSION_REGEX" \
+              '[.fields.fixVersions[]?.name // empty] | map(select(test($re))) | first // empty' "$TMPFILE")
+            if [ -z "$MATCHED_VERSION" ]; then
               ISSUE_ERRORS="${ISSUE_ERRORS}
           - fixVersion does not include \`${JIRA_VERSION}\` (found: ${FIX_VERSIONS:-none})"
               OVERALL_PASS=false
@@ -130,7 +130,7 @@ runs:
         - **${KEY}**:${ISSUE_ERRORS}"
             else
               DETAILS="${DETAILS}
-        - **${KEY}**: All checks passed"
+        - **${KEY}**: All checks passed (fixVersion: \`${MATCHED_VERSION}\`)"
             fi
 
             rm -f "$TMPFILE"
