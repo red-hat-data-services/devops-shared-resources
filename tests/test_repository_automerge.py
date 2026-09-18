@@ -5,9 +5,11 @@ from collections.abc import Sequence
 
 import pytest
 
+from lib.github_cli import GhCommandError
 from lib.repository_automerge import (
-    GhCommandError,
-    RepositoryAutoMergeManager,
+    RepositoryAutoMergeError,
+    get_repository_state,
+    manage_repository_automerge,
 )
 
 
@@ -28,9 +30,8 @@ def response(stdout: str = "", *, returncode: int = 0, stderr: str = "") -> tupl
 
 def test_audit_reports_canonical_renamed_repository() -> None:
     runner = QueueRunner(response("org/new-name\tfalse\n"))
-    manager = RepositoryAutoMergeManager(runner=runner)
 
-    result = manager.manage("org/old-name")
+    result = manage_repository_automerge("org/old-name", runner=runner)
 
     assert result.requested_repository == "org/old-name"
     assert result.repository == "org/new-name"
@@ -40,9 +41,8 @@ def test_audit_reports_canonical_renamed_repository() -> None:
 
 def test_apply_skips_repository_that_is_already_enabled() -> None:
     runner = QueueRunner(response("org/repo\ttrue\n"))
-    manager = RepositoryAutoMergeManager(runner=runner)
 
-    result = manager.manage("org/repo", apply=True)
+    result = manage_repository_automerge("org/repo", apply=True, runner=runner)
 
     assert result.status == "already_enabled"
     assert len(runner.commands) == 1
@@ -56,14 +56,14 @@ def test_apply_updates_and_retries_stale_verification() -> None:
         response("org/repo\ttrue\n"),
     )
     sleeps: list[float] = []
-    manager = RepositoryAutoMergeManager(
+    result = manage_repository_automerge(
+        "org/repo",
+        apply=True,
         runner=runner,
         verify_attempts=3,
         verify_delay=0.25,
         sleeper=sleeps.append,
     )
-
-    result = manager.manage("org/repo", apply=True)
 
     assert result.status == "enabled"
     assert sleeps == [0.25]
@@ -88,30 +88,31 @@ def test_apply_fails_after_verification_attempts_are_exhausted() -> None:
         response("org/repo\tfalse\n"),
     )
     sleeps: list[float] = []
-    manager = RepositoryAutoMergeManager(
-        runner=runner,
-        verify_attempts=2,
-        verify_delay=1,
-        sleeper=sleeps.append,
-    )
-
-    with pytest.raises(GhCommandError, match="remained disabled after 2 checks"):
-        manager.manage("org/repo", apply=True)
+    with pytest.raises(
+        RepositoryAutoMergeError,
+        match="remained disabled after 2 checks",
+    ):
+        manage_repository_automerge(
+            "org/repo",
+            apply=True,
+            runner=runner,
+            verify_attempts=2,
+            verify_delay=1,
+            sleeper=sleeps.append,
+        )
 
     assert sleeps == [1]
 
 
 def test_invalid_get_response_is_rejected() -> None:
-    manager = RepositoryAutoMergeManager(runner=QueueRunner(response("org/repo\n")))
+    runner = QueueRunner(response("org/repo\n"))
 
-    with pytest.raises(GhCommandError, match="invalid GitHub response"):
-        manager.get_state("org/repo")
+    with pytest.raises(RepositoryAutoMergeError, match="invalid GitHub response"):
+        get_repository_state("org/repo", runner=runner)
 
 
 def test_failed_gh_command_includes_error_output() -> None:
-    manager = RepositoryAutoMergeManager(
-        runner=QueueRunner(response(returncode=1, stderr="permission denied"))
-    )
+    runner = QueueRunner(response(returncode=1, stderr="permission denied"))
 
     with pytest.raises(GhCommandError, match="permission denied"):
-        manager.get_state("org/repo")
+        get_repository_state("org/repo", runner=runner)

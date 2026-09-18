@@ -13,10 +13,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lib.github_cli import GhCommandError
 from lib.repository_automerge import (
-    GhCommandError,
-    RepositoryAutoMergeManager,
+    RepositoryAutoMergeError,
     RepositoryAutoMergeResult,
+    check_authentication,
+    manage_repository_automerge,
 )
 
 
@@ -108,7 +110,6 @@ def main(
     argv: list[str] | None = None,
     *,
     stdin: TextIO | None = None,
-    manager: RepositoryAutoMergeManager | None = None,
 ) -> int:
     args = build_parser().parse_args(argv)
     input_stream = stdin or sys.stdin
@@ -119,9 +120,8 @@ def main(
             stdin=input_stream,
             default_org=args.org.strip(),
         )
-        automerge = manager or RepositoryAutoMergeManager()
-        automerge.check_authentication()
-    except (ValueError, GhCommandError) as exc:
+        check_authentication()
+    except (ValueError, GhCommandError, RepositoryAutoMergeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
 
@@ -129,10 +129,10 @@ def main(
     failures = 0
     for repository in repositories:
         try:
-            result = automerge.manage(repository, apply=args.apply)
+            result = manage_repository_automerge(repository, apply=args.apply)
             _print_result(result)
             counts[result.status] += 1
-        except GhCommandError as exc:
+        except (GhCommandError, RepositoryAutoMergeError) as exc:
             print(f"FAILED           {repository}: {exc}", file=sys.stderr)
             failures += 1
 

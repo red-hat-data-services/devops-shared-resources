@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import subprocess
 import warnings
 from dataclasses import dataclass
-from typing import Callable, Sequence
+from typing import Sequence
 
 from urllib.parse import urlparse
+
+from lib.github_cli import (
+    GhCommandError,
+    Runner,
+    default_runner,
+    run_gh as execute_gh,
+)
 
 PR_URL_PATTERN = re.compile(
     r"^https://github\.com/(?P<owner>[^/]+)/(?P<repo>[^/]+)/pull/(?P<number>\d+)/?$"
@@ -88,18 +94,6 @@ class StatusUpdateBatchError(RuntimeError):
         super().__init__(
             f"{len(self.failures)} PR(s) failed, {len(self.successes)} succeeded.\n"
             + "\n".join(lines)
-        )
-
-
-class GhCommandError(RuntimeError):
-    """Raised when a gh CLI command fails."""
-
-    def __init__(self, command: Sequence[str], returncode: int, output: str) -> None:
-        self.command = list(command)
-        self.returncode = returncode
-        self.output = output
-        super().__init__(
-            f"gh command failed ({returncode}): {' '.join(self.command)}\n{output}"
         )
 
 
@@ -197,7 +191,7 @@ class PRStatusUpdater:
         self,
         *,
         check_name: str,
-        runner: Callable[[Sequence[str]], subprocess.CompletedProcess[str]] | None = None,
+        runner: Runner | None = None,
         dry_run: bool = False,
     ) -> None:
         self.check_name = validate_check_name(check_name)
@@ -205,14 +199,7 @@ class PRStatusUpdater:
         self._runner = runner or self._default_runner
 
     def _default_runner(self, command: Sequence[str]) -> subprocess.CompletedProcess[str]:
-        env = os.environ.copy()
-        return subprocess.run(
-            list(command),
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-        )
+        return default_runner(command)
 
     def run_gh(self, gh_args: Sequence[str], *, mutate: bool = False) -> str:
         """Run gh. In dry-run mode, read-only calls execute; mutating calls are printed only."""
@@ -224,11 +211,7 @@ class PRStatusUpdater:
         if self.dry_run:
             print(f"[dry-run] {' '.join(command)}")
 
-        result = self._runner(command)
-        if result.returncode != 0:
-            output = (result.stdout or "") + (result.stderr or "")
-            raise GhCommandError(command, result.returncode, output.strip())
-        return (result.stdout or "").strip()
+        return execute_gh(gh_args, runner=self._runner)
 
     def get_pull_head(self, pr: PullRequestRef) -> PullHeadInfo:
         """Return head SHA and repo that owns the head commit (fork PRs).

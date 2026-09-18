@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from lib.pr_status_updater import (
-    GhCommandError,
     PRStatusUpdater,
     StatusUpdateBatchError,
     normalize_repo_slug,
@@ -289,11 +288,6 @@ def test_post_status_for_many_continue_on_error() -> None:
         )
     assert len(exc_info.value.successes) == 1
     assert len(exc_info.value.failures) == 1
-
-
-def test_gh_command_error_message() -> None:
-    err = GhCommandError(["gh", "api"], 1, "boom")
-    assert "boom" in str(err)
 
 
 def test_post_status_skips_when_context_already_has_same_state() -> None:
