@@ -38,3 +38,12 @@ posts the matching `gated artifacts promoter` commit status, and updates
 - `scripts/gap_pr_monitor.py` — CLI (uses `lib/pr_status_updater.py`)
 - `docs/gap-pr-monitor/README.md` — usage
 - Workflow wrapper: `gated-artifacts-promoter` (`.github/workflows/gap-pr-monitor.yml`)
+
+## Repository auto-merge manager
+
+Audits or enables the repository-level GitHub setting that permits pull request auto-merge.
+
+- `lib/repository_automerge.py` — idempotent GitHub API operations and verification
+- `scripts/manage_repository_automerge.py` — dry-run-first CLI accepting arguments or stdin
+- `docs/repository-automerge/README.md` — usage, permissions, and behavior
+- `tests/` — unit tests with mocked GitHub CLI calls
