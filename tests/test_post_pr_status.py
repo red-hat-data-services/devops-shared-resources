@@ -4,6 +4,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
+from lib.github_cli import GhCommandError
 from lib.pr_status_updater import PRStatusUpdater
 from scripts import post_pr_status
 
@@ -52,6 +53,26 @@ def test_main_rejects_invalid_pr_url_before_gh() -> None:
         )
         == 1
     )
+
+
+def test_main_handles_gh_command_error(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    error = GhCommandError(["gh", "api"], 1, "request failed")
+    monkeypatch.setattr(PRStatusUpdater, "resolve_pr_urls", MagicMock(side_effect=error))
+
+    assert (
+        post_pr_status.main(
+            [
+                "--status",
+                "success",
+                "--pr-url",
+                "https://github.com/org/repo/pull/1",
+            ]
+        )
+        == 1
+    )
+    assert "request failed" in capsys.readouterr().err
 
 
 def test_main_dry_run_multiple_pr_urls(
