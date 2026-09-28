@@ -202,11 +202,14 @@ class PRCreator:
             "https://api.github.com/graphql",
             json={"query": mutation, "variables": {"pullRequestId": node_id}},
         )
+        context = f" for {owner}/{repo} pull request #{number}"
         if response.status_code >= 400:
-            raise RuntimeError(f"Failed to enable automerge: {response.text}")
+            raise RuntimeError(f"Failed to enable automerge{context}: {response.text}")
         payload = response.json()
         if payload.get("errors"):
-            raise RuntimeError(f"Failed to enable automerge: {json.dumps(payload['errors'])}")
+            raise RuntimeError(
+                f"Failed to enable automerge{context}: {json.dumps(payload['errors'])}"
+            )
 
     def create_or_update_tracking_pr(
         self,

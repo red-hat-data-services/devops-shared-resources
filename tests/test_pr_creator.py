@@ -104,6 +104,22 @@ def test_create_pull_request_calls_github_api() -> None:
     creator.enable_automerge.assert_called_once()
 
 
+def test_enable_automerge_error_identifies_pull_request() -> None:
+    creator = PRCreator("token")
+    creator._request = MagicMock(return_value={"node_id": "PR_node_id"})
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "errors": [{"type": "UNPROCESSABLE", "message": "Pull request is in unstable status"}]
+    }
+    creator.session.post = MagicMock(return_value=response)
+
+    with pytest.raises(RuntimeError) as exc_info:
+        creator.enable_automerge("https://github.com/org/repo.git", number=42)
+
+    assert "org/repo pull request #42" in str(exc_info.value)
+    assert "Pull request is in unstable status" in str(exc_info.value)
+
+
 def test_create_or_update_tracking_pr_updates_existing() -> None:
     creator = PRCreator("token")
     with (
