@@ -8,6 +8,7 @@ import pytest
 from lib.github_cli import GhCommandError
 from lib.repository_automerge import (
     RepositoryAutoMergeError,
+    check_authentication,
     get_repository_state,
     manage_repository_automerge,
 )
@@ -26,6 +27,16 @@ class QueueRunner:
 
 def response(stdout: str = "", *, returncode: int = 0, stderr: str = "") -> tuple[int, str, str]:
     return returncode, stdout, stderr
+
+
+def test_authentication_checks_only_active_github_com_account() -> None:
+    runner = QueueRunner(response())
+
+    check_authentication(runner=runner)
+
+    assert runner.commands == [
+        ["gh", "auth", "status", "--active", "--hostname", "github.com"]
+    ]
 
 
 def test_audit_reports_canonical_renamed_repository() -> None:
@@ -102,6 +113,29 @@ def test_apply_fails_after_verification_attempts_are_exhausted() -> None:
         )
 
     assert sleeps == [1]
+
+
+@pytest.mark.parametrize(
+    ("verify_attempts", "verify_delay", "message"),
+    [(0, 2.0, "attempts"), (5, -1.0, "delay")],
+)
+def test_invalid_verification_options_fail_before_api_requests(
+    verify_attempts: int,
+    verify_delay: float,
+    message: str,
+) -> None:
+    runner = QueueRunner()
+
+    with pytest.raises(ValueError, match=message):
+        manage_repository_automerge(
+            "org/repo",
+            apply=True,
+            runner=runner,
+            verify_attempts=verify_attempts,
+            verify_delay=verify_delay,
+        )
+
+    assert runner.commands == []
 
 
 def test_invalid_get_response_is_rejected() -> None:

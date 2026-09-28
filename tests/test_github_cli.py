@@ -30,3 +30,18 @@ def test_run_gh_raises_structured_error() -> None:
     assert error.returncode == 1
     assert error.output == "stdout stderr"
     assert "stdout stderr" in str(error)
+
+
+def test_run_gh_wraps_executable_startup_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def raise_os_error(*_args: object, **_kwargs: object) -> None:
+        raise FileNotFoundError("gh executable not found")
+
+    monkeypatch.setattr(subprocess, "run", raise_os_error)
+
+    with pytest.raises(GhCommandError) as exc_info:
+        run_gh(["api", "repos/org/repo"])
+
+    assert exc_info.value.returncode == 127
+    assert "gh executable not found" in str(exc_info.value)

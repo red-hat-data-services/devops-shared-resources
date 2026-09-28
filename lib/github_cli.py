@@ -24,13 +24,16 @@ class GhCommandError(RuntimeError):
 
 def default_runner(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
     """Run a command without raising for a nonzero exit status."""
-    return subprocess.run(
-        list(command),
-        capture_output=True,
-        text=True,
-        env=os.environ.copy(),
-        check=False,
-    )
+    try:
+        return subprocess.run(
+            list(command),
+            capture_output=True,
+            text=True,
+            env=os.environ.copy(),
+            check=False,
+        )
+    except OSError as exc:
+        raise GhCommandError(command, 127, str(exc)) from exc
 
 
 def run_gh(args: Sequence[str], *, runner: Runner | None = None) -> str:

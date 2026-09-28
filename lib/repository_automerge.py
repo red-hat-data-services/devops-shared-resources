@@ -34,7 +34,9 @@ class RepositoryAutoMergeResult:
 
 def check_authentication(*, runner: Runner | None = None) -> None:
     """Verify that gh is authenticated to GitHub.com."""
-    run_gh(["auth", "status", "--hostname", "github.com"], runner=runner)
+    run_gh(
+        ["auth", "status", "--active", "--hostname", "github.com"], runner=runner
+    )
 
 
 def get_repository_state(
@@ -99,10 +101,7 @@ def verify_repository_automerge(
     sleeper: Sleeper = time.sleep,
 ) -> None:
     """Retry GET requests until GitHub reports auto-merge enabled."""
-    if attempts < 1:
-        raise ValueError("attempts must be at least 1")
-    if delay < 0:
-        raise ValueError("delay must be at least 0")
+    _validate_verification_options(attempts, delay)
 
     last_error: GhCommandError | None = None
     for attempt in range(attempts):
@@ -121,6 +120,13 @@ def verify_repository_automerge(
     raise RepositoryAutoMergeError(f"{repository}: {message}")
 
 
+def _validate_verification_options(attempts: int, delay: float) -> None:
+    if attempts < 1:
+        raise ValueError("attempts must be at least 1")
+    if delay < 0:
+        raise ValueError("delay must be at least 0")
+
+
 def manage_repository_automerge(
     repository: str,
     *,
@@ -131,6 +137,9 @@ def manage_repository_automerge(
     sleeper: Sleeper = time.sleep,
 ) -> RepositoryAutoMergeResult:
     """Audit one repository and optionally enable auto-merge."""
+    if apply:
+        _validate_verification_options(verify_attempts, verify_delay)
+
     state = get_repository_state(repository, runner=runner)
     if state.auto_merge_enabled:
         return RepositoryAutoMergeResult(
