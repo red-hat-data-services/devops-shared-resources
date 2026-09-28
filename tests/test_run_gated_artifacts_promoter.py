@@ -116,6 +116,7 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
         updated=False,
         dry_run=True,
     )
+    progress_messages: list[str] = []
 
     result = run_promoter(
         config_path=config_path,
@@ -124,6 +125,7 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
         sync_runner=fake_sync,
         leader_manager=leader,
         token="unused",
+        progress=progress_messages.append,
     )
 
     assert result.trigger_id == "gap-fixed"
@@ -138,6 +140,19 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     leader.create_or_update.assert_called_once()
     _, kwargs = leader.create_or_update.call_args
     assert kwargs["trigger_id"] == "gap-fixed"
+    assert progress_messages == [
+        "[promoter] Starting trigger gap-fixed: 1 sync entry (dry run)",
+        "[1/1] Processing kserve: "
+        "https://github.com/rhoai-rhtap/kserve.git:main -> "
+        "https://github.com/rhoai-rhtap/kserve.git:stable "
+        "(pr, head=source, automerge=off)",
+        "[1/1] Completed kserve: Dry run: would sync",
+        "[leader] Processing red-hat-data-services/gated-artifacts-promoter "
+        "with 0 child pull requests",
+        "[leader] Completed red-hat-data-services/gated-artifacts-promoter: "
+        "GAP Leaders/2026-09-24_gap-fixed/state.json",
+        "[promoter] Completed trigger gap-fixed: 1 sync entry, 0 child pull requests",
+    ]
 
 
 def test_run_promoter_collects_prs(tmp_path: Path) -> None:

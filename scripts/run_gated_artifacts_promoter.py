@@ -137,33 +137,80 @@ def run_promoter(
     token: str | None = None,
     sync_runner: Callable[..., SyncOutcome] | None = None,
     leader_manager: LeaderPRManager | None = None,
+    progress: Callable[[str], None] | None = None,
 ) -> PromoterRunResult:
     """Execute sync entries and create/update the Leader PR."""
     resolved_trigger = normalize_trigger_id(trigger_id)
     entries = filter_sync_entries(load_sync_config(config_path), only)
     resolved_token = token if token is not None else resolve_github_token()
     runner = sync_runner or run_sync_entry
+    report = progress or (lambda _message: None)
 
     outcomes: list[tuple[dict[str, Any], SyncOutcome]] = []
     state_prs: list[StatePullRequest] = []
+    entry_count = len(entries)
+    entry_label = "entry" if entry_count == 1 else "entries"
+    mode = " (dry run)" if dry_run else ""
+    report(
+        f"[promoter] Starting trigger {resolved_trigger}: "
+        f"{entry_count} sync {entry_label}{mode}"
+    )
 
-    for entry in entries:
+    for index, entry in enumerate(entries, start=1):
         prepared = prepare_entry_for_trigger(entry, resolved_trigger)
-        outcome = runner(
-            prepared,
-            token=resolved_token,
-            dry_run=dry_run,
-            verbose=verbose,
+        name = str(prepared.get("name") or prepared["dest"]["url"])
+        source = prepared["src"]
+        target = prepared["dest"]
+        details = [prepared["sync_type"]]
+        if prepared["sync_type"] == "pr":
+            details.extend(
+                [
+                    f"head={prepared['pr']['head_strategy']}",
+                    f"automerge={'on' if prepared['pr']['automerge'] else 'off'}",
+                ]
+            )
+        report(
+            f"[{index}/{entry_count}] Processing {name}: "
+            f"{source['url']}:{source['branch']} -> "
+            f"{target['url']}:{target['branch']} ({', '.join(details)})"
         )
+        try:
+            outcome = runner(
+                prepared,
+                token=resolved_token,
+                dry_run=dry_run,
+                verbose=verbose,
+            )
+        except Exception as exc:
+            report(f"[{index}/{entry_count}] Failed {name}: {exc}")
+            raise
         outcomes.append((prepared, outcome))
         state_pr = outcome_to_state_pr(prepared, outcome)
         if state_pr is not None:
             state_prs.append(state_pr)
+        result = outcome.message
+        if outcome.pr_url:
+            result += f" ({outcome.pr_url})"
+        report(f"[{index}/{entry_count}] Completed {name}: {result}")
 
     state = build_state(pull_requests=state_prs)
 
     manager = leader_manager or LeaderPRManager(repo=leader_repo, dry_run=dry_run)
-    leader_result = manager.create_or_update(state, trigger_id=resolved_trigger)
+    report(
+        f"[leader] Processing {leader_repo} with "
+        f"{len(state_prs)} child pull requests"
+    )
+    try:
+        leader_result = manager.create_or_update(state, trigger_id=resolved_trigger)
+    except Exception as exc:
+        report(f"[leader] Failed {leader_repo}: {exc}")
+        raise
+    leader_location = leader_result.pr_url or leader_result.state_path
+    report(f"[leader] Completed {leader_repo}: {leader_location}")
+    report(
+        f"[promoter] Completed trigger {resolved_trigger}: "
+        f"{len(outcomes)} sync {entry_label}, {len(state_prs)} child pull requests"
+    )
 
     return PromoterRunResult(
         trigger_id=resolved_trigger,
@@ -185,6 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             leader_repo=args.leader_repo,
             dry_run=args.dry_run,
             verbose=args.verbose,
+            progress=lambda message: print(message, file=sys.stderr, flush=True),
         )
     except (ConfigError, StateFileError, ValueError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)
