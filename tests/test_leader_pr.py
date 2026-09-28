@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from lib.leader_pr import GAP_LABEL, LEADER_BRANCH, GhCommandError, LeaderPRManager
+from lib.leader_pr import GAP_LABEL, GhCommandError, LeaderPRManager
 from lib.state_file import build_state
 
 
@@ -24,6 +24,10 @@ def _assert_dated_state_path(path: str, trigger_id: str) -> None:
         rf"GAP Leaders/\d{{4}}-\d{{2}}-\d{{2}}_{re.escape(trigger_id)}/state\.json",
         path,
     )
+
+
+def _leader_branch(trigger_id: str) -> str:
+    return f"gap-leader/{trigger_id}"
 
 
 def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
@@ -48,7 +52,7 @@ def test_dry_run_prints_gh_pr_create_dry_run(capsys: pytest.CaptureFixture[str])
     assert "--dry-run" in captured
     assert result.dry_run is True
     assert result.pr_url is None
-    assert result.branch == LEADER_BRANCH
+    assert result.branch == _leader_branch("gap-testtrigger001")
     _assert_dated_state_path(result.state_path, "gap-testtrigger001")
     assert any(cmd[:3] == ["gh", "pr", "list"] for cmd in calls)
 
@@ -91,14 +95,14 @@ def test_create_leader_pr_via_gh(tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     assert result.updated is False
     assert result.pr_number == 9
     assert result.pr_url.endswith("/pull/9")
-    assert result.branch == LEADER_BRANCH
+    assert result.branch == _leader_branch("gap-testtrigger002")
     _assert_dated_state_path(result.state_path, "gap-testtrigger002")
 
     create_cmd = next(cmd for cmd, _ in calls if cmd[:3] == ["gh", "pr", "create"])
     assert "--label" in create_cmd
     assert "gap-testtrigger002" in create_cmd
     assert GAP_LABEL in create_cmd
-    assert LEADER_BRANCH in create_cmd
+    assert _leader_branch("gap-testtrigger002") in create_cmd
     push_cmd = next(cmd for cmd, _ in calls if cmd[:2] == ["git", "push"])
     assert "--force" in push_cmd
 
@@ -116,7 +120,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
                         {
                             "number": 4,
                             "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                            "headRefName": LEADER_BRANCH,
+                            "headRefName": _leader_branch("gap-existing"),
                             "title": "old",
                         }
                     ]
@@ -150,7 +154,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     result = manager.create_or_update(state, trigger_id="gap-existing")
     assert result.updated is True
     assert result.pr_number == 4
-    assert result.branch == LEADER_BRANCH
+    assert result.branch == _leader_branch("gap-existing")
     assert result.state_path == "GAP Leaders/2026-09-20_gap-existing/state.json"
 
     label_cmd = next(
@@ -184,7 +188,7 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
                             {
                                 "number": 5,
                                 "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/5",
-                                "headRefName": LEADER_BRANCH,
+                                "headRefName": _leader_branch("gap-old"),
                                 "title": "old leader",
                             }
                         ]
@@ -205,7 +209,7 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
         if command[0] == "git" and command[1] == "status":
             return _completed("A  GAP Leaders/new/state.json\n")
         if command[:3] == ["gh", "pr", "create"]:
-            assert LEADER_BRANCH in command
+            assert _leader_branch("gap-newrun") in command
             return _completed(
                 "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12\n"
             )
@@ -220,7 +224,7 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
     assert GAP_LABEL in listed_labels
     assert result.updated is False
     assert result.pr_number == 12
-    assert result.branch == LEADER_BRANCH
+    assert result.branch == _leader_branch("gap-newrun")
     _assert_dated_state_path(result.state_path, "gap-newrun")
     assert any(cmd[3] == "5" and "--merge" in cmd for cmd in merge_calls)
     push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
@@ -241,7 +245,7 @@ def test_update_existing_does_not_merge_current_leader(
                         {
                             "number": 4,
                             "url": "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/4",
-                            "headRefName": LEADER_BRANCH,
+                            "headRefName": _leader_branch("gap-existing"),
                             "title": "current",
                         }
                     ]

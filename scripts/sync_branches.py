@@ -259,9 +259,14 @@ def _create_or_update_pr(
         labels=entry["pr"]["labels"],
         reviewers=entry["pr"]["reviewers"],
         automerge=entry["pr"]["automerge"],
+        merge_when_ready=entry["pr"].get("merge_when_ready", False),
         delete_branch_on_merge=delete_branch_on_merge,
     )
-    action = "Updated" if pr_result.updated else "Created"
+    action = (
+        "Merged"
+        if pr_result.merged
+        else ("Updated" if pr_result.updated else "Created")
+    )
     message = f"{action} pull request #{pr_result.number}"
     if conflict_files:
         message += " (contains merge conflicts)"

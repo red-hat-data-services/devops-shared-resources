@@ -98,6 +98,7 @@ def test_run_sync_entry_creates_pr(mock_prepare, mock_pr_creator, mock_push, git
         branch="sync-branch",
         created=True,
         updated=False,
+        merged=False,
     )
     mock_pr_creator.return_value = pr_instance
 
@@ -124,6 +125,10 @@ def test_run_sync_entry_creates_pr(mock_prepare, mock_pr_creator, mock_push, git
     outcome = run_sync_entry(entry, token="token", dry_run=False)
     assert outcome.pr_url == "https://github.com/example/repo/pull/1"
     pr_instance.create_or_update_tracking_pr.assert_called_once()
+    assert (
+        pr_instance.create_or_update_tracking_pr.call_args.kwargs["merge_when_ready"]
+        is False
+    )
     mock_push.assert_called_once()
 
 
@@ -151,6 +156,7 @@ def test_run_sync_entry_creates_source_pr(mock_pr_creator, mock_collect, git_rep
         branch="main",
         created=True,
         updated=False,
+        merged=False,
     )
     mock_pr_creator.return_value = pr_instance
 

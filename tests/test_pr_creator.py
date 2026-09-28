@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
@@ -83,7 +83,7 @@ def test_create_pull_request_calls_github_api() -> None:
     creator.ensure_delete_branch_on_merge = MagicMock()
     creator.add_labels = MagicMock()
     creator.request_reviewers = MagicMock()
-    creator.enable_automerge = MagicMock()
+    creator.enable_automerge = MagicMock(return_value=False)
 
     result = creator.create_pull_request(
         "https://github.com/org/repo.git",
@@ -106,7 +106,9 @@ def test_create_pull_request_calls_github_api() -> None:
 
 def test_enable_automerge_error_identifies_pull_request() -> None:
     creator = PRCreator("token")
-    creator._request = MagicMock(return_value={"node_id": "PR_node_id"})
+    creator._request = MagicMock(
+        return_value={"node_id": "PR_node_id", "head": {"sha": "head_sha"}}
+    )
     response = MagicMock(status_code=200)
     response.json.return_value = {
         "errors": [{"type": "UNPROCESSABLE", "message": "Pull request is in unstable status"}]
@@ -118,6 +120,108 @@ def test_enable_automerge_error_identifies_pull_request() -> None:
 
     assert "org/repo pull request #42" in str(exc_info.value)
     assert "Pull request is in unstable status" in str(exc_info.value)
+
+
+def test_enable_automerge_queues_when_github_accepts_request() -> None:
+    creator = PRCreator("token")
+    creator._request = MagicMock(
+        return_value={"node_id": "PR_node_id", "head": {"sha": "head_sha"}}
+    )
+    response = MagicMock(status_code=200)
+    response.json.return_value = {"data": {"enablePullRequestAutoMerge": {}}}
+    creator.session.post = MagicMock(return_value=response)
+
+    merged = creator.enable_automerge(
+        "https://github.com/org/repo.git",
+        number=42,
+        merge_when_ready=True,
+    )
+
+    assert merged is False
+    creator._request.assert_called_once_with("GET", "/repos/org/repo/pulls/42")
+
+
+def test_enable_automerge_merges_unstable_mergeable_pr_when_ready() -> None:
+    creator = PRCreator("token")
+    pull = {"node_id": "PR_node_id", "head": {"sha": "head_sha"}}
+    current = {
+        "mergeable": True,
+        "mergeable_state": "unstable",
+        "head": {"sha": "head_sha"},
+    }
+    creator._request = MagicMock(side_effect=[pull, current, {"merged": True}])
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "errors": [{"type": "UNPROCESSABLE", "message": "Pull request is in unstable status"}]
+    }
+    creator.session.post = MagicMock(return_value=response)
+
+    merged = creator.enable_automerge(
+        "https://github.com/org/repo.git",
+        number=42,
+        merge_when_ready=True,
+    )
+
+    assert merged is True
+    assert creator._request.call_args_list == [
+        call("GET", "/repos/org/repo/pulls/42"),
+        call("GET", "/repos/org/repo/pulls/42"),
+        call(
+            "PUT",
+            "/repos/org/repo/pulls/42/merge",
+            json={"merge_method": "merge", "sha": "head_sha"},
+        ),
+    ]
+
+
+def test_enable_automerge_does_not_merge_blocked_pr() -> None:
+    creator = PRCreator("token")
+    pull = {"node_id": "PR_node_id", "head": {"sha": "head_sha"}}
+    current = {
+        "mergeable": True,
+        "mergeable_state": "blocked",
+        "head": {"sha": "head_sha"},
+    }
+    creator._request = MagicMock(side_effect=[pull, current])
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "errors": [{"type": "UNPROCESSABLE", "message": "Pull request is blocked"}]
+    }
+    creator.session.post = MagicMock(return_value=response)
+
+    with pytest.raises(RuntimeError, match="Failed to enable automerge"):
+        creator.enable_automerge(
+            "https://github.com/org/repo.git",
+            number=42,
+            merge_when_ready=True,
+        )
+
+    assert creator._request.call_count == 2
+
+
+def test_enable_automerge_refuses_to_merge_changed_head() -> None:
+    creator = PRCreator("token")
+    pull = {"node_id": "PR_node_id", "head": {"sha": "original_sha"}}
+    current = {
+        "mergeable": True,
+        "mergeable_state": "unstable",
+        "head": {"sha": "new_sha"},
+    }
+    creator._request = MagicMock(side_effect=[pull, current])
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "errors": [{"type": "UNPROCESSABLE", "message": "Pull request is in unstable status"}]
+    }
+    creator.session.post = MagicMock(return_value=response)
+
+    with pytest.raises(RuntimeError, match="head commit changed"):
+        creator.enable_automerge(
+            "https://github.com/org/repo.git",
+            number=42,
+            merge_when_ready=True,
+        )
+
+    assert creator._request.call_count == 2
 
 
 def test_create_or_update_tracking_pr_updates_existing() -> None:
@@ -135,6 +239,7 @@ def test_create_or_update_tracking_pr_updates_existing() -> None:
         ),
         patch.object(creator, "update_pull_request") as mock_update,
         patch.object(creator, "add_labels"),
+        patch.object(creator, "enable_automerge", return_value=True) as mock_automerge,
     ):
         result = creator.create_or_update_tracking_pr(
             "https://github.com/org/repo.git",
@@ -144,11 +249,19 @@ def test_create_or_update_tracking_pr_updates_existing() -> None:
             base_branch="stable",
             tracking_label="lake-gate",
             labels=["lake-gate"],
+            automerge=True,
+            merge_when_ready=True,
         )
 
     assert result.updated is True
+    assert result.merged is True
     assert result.branch == "sync-existing"
     mock_update.assert_called_once()
+    mock_automerge.assert_called_once_with(
+        "https://github.com/org/repo.git",
+        number=7,
+        merge_when_ready=True,
+    )
 
 
 def test_create_or_update_prefers_existing_head_base_pr() -> None:

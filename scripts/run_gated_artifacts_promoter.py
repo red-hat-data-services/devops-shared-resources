@@ -96,6 +96,7 @@ def prepare_entry_for_trigger(entry: dict[str, Any], trigger_id: str) -> dict[st
     prepared = copy.deepcopy(entry)
     pr = prepared.setdefault("pr", {})
     pr["tracking_label"] = GAP_LABEL
+    pr["merge_when_ready"] = True
     head = pr.get("head_strategy") or "source"
     if head != "sync-branch":
         head = "source"

@@ -21,9 +21,7 @@ from lib.state_file import (
 )
 
 GAP_LABEL = "gated-artifacts-promoter"
-# Stable Leader head branch. Recreated from main for each new run (force-push),
-# including when a prior Leader PR was closed without --delete-branch.
-LEADER_BRANCH = "new-gap-leader"
+LEADER_BRANCH_PREFIX = "gap-leader"
 
 
 class GhCommandError(RuntimeError):
@@ -123,9 +121,7 @@ class LeaderPRManager:
         return (result.stdout or "").strip()
 
     def leader_branch(self, trigger_id: str) -> str:
-        # One reusable head branch; recreated after each merge (--delete-branch).
-        _ = trigger_id
-        return LEADER_BRANCH
+        return f"{LEADER_BRANCH_PREFIX}/{trigger_id}"
 
     def _resolve_token(self) -> str:
         token = (
@@ -327,9 +323,8 @@ class LeaderPRManager:
             )
 
         # New run: merge prior open Leader PRs first so their state.json
-        # folders are retained on the default branch. Merge uses
-        # --delete-branch; if the prior PR was only closed, force-push below
-        # still recreates ``new-gap-leader`` from main.
+        # folders are retained on the default branch. Each trigger has a
+        # unique head branch, so deleting a prior branch cannot affect this PR.
         if existing is None:
             self.merge_previous_leader_prs()
 
@@ -393,9 +388,8 @@ class LeaderPRManager:
                     cwd=workdir,
                     mutate=True,
                 )
-                # Force-push when opening a new Leader so a leftover
-                # ``new-gap-leader`` (closed PR without branch delete) does not
-                # reject a non-fast-forward push.
+                # Force-push when opening in case a closed PR left this
+                # trigger's branch behind with stale history.
                 push_cmd = ["push", "-u", "origin", "HEAD"]
                 if existing is None:
                     push_cmd.insert(1, "--force")
