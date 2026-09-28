@@ -168,11 +168,11 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert "--force" not in push_cmd
 
 
-def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A new trigger merges prior open Leader PRs, then opens a new one."""
+def test_new_trigger_closes_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new trigger closes prior open Leader PRs, then opens a new one."""
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     listed_labels: list[str] = []
-    merge_calls: list[list[str]] = []
+    close_calls: list[list[str]] = []
     calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
@@ -197,8 +197,8 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
             return _completed("[]\n")
         if command[:3] == ["gh", "pr", "comment"]:
             return _completed("")
-        if command[:3] == ["gh", "pr", "merge"]:
-            merge_calls.append(list(command))
+        if command[:3] == ["gh", "pr", "close"]:
+            close_calls.append(list(command))
             assert "--delete-branch" in command
             return _completed("")
         if command[:3] == ["gh", "repo", "clone"]:
@@ -226,16 +226,16 @@ def test_new_trigger_merges_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
     assert result.pr_number == 12
     assert result.branch == _leader_branch("gap-newrun")
     _assert_dated_state_path(result.state_path, "gap-newrun")
-    assert any(cmd[3] == "5" and "--merge" in cmd for cmd in merge_calls)
+    assert any(cmd[3] == "5" for cmd in close_calls)
     push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
     assert "--force" in push_cmd
 
 
-def test_update_existing_does_not_merge_current_leader(
+def test_update_existing_does_not_close_current_leader(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
-    merge_calls: list[list[str]] = []
+    close_calls: list[list[str]] = []
 
     def fake_runner(command: list[str], cwd: Path | None) -> MagicMock:
         if command[:3] == ["gh", "pr", "list"]:
@@ -251,8 +251,8 @@ def test_update_existing_does_not_merge_current_leader(
                     ]
                 )
             )
-        if command[:3] == ["gh", "pr", "merge"]:
-            merge_calls.append(list(command))
+        if command[:3] == ["gh", "pr", "close"]:
+            close_calls.append(list(command))
             return _completed("")
         if command[:3] == ["gh", "repo", "clone"]:
             dest = Path(command[4])
@@ -275,7 +275,7 @@ def test_update_existing_does_not_merge_current_leader(
     )
     result = manager.create_or_update(build_state(pull_requests=[]), trigger_id="gap-existing")
     assert result.pr_number == 4
-    assert merge_calls == []
+    assert close_calls == []
 
 
 def test_gh_failure_raises() -> None:

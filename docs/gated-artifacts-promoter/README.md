@@ -25,9 +25,9 @@ python scripts/run_gated_artifacts_promoter.py \
 ```
 
 Omit `--trigger-id` to generate one (used in the state path and as a PR label).
-Each new trigger ID **merges** any previously open Leader PR (with
-`--delete-branch`), then creates `gap-leader/<trigger-id>` from main and opens
-a **new Leader PR** with a dated state file at
+Each new trigger ID **closes** any previously open Leader PR (and deletes its
+branch), then creates `gap-leader/<trigger-id>` from main and opens a **new
+Leader PR** with a dated state file at
 `GAP Leaders/<UTC-date>_<trigger-id>/state.json`. A rerun with the same trigger
 ID updates that trigger's existing PR and branch. Child sync PRs are reused via
 the shared `gated-artifacts-promoter` tracking label.
