@@ -1,0 +1,22 @@
+parent_ref: origin/rhoai-3.6
+tekton_layout: nested
+
+templates:
+  - name: push
+    file: push.yaml.j2
+    match_fn: is_push_pipeline_by_cel
+
+  - name: pull-request
+    file: pull-request.yaml.j2
+    match_fn: is_pr_pipeline
+    parent:
+      template: push
+      inherit_params: true
+      match_fn:
+        - alias_match
+        - exact_component_match
+        - odh_prefix_match
+        - component_starts_with
+
+component_aliases:
+  odh-guardrails-detector-hf-runtime: odh-guardrails-detector-huggingface-runtime

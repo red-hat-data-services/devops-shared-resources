@@ -1,0 +1,23 @@
+templates:
+  - name: push
+    file: push.yaml.j2
+    match_fn: is_push_pipeline
+
+  - name: pull-request
+    file: pull-request.yaml.j2
+    match_fn: is_pr_pipeline
+    parent:
+      template: push
+      inherit_params: true
+      match_fn:
+        - alias_match
+        - exact_component_match
+        - odh_prefix_match
+        - component_starts_with
+
+  - name: scheduled
+    file: scheduled.yaml.j2
+    match_fn: is_scheduled_pipeline
+
+component_aliases:
+  odh-guardrails-detector-hf-runtime: odh-guardrails-detector-huggingface-runtime

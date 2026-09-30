@@ -1,0 +1,19 @@
+metadata:
+  labels:
+    appstudio.openshift.io/application: rhoai-fbc-fragment-ci
+  annotations:
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push" && target_branch.startsWith("refs/tags/v")
+spec:
+  params:
+  - name: additional-tags
+    value:
+    - "{{branch}}-{{'{{revision}}'}}"
+    - "{{branch}}-nightly"
+  - name: output-image
+    value: "quay.io/rhoai-private/rhoai-fbc-fragment:{{branch}}"
+  pipelineRef:
+    params:
+    - name: revision
+      value: "{{branch}}"
+

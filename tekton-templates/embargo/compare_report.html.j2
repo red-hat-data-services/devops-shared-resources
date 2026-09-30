@@ -1,0 +1,296 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>MR-FBC Verification Report</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    background: #f5f6fa;
+    color: #24292e;
+    line-height: 1.5;
+    padding: 24px;
+    max-width: 1400px;
+    margin: 0 auto;
+  }
+  h1 { font-size: 1.8rem; font-weight: 600; margin-bottom: 4px; }
+  .subtitle { color: #586069; font-size: 0.9rem; margin-bottom: 28px; }
+  .branch-section { margin-bottom: 20px; }
+  .branch-section > summary {
+    font-size: 1.3rem;
+    font-weight: 600;
+    cursor: pointer;
+    padding: 12px 16px;
+    background: #fff;
+    border: 1px solid #d1d5da;
+    border-radius: 6px;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .branch-section > summary::-webkit-details-marker { display: none; }
+  .branch-section > summary::before {
+    content: "▶";
+    font-size: 0.7rem;
+    transition: transform 0.15s;
+    display: inline-block;
+  }
+  .branch-section[open] > summary::before { transform: rotate(90deg); }
+  .branch-section[open] > summary {
+    border-radius: 6px 6px 0 0;
+    border-bottom: none;
+  }
+  .branch-body {
+    background: #fff;
+    border: 1px solid #d1d5da;
+    border-top: none;
+    border-radius: 0 0 6px 6px;
+    padding: 20px;
+  }
+  .fbc-info {
+    font-size: 0.85rem;
+    color: #586069;
+    margin-bottom: 16px;
+  }
+  .fbc-info code {
+    background: #f1f3f5;
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.85rem;
+  }
+  .summary-cards {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 12px;
+    margin-bottom: 20px;
+  }
+  .summary-card {
+    flex: 1 1 120px;
+    min-width: 100px;
+    padding: 14px 16px;
+    border-radius: 6px;
+    text-align: center;
+    border: 1px solid rgba(0,0,0,0.08);
+  }
+  .summary-card .count { font-size: 1.8rem; font-weight: 700; }
+  .summary-card .label { font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.85; }
+  .card-total { background: #e8f0fe; color: #1a73e8; }
+  .card-components { background: #e8eaf6; color: #3949ab; }
+  .card-ok { background: #e6f4ea; color: #28a745; }
+  .card-stale-active { background: #fce4ec; color: #dc3545; }
+  .card-missing-active { background: #fff3e0; color: #e65100; }
+  .card-error-active { background: #eceff1; color: #dc3545; }
+  .card-zero { background: #f5f5f5; color: #6c757d; }
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.9rem;
+    margin-bottom: 4px;
+  }
+  th {
+    text-align: left;
+    padding: 10px 12px;
+    background: #f6f8fa;
+    border: 1px solid #d1d5da;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  td {
+    padding: 8px 12px;
+    border: 1px solid #d1d5da;
+    vertical-align: top;
+  }
+  .mono {
+    font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+    font-size: 0.82rem;
+  }
+  .row-ok { background: #d4edda; }
+  .row-stale { background: #f8d7da; }
+  .row-missing { background: #fff3cd; }
+  .row-error { background: #e9ecef; }
+  .badge {
+    display: inline-block;
+    padding: 2px 10px;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 0.3px;
+  }
+  .badge-ok { background: #28a745; }
+  .badge-stale { background: #dc3545; }
+  .badge-missing { background: #fd7e14; }
+  .badge-error { background: #6c757d; }
+  .repo-details { margin: 0; }
+  .repo-details > summary {
+    cursor: pointer;
+    font-weight: 500;
+    padding: 4px 0;
+    list-style: none;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .repo-details > summary::-webkit-details-marker { display: none; }
+  .repo-details > summary::before {
+    content: "▶";
+    font-size: 0.6rem;
+    transition: transform 0.15s;
+    display: inline-block;
+  }
+  .repo-details[open] > summary::before { transform: rotate(90deg); }
+  .component-table {
+    margin-top: 8px;
+    font-size: 0.82rem;
+  }
+  .component-table th {
+    background: #eef1f5;
+    padding: 6px 10px;
+    font-size: 0.8rem;
+  }
+  .component-table td { padding: 5px 10px; }
+  a { color: #0366d6; text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  .ancestry-detail { font-size: 0.78rem; color: #586069; display: block; margin-top: 2px; }
+  @media (max-width: 900px) {
+    body { padding: 12px; }
+    table { font-size: 0.8rem; }
+    th, td { padding: 6px 8px; }
+    .summary-card { flex: 1 1 80px; min-width: 80px; padding: 10px; }
+    .summary-card .count { font-size: 1.4rem; }
+  }
+  @media (max-width: 600px) {
+    .summary-cards { flex-direction: column; }
+    .summary-card { min-width: unset; }
+    table { display: block; overflow-x: auto; }
+  }
+</style>
+</head>
+<body>
+
+<h1>MR-FBC Verification Report</h1>
+<p class="subtitle">Generated at {{ data.generated_at }}</p>
+
+{% for branch_name, branch in data.branches.items() %}
+{% set has_issues = branch.summary.stale > 0 or branch.summary.missing > 0 or branch.summary.errors > 0 %}
+<details class="branch-section"{{ " open" if has_issues }}>
+  <summary>
+    {{ branch_name }}
+    {% if has_issues %}
+    <span class="badge badge-stale">needs attention</span>
+    {% else %}
+    <span class="badge badge-ok">all ok</span>
+    {% endif %}
+  </summary>
+  <div class="branch-body">
+    <div class="fbc-info">
+      FBC Image: <code>{{ branch.fbc_image }}</code>
+      &nbsp;·&nbsp; Built: {{ branch.fbc_build_date }}
+    </div>
+
+    <div class="summary-cards">
+      <div class="summary-card card-total">
+        <div class="count">{{ branch.summary.total_repos }}</div>
+        <div class="label">Repos</div>
+      </div>
+      <div class="summary-card card-components">
+        <div class="count">{{ branch.summary.total_components }}</div>
+        <div class="label">Components</div>
+      </div>
+      <div class="summary-card card-ok">
+        <div class="count">{{ branch.summary.ok }}</div>
+        <div class="label">OK</div>
+      </div>
+      <div class="summary-card {{ 'card-stale-active' if branch.summary.stale > 0 else 'card-zero' }}">
+        <div class="count">{{ branch.summary.stale }}</div>
+        <div class="label">Stale</div>
+      </div>
+      <div class="summary-card {{ 'card-missing-active' if branch.summary.missing > 0 else 'card-zero' }}">
+        <div class="count">{{ branch.summary.missing }}</div>
+        <div class="label">Missing</div>
+      </div>
+      <div class="summary-card {{ 'card-error-active' if branch.summary.errors > 0 else 'card-zero' }}">
+        <div class="count">{{ branch.summary.errors }}</div>
+        <div class="label">Errors</div>
+      </div>
+    </div>
+
+    <table>
+      <thead>
+        <tr>
+          <th>Repo</th>
+          <th>Status</th>
+          <th>Latest MR</th>
+          <th>Merged</th>
+          <th>Ancestry Check</th>
+          <th>FBC Commit</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for repo_name, repo in branch.repos.items() %}
+        <tr class="row-{{ repo.status }}">
+          <td>
+            {% if repo.components %}
+            <details class="repo-details">
+              <summary>{{ repo_name }}</summary>
+              <table class="component-table">
+                <thead>
+                  <tr>
+                    <th>Component</th>
+                    <th>Image</th>
+                    <th>Built</th>
+                    <th>Date Check</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {% for comp in repo.components %}
+                  <tr>
+                    <td>{{ comp.name }}</td>
+                    <td class="mono">{{ comp.image }}:{{ comp.image_tag }}</td>
+                    <td>{{ comp.image_built }}</td>
+                    <td><span class="badge badge-{{ comp.date_check }}">{{ comp.date_check }}</span></td>
+                  </tr>
+                  {% endfor %}
+                </tbody>
+              </table>
+            </details>
+            {% else %}
+            {{ repo_name }}
+            {% endif %}
+          </td>
+          <td><span class="badge badge-{{ repo.status }}">{{ repo.status }}</span></td>
+          <td>
+            {% if repo.latest_mr %}
+              {% if repo.latest_mr.url %}
+              <a href="{{ repo.latest_mr.url }}" target="_blank" rel="noopener">!{{ repo.latest_mr.iid }}</a>
+              {% else %}
+              !{{ repo.latest_mr.iid }}
+              {% endif %}
+              {{ repo.latest_mr.title }}
+            {% else %}
+            —
+            {% endif %}
+          </td>
+          <td>{{ repo.latest_mr.merged if repo.latest_mr else "—" }}</td>
+          <td>
+            <span class="badge badge-{{ repo.ancestry_check }}">{{ repo.ancestry_check }}</span>
+            {% if repo.ancestry_detail %}
+            <span class="ancestry-detail">{{ repo.ancestry_detail }}</span>
+            {% endif %}
+          </td>
+          <td class="mono">{{ repo.fbc_commit[:12] if repo.fbc_commit else "—" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+</details>
+{% endfor %}
+
+</body>
+</html>

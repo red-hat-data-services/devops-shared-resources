@@ -1,0 +1,5 @@
+metadata:
+  annotations:
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push" && target_branch == "{{ branch }}" 
+        && ( "bundle/**".pathChanged() || ".tekton/{{filename}}".pathChanged() )
