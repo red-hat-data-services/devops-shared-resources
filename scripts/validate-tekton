@@ -1,7 +1,7 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.10"
-# dependencies = ["ruamel.yaml", "jinja2", "cel-python"]
+# dependencies = ["ruamel.yaml", "jinja2", "cel-python", "requests"]
 # ///
 """Validate Tekton PipelineRun files in the current repo.
 
@@ -19,6 +19,7 @@ from pathlib import Path
 from ruamel.yaml import YAML
 
 _repo_root = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(_repo_root))
 from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
 from lib.tekton_config import load_config
 from lib.tekton_filters import DELETE_FILE_PREFIX
