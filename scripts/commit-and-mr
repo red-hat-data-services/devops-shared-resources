@@ -1,0 +1,304 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Commit changes and create a GitLab MR from structured JSON input.
+
+Reads JSON from stdin describing what changed, commits the staged files,
+pushes, and creates/updates a merge request. Works with any tool that
+produces the expected JSON format.
+
+Single-repo:
+  some-fix-tool --json | commit-and-mr --target-branch main
+
+Multi-repo:
+  batch-tool --json --keep-clones | commit-and-mr --merge auto
+
+Expected JSON (single-repo):
+  {"title": "...", "changes": [{"file": "f.yaml", "details": ["what changed"]}]}
+
+Expected JSON (multi-repo):
+  {"results": [{"clone_path": "...", "branch": "...", "title": "...", "changes": [...]}]}
+"""
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+import urllib.parse
+from pathlib import Path
+
+_repo_root = Path(__file__).resolve().parent.parent
+from lib.tekton_gitlab import gitlab_api, merge_mr, auto_merge_mr, get_project_path_from_remote
+
+DEFAULT_GL_HOST = "gitlab.cee.redhat.com"
+DEFAULT_FIX_BRANCH_PREFIX = "fix/tekton-policy-"
+
+verbose = False
+
+
+def log(msg: str):
+    if verbose:
+        print(msg, file=sys.stderr)
+
+
+def info(msg: str):
+    print(msg, file=sys.stderr)
+
+
+def warn(msg: str):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def die(msg: str):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def git(*args, check=True, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=check, **kwargs)
+
+
+def build_commit_message(title: str, changes: list[dict], skip_builds: bool) -> str:
+    subject = title
+    if skip_builds:
+        subject += " [skip tkn]"
+    lines = [subject, ""]
+    for change in changes:
+        details = change.get("details", [])
+        if details:
+            lines.append(f"{change['file']}:")
+            for d in details:
+                lines.append(f"  - {d}")
+        else:
+            lines.append(f"{change['file']}: fixed")
+    return "\n".join(lines)
+
+
+def build_mr_description(changes: list[dict]) -> str:
+    lines = ["## Changes\n"]
+    for change in changes:
+        lines.append(f"### `{change['file']}`\n")
+        for d in change.get("details", []):
+            lines.append(f"- {d}")
+        lines.append("")
+    return "\n".join(lines)
+
+
+def process_repo(
+    title: str,
+    changes: list[dict],
+    target_branch: str,
+    stage_dir: str,
+    fix_branch_prefix: str,
+    gitlab_host: str,
+    merge_strategy: str | None,
+    skip_builds: bool,
+    commit_msg: str | None,
+    dry_run: bool,
+) -> dict | None:
+    """Commit, push, and create MR for one repo. Returns MR info dict or None."""
+    if not changes:
+        log("no changes, skipping")
+        return None
+
+    fix_branch = f"{fix_branch_prefix}{target_branch}"
+    msg = commit_msg or build_commit_message(title, changes, skip_builds)
+
+    if dry_run:
+        info(f"  would create branch: {fix_branch}")
+        info(f"  would stage: {stage_dir}")
+        info(f"  would commit: {msg}")
+        info(f"  would push: {fix_branch}")
+        info(f"  would create/update MR targeting {target_branch}")
+        if merge_strategy:
+            info(f"  would merge: {merge_strategy}")
+        return {"branch": fix_branch, "dry_run": True}
+
+    r = git("checkout", "-b", fix_branch, check=False)
+    if r.returncode != 0:
+        git("branch", "-f", fix_branch, "HEAD")
+        r = git("checkout", fix_branch, check=False)
+    if r.returncode != 0:
+        warn(f"failed to switch to branch '{fix_branch}': {r.stderr.strip()}")
+        return None
+
+    git("add", stage_dir)
+    git("commit", "-m", msg, "--", stage_dir)
+    info(f"==> Committed to {fix_branch}")
+
+    push_result = git("push", "--force", "origin", fix_branch, check=False)
+    if push_result.returncode != 0:
+        warn(f"failed to push: {push_result.stderr.strip()}")
+        return None
+
+    project_path = get_project_path_from_remote()
+    if not project_path:
+        warn("could not determine project path from git remote")
+        return None
+
+    mr_body = build_mr_description(changes)
+    mr_title = title
+    encoded = urllib.parse.quote(project_path, safe="")
+
+    existing_mr = gitlab_api(
+        f"projects/{encoded}/merge_requests?source_branch={urllib.parse.quote(fix_branch)}&state=opened",
+        gitlab_host,
+    )
+    existing_mrs = json.loads(existing_mr.stdout) if existing_mr.returncode == 0 else []
+
+    mr_iid = None
+    mr_url = f"https://{gitlab_host}/{project_path}/-/merge_requests"
+    result_info = {"branch": fix_branch}
+
+    if existing_mrs:
+        mr_iid = existing_mrs[0]["iid"]
+        gitlab_api(
+            f"projects/{encoded}/merge_requests/{mr_iid}",
+            gitlab_host,
+            method="PUT",
+            fields={"title": mr_title, "description": mr_body},
+        )
+        info(f"==> MR (updated): {mr_url}/{mr_iid}")
+    else:
+        mr_result = gitlab_api(
+            f"projects/{encoded}/merge_requests",
+            gitlab_host,
+            method="POST",
+            fields={
+                "source_branch": fix_branch,
+                "target_branch": target_branch,
+                "title": mr_title,
+                "description": mr_body,
+                "remove_source_branch": "true",
+            },
+        )
+        if mr_result.returncode == 0:
+            mr_iid = json.loads(mr_result.stdout).get("iid")
+            info(f"==> MR: {mr_url}/{mr_iid}")
+        else:
+            warn(f"failed to create MR: {mr_result.stderr.strip()}")
+
+    if mr_iid:
+        result_info["mr"] = {"project": project_path, "iid": mr_iid, "url": f"{mr_url}/{mr_iid}"}
+
+        if merge_strategy == "now":
+            if merge_mr(project_path, mr_iid, gitlab_host):
+                info(f"==> Merged: {mr_url}/{mr_iid}")
+            else:
+                warn(f"failed to merge MR {mr_url}/{mr_iid}")
+        elif merge_strategy == "auto":
+            if auto_merge_mr(project_path, mr_iid, gitlab_host):
+                info(f"==> Auto-merge enabled: {mr_url}/{mr_iid}")
+            else:
+                warn(f"failed to enable auto-merge for MR {mr_url}/{mr_iid}")
+
+    return result_info
+
+
+def main():
+    global verbose
+
+    parser = argparse.ArgumentParser(
+        description="Commit changes and create a GitLab MR from structured JSON input.",
+    )
+    parser.add_argument(
+        "--target-branch",
+        help="Branch the fixes target (required for single-repo mode; read from JSON in multi-repo mode)",
+    )
+    parser.add_argument(
+        "--stage", default=".tekton/",
+        help="Directory to git add (default: .tekton/)",
+    )
+    parser.add_argument(
+        "--fix-branch-prefix", default=DEFAULT_FIX_BRANCH_PREFIX,
+        help=f"Prefix for the fix branch name (default: {DEFAULT_FIX_BRANCH_PREFIX})",
+    )
+    parser.add_argument(
+        "--gitlab-host", default=DEFAULT_GL_HOST,
+        help=f"GitLab hostname (default: {DEFAULT_GL_HOST})",
+    )
+    parser.add_argument(
+        "--merge", choices=["now", "auto"],
+        help="Merge strategy: 'now' merges immediately, 'auto' merges when pipeline succeeds",
+    )
+    parser.add_argument("--skip-builds", action="store_true",
+                        help="Add [skip tkn] to commit message")
+    parser.add_argument("--commit-msg", help="Override commit message")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    parser.add_argument("--json", action="store_true", help="Output result as JSON")
+    parser.add_argument("--verbose", action="store_true", help="Detailed progress")
+    args = parser.parse_args()
+    verbose = args.verbose
+
+    data = json.load(sys.stdin)
+
+    if "results" in data and isinstance(data["results"], list):
+        # Multi-repo mode
+        all_results = []
+        for entry in data["results"]:
+            repo = entry.get("repo", "unknown")
+            branch = entry.get("branch")
+            clone_path = entry.get("clone_path")
+            changes = entry.get("changes", [])
+            title = entry.get("title", f"Fix issues on {branch or 'unknown'}")
+
+            if not changes:
+                log(f"{repo} ({branch}): no changes, skipping")
+                continue
+
+            target = args.target_branch or branch
+            if not target:
+                warn(f"{repo}: no target branch (use --target-branch or include branch in JSON)")
+                continue
+
+            if not clone_path or not Path(clone_path).is_dir():
+                warn(f"{repo}: clone path missing or not found: {clone_path}")
+                continue
+
+            info(f"\n==> {repo} ({branch})")
+            original_dir = os.getcwd()
+            try:
+                os.chdir(clone_path)
+                result = process_repo(
+                    title, changes, target, args.stage, args.fix_branch_prefix,
+                    args.gitlab_host, args.merge, args.skip_builds,
+                    args.commit_msg, args.dry_run,
+                )
+                if result:
+                    result["repo"] = repo
+                    result["branch"] = branch
+                    all_results.append(result)
+            finally:
+                os.chdir(original_dir)
+
+        if args.json:
+            print(json.dumps({"results": all_results}, indent=2))
+    else:
+        # Single-repo mode
+        if not args.target_branch:
+            die("--target-branch is required in single-repo mode")
+
+        changes = data.get("changes", [])
+        title = data.get("title", f"Fix issues on {args.target_branch}")
+
+        if not changes:
+            log("no changes")
+            if args.json:
+                print(json.dumps({"skipped": True}))
+            return
+
+        result = process_repo(
+            title, changes, args.target_branch, args.stage, args.fix_branch_prefix,
+            args.gitlab_host, args.merge, args.skip_builds,
+            args.commit_msg, args.dry_run,
+        )
+
+        if args.json and result:
+            print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

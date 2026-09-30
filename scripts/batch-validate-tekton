@@ -1,0 +1,386 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["ruamel.yaml"]
+# ///
+"""Run validate-tekton across multiple repos and branches.
+
+Sparse-clones each repo (just .tekton/) into a temp directory, runs
+validate-tekton inside it, and collects results. Supports a
+release-branch-config.yaml config, a single repo argument, or an
+existing local clone.
+"""
+
+import argparse
+import json
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+VALIDATE_TEKTON = str(SCRIPT_DIR / "validate-tekton")
+
+from lib.tekton_release_config import load_release_config, get_repos_for_branch, get_branches
+DEFAULT_GL_HOST = "gitlab.cee.redhat.com"
+DEFAULT_TARGET = "rhoai/private"
+
+verbose = False
+out = sys.stdout
+
+
+def log(msg: str):
+    if verbose:
+        print(msg, file=sys.stderr)
+
+
+def warn(msg: str):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def die(msg: str):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def git(*args, check=True, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=check, **kwargs)
+
+
+def sparse_clone(clone_url: str, branch: str, dest: str) -> str | None:
+    """Sparse-clone only .tekton/ from a repo. Returns None on success, or an error reason."""
+    r = git("clone", "--filter=blob:none", "--no-checkout", "--depth=1",
+            "-b", branch, clone_url, dest, check=False)
+    if r.returncode != 0:
+        stderr = r.stderr.strip()
+        if "not found" in stderr or "does not exist" in stderr:
+            return f"branch '{branch}' not found"
+        if "Could not read from remote" in stderr or "does not appear to be a git repository" in stderr:
+            return "repository not found"
+        return f"clone failed: {stderr.splitlines()[-1] if stderr else 'unknown error'}"
+
+    r = git("-C", dest, "sparse-checkout", "set", ".tekton", check=False)
+    if r.returncode != 0:
+        return f"sparse-checkout failed: {r.stderr.strip()}"
+
+    r = git("-C", dest, "checkout", check=False)
+    if r.returncode != 0:
+        return f"checkout failed: {r.stderr.strip()}"
+
+    return None
+
+
+def run_validate_tekton(repo_dir: str, branch: str | None, passthrough_args: list[str]) -> tuple[int, dict | None]:
+    """Run validate-tekton in the given directory. Returns (exit_code, parsed_json_or_None)."""
+    cmd = [VALIDATE_TEKTON, "--json"]
+    if branch:
+        cmd += ["-b", branch]
+    cmd += passthrough_args
+
+    log(f"  running: {' '.join(cmd)}")
+    result = subprocess.run(cmd, cwd=repo_dir, capture_output=True, text=True)
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+
+    parsed = None
+    try:
+        parsed = json.loads(result.stdout)
+    except (json.JSONDecodeError, ValueError):
+        if result.stdout:
+            print(result.stdout, end="")
+
+    if parsed:
+        files = parsed.get("files", {})
+        summary = parsed.get("summary", {})
+        fixed_files = set(parsed.get("fixed", []))
+        unfixed_errors = 0
+        if not fixed_files:
+            for filename, data in sorted(files.items()):
+                errors = data.get("errors", [])
+                warnings = data.get("warnings", [])
+                if not errors and not warnings:
+                    print(f"  {filename}: ok", file=out)
+                else:
+                    unfixed_errors += len(errors)
+                    print(f"  {filename}:", file=out)
+                    for e in errors:
+                        print(f"    ERROR: {e}", file=out)
+                    for w in warnings:
+                        print(f"    warning: {w}", file=out)
+        else:
+            for filename, data in sorted(files.items()):
+                errors = data.get("errors", [])
+                warnings = data.get("warnings", [])
+                if errors and filename in fixed_files:
+                    unfixed_errors += len(errors)
+                    print(f"  {filename}: (partially fixed, {len(errors)} remaining)", file=out)
+                    for e in errors:
+                        print(f"    ERROR: {e}", file=out)
+                elif errors:
+                    unfixed_errors += len(errors)
+                    print(f"  {filename}:", file=out)
+                    for e in errors:
+                        print(f"    ERROR: {e}", file=out)
+                if warnings:
+                    for w in warnings:
+                        print(f"    warning: {w}", file=out)
+        print(f"\n==> {summary.get('ok', 0)} ok, {unfixed_errors} errors, {summary.get('warnings', 0)} warnings", file=out)
+
+    return result.returncode, parsed
+
+
+def main():
+    global verbose
+
+    parser = argparse.ArgumentParser(
+        description="Run validate-tekton across multiple repos and branches.",
+    )
+
+    parser.add_argument(
+        "repo", nargs="?",
+        help="Single repo name (e.g., odh-dashboard)",
+    )
+    parser.add_argument(
+        "--config",
+        help="Path to release-branch-config.yaml",
+    )
+    parser.add_argument(
+        "-b", "--branch", nargs="+",
+        help="Branch(es) to validate (applies to all repos)",
+    )
+    parser.add_argument(
+        "-t", "--target", default=DEFAULT_TARGET,
+        help=f"GitLab namespace (default: {DEFAULT_TARGET})",
+    )
+    parser.add_argument(
+        "--gitlab-host", default=DEFAULT_GL_HOST,
+        help=f"GitLab hostname (default: {DEFAULT_GL_HOST})",
+    )
+    parser.add_argument(
+        "--clone-protocol", choices=["ssh", "https"], default="ssh",
+        help="Git clone protocol (default: ssh)",
+    )
+    parser.add_argument(
+        "--local-path",
+        help="Use existing local clone instead of sparse-cloning",
+    )
+    parser.add_argument("-n", "--namespace", help="Only validate PipelineRuns in this namespace")
+    parser.add_argument("--config-dir", required=True, help="Directory containing templates and config.yaml (passed to validate-tekton)")
+    parser.add_argument("--config-file", help="Explicit path to config YAML (passed to validate-tekton)")
+    parser.add_argument("--fix", action="store_true", help="Write corrected files")
+    parser.add_argument("--json", action="store_true",
+                        help="Output structured JSON to stdout (human-readable goes to stderr)")
+    parser.add_argument("--keep-clones", action="store_true",
+                        help="Keep cloned repos after validation (for piping to commit-and-mr)")
+    parser.add_argument("--clone-dir",
+                        help="Directory for clones instead of tmpdir (implies --keep-clones)")
+    parser.add_argument("--var", action="append", metavar="KEY=VALUE",
+                        help="Set a template variable (passed to validate-tekton)")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    parser.add_argument("--verbose", action="store_true", help="Detailed progress")
+
+    args = parser.parse_args()
+    verbose = args.verbose
+
+    global out
+    if args.json:
+        out = sys.stderr
+
+    if args.clone_dir:
+        args.keep_clones = True
+
+    # Build passthrough args for validate-tekton
+    passthrough = []
+    if args.namespace:
+        passthrough += ["-n", args.namespace]
+    if args.fix:
+        passthrough.append("--fix")
+    if args.dry_run:
+        passthrough.append("--dry-run")
+    if args.verbose:
+        passthrough.append("--verbose")
+    if args.config_dir:
+        passthrough += ["--config-dir", args.config_dir]
+    if args.config_file:
+        passthrough += ["--config-file", args.config_file]
+    for item in args.var or []:
+        passthrough += ["--var", item]
+
+    # Resolve repo list: [(repo_name_or_path, [branches])]
+    repos: list[tuple[str, list[str]]] = []
+
+    rcm = load_release_config(args.config) if args.config else None
+
+    if args.local_path:
+        local = Path(args.local_path)
+        if not local.is_dir():
+            die(f"local path does not exist: {args.local_path}")
+        repos = [(args.local_path, args.branch or [])]
+    elif args.repo:
+        if args.branch:
+            repo_branch_list = args.branch
+        elif rcm:
+            repo_branch_list = [b for b in get_branches(rcm) if args.repo in get_repos_for_branch(rcm, b)]
+            if not repo_branch_list:
+                die(f"no branches found for '{args.repo}' in config")
+        else:
+            die(f"no branches specified for '{args.repo}' — use -b or --config")
+        repos = [(args.repo, repo_branch_list)]
+    elif args.config:
+        selected_branches = args.branch or get_branches(rcm)
+        repo_branches: dict[str, list[str]] = {}
+        for branch in selected_branches:
+            for repo in get_repos_for_branch(rcm, branch):
+                repo_branches.setdefault(repo, []).append(branch)
+        repos = [(name, brlist) for name, brlist in sorted(repo_branches.items())]
+    else:
+        die("specify a repo name, --config, or --local-path")
+
+    # Validate that branches are specified
+    for name, branches in repos:
+        if not branches and not args.local_path:
+            die(f"no branches specified for '{name}' — use -b or specify branches in the repos file")
+
+    # Each entry: (label, status, parsed_json, metadata)
+    # status: "ok", "failed", "skipped:<reason>", "error:<reason>"
+    # metadata: {"repo": name, "branch": br, "clone_path": path} or {}
+    summary: list[tuple[str, str, dict | None, dict]] = []
+    has_errors = False
+
+    for repo_name, branches in repos:
+        if args.local_path:
+            for branch in branches or [None]:
+                label = f"{repo_name}" + (f" ({branch})" if branch else "")
+                print(f"\n==> {label}", file=out)
+                rc, parsed = run_validate_tekton(repo_name, branch, passthrough)
+                status = "ok" if rc == 0 else "failed"
+                meta = {"repo": repo_name, "branch": branch, "clone_path": str(Path(repo_name).resolve())}
+                summary.append((label, status, parsed, meta))
+                if rc != 0:
+                    has_errors = True
+        else:
+            if args.clone_protocol == "https":
+                clone_url = f"https://{args.gitlab_host}/{args.target}/{repo_name}.git"
+            else:
+                clone_url = f"git@{args.gitlab_host}:{args.target}/{repo_name}.git"
+
+            for branch in branches:
+                label = f"{repo_name} ({branch})"
+                print(f"\n==> {label}", file=out)
+
+                if args.clone_dir:
+                    base_dir = str(Path(args.clone_dir) / f"{repo_name}-{branch}")
+                    Path(base_dir).mkdir(parents=True, exist_ok=True)
+                else:
+                    base_dir = tempfile.mkdtemp(prefix=f"batch-validate-{repo_name}-")
+
+                cleanup = not args.keep_clones
+                try:
+                    clone_dir = str(Path(base_dir) / repo_name)
+                    log(f"  sparse-cloning {clone_url} @ {branch}")
+
+                    clone_err = sparse_clone(clone_url, branch, clone_dir)
+                    if clone_err:
+                        if "not found" in clone_err:
+                            print(f"  {clone_err}, skipping", file=out)
+                            summary.append((label, f"skipped: {clone_err}", None, {}))
+                        else:
+                            warn(clone_err)
+                            summary.append((label, f"error: {clone_err}", None, {}))
+                            has_errors = True
+                        continue
+
+                    rc, parsed = run_validate_tekton(clone_dir, None, passthrough)
+                    status = "ok" if rc == 0 else "failed"
+                    meta = {"repo": repo_name, "branch": branch, "clone_path": clone_dir}
+                    summary.append((label, status, parsed, meta))
+                    if rc != 0:
+                        has_errors = True
+                finally:
+                    if cleanup:
+                        shutil.rmtree(base_dir, ignore_errors=True)
+
+    # Summary
+    print("\n" + "=" * 60, file=out)
+    print("Summary:", file=out)
+    ok = 0
+    fixed_count = 0
+    fail = 0
+    skipped = 0
+    for label, status, parsed, meta in summary:
+        if status == "ok":
+            fixed_files = parsed.get("fixed", []) if parsed else []
+            if fixed_files:
+                n = len(fixed_files)
+                verb = "fixed" if args.fix and not args.dry_run else "would fix"
+                print(f"  {label}: ok ({verb} {n} file{'s' if n != 1 else ''})", file=out)
+                fixed_count += 1
+            else:
+                print(f"  {label}: ok", file=out)
+            ok += 1
+        elif status.startswith("skipped"):
+            reason = status.split(": ", 1)[1]
+            print(f"  {label}: SKIPPED ({reason})", file=out)
+            skipped += 1
+        else:
+            print(f"  {label}: FAILED", file=out)
+            fail += 1
+
+    parts = [f"{ok} passed", f"{fail} failed"]
+    if fixed_count:
+        parts.append(f"{fixed_count} {'fixed' if args.fix and not args.dry_run else 'would fix'}")
+    if skipped:
+        parts.append(f"{skipped} skipped")
+    print(f"\n{', '.join(parts)}", file=out)
+
+    if has_errors:
+        unfixed_entries = []
+        for label, status, parsed, meta in summary:
+            if status == "ok" or status.startswith("skipped"):
+                continue
+            fixed_files = set(parsed.get("fixed", [])) if parsed else set()
+            errors = []
+            if parsed:
+                for filename, data in sorted(parsed.get("files", {}).items()):
+                    if filename in fixed_files:
+                        continue
+                    for e in data.get("errors", []):
+                        errors.append(f"  {filename}: {e}")
+            elif status.startswith("error"):
+                reason = status.split(": ", 1)[1]
+                errors.append(f"  {reason}")
+            if errors:
+                unfixed_entries.append((label, errors))
+
+        if unfixed_entries:
+            print("\n" + "=" * 60, file=out)
+            header = "Unfixable errors (require manual resolution):" if args.fix else "Errors (use --fix to attempt auto-fix):"
+            print(f"{header}\n", file=out)
+            for label, errors in unfixed_entries:
+                print(f"==> {label}", file=out)
+                for e in errors:
+                    print(e, file=out)
+                print(file=out)
+
+    if args.json:
+        results = []
+        for label, status, parsed, meta in summary:
+            entry = {**meta, "status": status}
+            if parsed:
+                entry["files"] = parsed.get("files", {})
+                entry["fixed"] = parsed.get("fixed", [])
+                entry["summary"] = parsed.get("summary", {})
+                if "title" in parsed:
+                    entry["title"] = parsed["title"]
+                if "changes" in parsed:
+                    entry["changes"] = parsed["changes"]
+            results.append(entry)
+        print(json.dumps({"results": results}, indent=2))
+
+    if has_errors:
+        sys.exit(5)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,754 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["ruamel.yaml", "jinja2", "cel-python"]
+# ///
+"""Validate Tekton PipelineRun files in the current repo.
+
+Run from the root of a cloned git repo. Reads .tekton/ files from the
+working tree and validates them against a security policy. Fix mode
+writes corrected files, optionally committing and creating an MR.
+"""
+
+import argparse
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+from ruamel.yaml import YAML
+
+_repo_root = Path(__file__).resolve().parent.parent
+from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
+from lib.tekton_config import load_config
+from lib.tekton_filters import DELETE_FILE_PREFIX
+from lib.tekton_matchers import make_parent_matchers
+
+DEFAULT_CONFIG_DIR = str(_repo_root / "embargo-templates")
+
+verbose = False
+json_mode = False
+
+
+def log(msg: str):
+    if verbose:
+        print(msg, file=sys.stderr)
+
+
+def info(msg: str):
+    print(msg, file=sys.stderr if json_mode else sys.stdout)
+
+
+def warn(msg: str):
+    print(f"warning: {msg}", file=sys.stderr)
+
+
+def die(msg: str):
+    print(f"error: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+
+def git(*args, check=True, **kwargs) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, check=check, **kwargs)
+
+
+# --- Pipeline loading ---
+
+
+def _glob_tekton_files(base_dir: Path, layout: str = "flat"):
+    """Yield PipelineRun YAML file paths for the given layout.
+
+    Args:
+        base_dir: For 'flat' layout, the .tekton/ directory.
+                  For 'nested' layout, the repo root.
+        layout: 'flat' (.tekton/*.yaml) or 'nested' (pipelineruns/*/.tekton/*.yaml).
+    """
+    if layout == "nested":
+        yield from sorted(base_dir.glob("pipelineruns/*/.tekton/*.yaml"))
+    else:
+        yield from sorted(base_dir.glob("*.yaml"))
+
+
+def _load_pipelines(tekton_dir: Path, namespace_filter: str | None, config=None, layout: str = "flat"):
+    """Load PipelineRun files and build parent pipeline indexes.
+
+    Returns (pipelines, parent_indexes, yaml_errors, skipped_ns) where:
+      pipelines: {filepath: parsed_data}
+      parent_indexes: {template_name: {component_prefix: parsed_data}}
+      yaml_errors: {filepath: error_message}
+    """
+    ruamel = YAML()
+    ruamel.preserve_quotes = True
+
+    parent_template_names = config.parent_template_names() if config else {"push"}
+
+    pipelines = {}
+    parent_indexes = {name: {} for name in parent_template_names}
+    yaml_errors = {}
+    skipped_ns = 0
+    for filepath in _glob_tekton_files(tekton_dir, layout):
+        try:
+            with open(filepath) as f:
+                data = ruamel.load(f)
+        except Exception as e:
+            if "expected a single document" in str(e):
+                log(f"  {filepath.name}: multi-document YAML, skipping")
+                continue
+            yaml_errors[filepath] = f"invalid YAML: {e}"
+            continue
+
+        if not isinstance(data, dict) or data.get("kind") != "PipelineRun":
+            log(f"  {filepath.name}: not a PipelineRun, skipping")
+            continue
+
+        if namespace_filter and data.get("metadata", {}).get("namespace") != namespace_filter:
+            log(f"  {filepath.name}: namespace '{data.get('metadata', {}).get('namespace')}', skipping")
+            skipped_ns += 1
+            continue
+
+        pipelines[filepath] = data
+        pipeline_type = classify_pipeline(filepath.name, data, config=config)
+        if pipeline_type in parent_template_names:
+            prefix = extract_component_prefix(filepath.name, data)
+            if prefix:
+                parent_indexes[pipeline_type][prefix] = data
+
+    return pipelines, parent_indexes, yaml_errors, skipped_ns
+
+
+def _load_parent_pipelines_from_ref(ref: str, repo_root: Path, config, layout: str = "flat"):
+    """Load parent pipelines from a git ref (e.g. origin/rhoai-3.6).
+
+    Uses git ls-tree and git show to read PipelineRun files from the ref
+    without checking it out. Returns parent_indexes in the same format
+    as _load_pipelines.
+
+    Args:
+        ref: Git ref to read from (e.g. "origin/rhoai-3.6").
+        repo_root: Path to the git repo root.
+        config: PipelineConfig instance.
+        layout: 'flat' or 'nested'.
+
+    Returns:
+        parent_indexes: {template_name: {component_prefix: parsed_data}}
+    """
+    from io import StringIO
+
+    ruamel = YAML()
+    ruamel.preserve_quotes = True
+
+    parent_template_names = config.parent_template_names()
+    parent_indexes = {name: {} for name in parent_template_names}
+
+    # List files from the ref
+    if layout == "nested":
+        ls_path = "pipelineruns/"
+    else:
+        ls_path = ".tekton/"
+
+    r = git("ls-tree", "-r", "--name-only", ref, "--", ls_path, check=False, cwd=str(repo_root))
+    if r.returncode != 0:
+        warn(f"failed to list files from {ref}: {r.stderr.strip()}")
+        return parent_indexes
+
+    yaml_files = [line for line in r.stdout.strip().split("\n") if line.endswith(".yaml")]
+    log(f"  loading {len(yaml_files)} files from {ref}")
+
+    for filepath_str in yaml_files:
+        r = git("show", f"{ref}:{filepath_str}", check=False, cwd=str(repo_root))
+        if r.returncode != 0:
+            log(f"  {filepath_str}: failed to read from {ref}")
+            continue
+
+        try:
+            data = ruamel.load(StringIO(r.stdout))
+        except Exception as e:
+            log(f"  {filepath_str}: invalid YAML: {e}")
+            continue
+
+        if not isinstance(data, dict) or data.get("kind") != "PipelineRun":
+            continue
+
+        filename = Path(filepath_str).name
+        pipeline_type = classify_pipeline(filename, data, config=config)
+        if pipeline_type in parent_template_names:
+            prefix = extract_component_prefix(filename, data)
+            if prefix:
+                parent_indexes[pipeline_type][prefix] = data
+                log(f"  {filename}: loaded as {pipeline_type} parent (prefix: {prefix})")
+
+    total = sum(len(idx) for idx in parent_indexes.values())
+    info(f"  loaded {total} parent pipelines from {ref}")
+    return parent_indexes
+
+
+def _find_parent_pipeline(child_data: dict, candidate_pipelines: dict, match_fn_names: list[str], component_aliases: dict | None = None) -> dict | None:
+    """Find a parent pipeline for a child using configured match functions.
+
+    Iterates match_fn_names in order. For each matcher, iterates all candidates.
+    Returns the first match found. For component_starts_with, only matches if
+    exactly one candidate matches (replicating the original single-match guard).
+    """
+    all_parent_matchers = make_parent_matchers()
+    for fn_name in match_fn_names:
+        fn = all_parent_matchers.get(fn_name)
+        if not fn:
+            continue
+        if fn_name == "alias_match":
+            matches = [data for data in candidate_pipelines.values() if fn(data, child_data, aliases=component_aliases)]
+        else:
+            matches = [data for data in candidate_pipelines.values() if fn(data, child_data)]
+        if fn_name == "component_starts_with":
+            if len(matches) == 1:
+                return matches[0]
+        elif matches:
+            return matches[0]
+    return None
+
+
+def _resolve_pipeline_overlay(config, tmpl_config, filepath, data):
+    """Resolve a template overlay for a pipeline file."""
+    prefix = extract_component_prefix(filepath.name, data)
+    label = data.get("metadata", {}).get("labels", {}).get(
+        "appstudio.openshift.io/component")
+    return resolve_overlay(config.config_dir, tmpl_config.file, prefix, label)
+
+
+# --- Validate ---
+
+
+def validate_tekton_dir(
+    tekton_dir: Path,
+    branch: str | None,
+    namespace_filter: str | None,
+    config=None,
+    cli_vars: dict | None = None,
+    pipelines_data: dict | None = None,
+    external_parent_indexes: dict | None = None,
+    layout: str = "flat",
+) -> dict:
+    if config is None:
+        config = load_config(DEFAULT_CONFIG_DIR)
+
+    if pipelines_data is not None:
+        pipelines = {Path(name): data for name, data in pipelines_data.items()}
+        parent_template_names = config.parent_template_names()
+        parent_indexes = {name: {} for name in parent_template_names}
+        for name, data in pipelines_data.items():
+            pipeline_type = classify_pipeline(name, data, config=config)
+            if pipeline_type in parent_template_names:
+                prefix = extract_component_prefix(name, data)
+                if prefix:
+                    parent_indexes[pipeline_type][prefix] = data
+        yaml_errors = {}
+    else:
+        pipelines, parent_indexes, yaml_errors, _ = _load_pipelines(tekton_dir, namespace_filter, config, layout=layout)
+
+    # Use external parent indexes if provided (cross-branch parenting)
+    if external_parent_indexes is not None:
+        parent_indexes = external_parent_indexes
+
+    results = {}
+    for filepath, msg in sorted(yaml_errors.items()):
+        results[filepath.name] = {"errors": [msg], "warnings": []}
+
+    for filepath, data in sorted(pipelines.items()):
+        pipeline_type = classify_pipeline(filepath.name, data, config=config)
+        tmpl_config = config.get_template(pipeline_type)
+        if not tmpl_config:
+            log(f"  {filepath.name}: unknown pipeline type '{pipeline_type}', skipping")
+            continue
+
+        template_path = str(Path(config.config_dir) / tmpl_config.file)
+
+        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+        if overlay:
+            overlay_rel = str(Path(overlay).relative_to(config.config_dir))
+            info(f"  {filepath.name}: using overlay {overlay_rel}")
+
+        # For child templates, use the parent template to check for delete signals.
+        # Skip this check when using cross-branch parents (delete signals are
+        # specific to embargo builds and don't apply to cross-branch migrations).
+        if tmpl_config.parent and external_parent_indexes is None:
+            parent_tmpl = config.get_template(tmpl_config.parent.template)
+            if parent_tmpl:
+                check_template = str(Path(config.config_dir) / parent_tmpl.file)
+                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data)
+                check_errors = []
+                render_and_merge(
+                    str(Path(check_template).parent), Path(check_template).name,
+                    data, filepath.name, branch, mode="validate", errors=check_errors, cli_vars=cli_vars,
+                    overlay_path=check_overlay,
+                )
+                delete_signals = [e for e in check_errors if e.startswith(DELETE_FILE_PREFIX)]
+                if delete_signals:
+                    results[filepath.name] = {
+                        "errors": [e.removeprefix(DELETE_FILE_PREFIX) for e in delete_signals],
+                        "warnings": [],
+                        "pipeline_type": pipeline_type,
+                        "delete": True,
+                    }
+                    continue
+        elif not tmpl_config.parent:
+            # Non-child templates still check for delete signals
+            check_errors = []
+            render_and_merge(
+                str(Path(template_path).parent), Path(template_path).name,
+                data, filepath.name, branch, mode="validate", errors=check_errors, cli_vars=cli_vars,
+                overlay_path=overlay,
+            )
+            delete_signals = [e for e in check_errors if e.startswith(DELETE_FILE_PREFIX)]
+            if delete_signals:
+                results[filepath.name] = {
+                    "errors": [e.removeprefix(DELETE_FILE_PREFIX) for e in delete_signals],
+                    "warnings": [],
+                    "pipeline_type": pipeline_type,
+                    "delete": True,
+                }
+                continue
+
+        parent_data = None
+        if tmpl_config.parent:
+            parent_data = _find_parent_pipeline(
+                data, parent_indexes.get(tmpl_config.parent.template, {}),
+                tmpl_config.parent.match_fns,
+                component_aliases=config.component_aliases,
+            )
+            if parent_data is None:
+                prefix = extract_component_prefix(filepath.name, data)
+                results[filepath.name] = {
+                    "errors": [f"no matching {tmpl_config.parent.template} pipeline found (expected prefix '{prefix}')"],
+                    "warnings": [],
+                    "pipeline_type": pipeline_type,
+                }
+                continue
+
+        template_dir = str(Path(template_path).parent)
+        template_name = Path(template_path).name
+        inherit = tmpl_config.parent.inherit_params if tmpl_config.parent else False
+        errors = []
+        warnings = []
+        render_and_merge(
+            template_dir, template_name, data, filepath.name, branch,
+            parent_data=parent_data, mode="validate", errors=errors, warnings=warnings,
+            cli_vars=cli_vars, inherit_params=inherit, overlay_path=overlay,
+        )
+
+        results[filepath.name] = {
+            "errors": errors,
+            "warnings": warnings,
+            "pipeline_type": pipeline_type,
+        }
+    return results
+
+
+# --- Fix ---
+
+
+def fix_tekton_dir(
+    tekton_dir: Path,
+    branch: str,
+    namespace_filter: str | None,
+    dry_run: bool,
+    config=None,
+    cli_vars: dict | None = None,
+    external_parent_indexes: dict | None = None,
+    layout: str = "flat",
+) -> tuple[list[str], dict]:
+    """Fix tekton files. Returns (fixed_filenames, post_fix_data).
+
+    post_fix_data is {filename: data} for all pipelines after fixes,
+    excluding deleted files. Usable for in-memory re-validation.
+
+    When external_parent_indexes is provided, parent pipelines come from
+    an external source (e.g. a different git branch) and Phase 1 (fixing
+    parent pipelines) is skipped.
+    """
+    if config is None:
+        config = load_config(DEFAULT_CONFIG_DIR)
+
+    ruamel = YAML()
+    ruamel.preserve_quotes = True
+    ruamel.width = 4096
+
+    pipelines, parent_indexes, _, _ = _load_pipelines(tekton_dir, namespace_filter, config, layout=layout)
+
+    # Use external parent indexes if provided (cross-branch parenting)
+    if external_parent_indexes is not None:
+        parent_indexes = external_parent_indexes
+
+    fixed_files = []
+    deleted_files = set()
+    post_fix_data = {}
+
+    # Phase 1: Fix non-child pipelines (those with no parent config).
+    # Skip when using external parents — parents are read-only.
+    if external_parent_indexes is None:
+        for filepath, data in sorted(pipelines.items()):
+            pipeline_type = classify_pipeline(filepath.name, data, config=config)
+            tmpl_config = config.get_template(pipeline_type)
+
+            if tmpl_config and tmpl_config.parent:
+                post_fix_data[filepath.name] = data
+                continue
+
+            if not tmpl_config:
+                post_fix_data[filepath.name] = data
+                continue
+
+            overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+            if overlay:
+                overlay_rel = str(Path(overlay).relative_to(config.config_dir))
+                info(f"  {filepath.name}: using overlay {overlay_rel}")
+
+            template_dir = config.config_dir
+            template_name = tmpl_config.file
+            errors = []
+            result = render_and_merge(template_dir, template_name, data, filepath.name, branch, mode="fix", errors=errors, cli_vars=cli_vars, overlay_path=overlay)
+
+            if any(e.startswith(DELETE_FILE_PREFIX) for e in errors):
+                if not dry_run:
+                    filepath.unlink()
+                info(f"  {filepath.name}: {'deleted' if not dry_run else 'would delete'}")
+                fixed_files.append(filepath.name)
+                deleted_files.add(filepath.name)
+                prefix = extract_component_prefix(filepath.name, data)
+                if prefix and pipeline_type in parent_indexes:
+                    parent_indexes[pipeline_type].pop(prefix, None)
+                continue
+
+            if result != data:
+                if not dry_run:
+                    with open(filepath, "w") as f:
+                        ruamel.dump(result, f)
+                info(f"  {filepath.name}: {'fixed' if not dry_run else 'would fix'} via template")
+                fixed_files.append(filepath.name)
+                prefix = extract_component_prefix(filepath.name, data)
+                if prefix and pipeline_type in parent_indexes:
+                    parent_indexes[pipeline_type][prefix] = result
+
+            post_fix_data[filepath.name] = result
+    else:
+        # With external parents, just populate post_fix_data for non-child pipelines
+        for filepath, data in sorted(pipelines.items()):
+            pipeline_type = classify_pipeline(filepath.name, data, config=config)
+            tmpl_config = config.get_template(pipeline_type)
+            if not tmpl_config or not tmpl_config.parent:
+                post_fix_data[filepath.name] = data
+
+    # Phase 2: Fix child pipelines (those with a parent config, using fixed parent data)
+    for filepath, data in sorted(pipelines.items()):
+        pipeline_type = classify_pipeline(filepath.name, data, config=config)
+        tmpl_config = config.get_template(pipeline_type)
+        if not tmpl_config or not tmpl_config.parent:
+            continue
+
+        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+        if overlay:
+            overlay_rel = str(Path(overlay).relative_to(config.config_dir))
+            info(f"  {filepath.name}: using overlay {overlay_rel}")
+
+        # Check for delete signals using parent template.
+        # Skip when using cross-branch parents.
+        if external_parent_indexes is None:
+            parent_tmpl = config.get_template(tmpl_config.parent.template)
+            if parent_tmpl:
+                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data)
+                check_errors = []
+                render_and_merge(
+                    config.config_dir, parent_tmpl.file, data, filepath.name, branch,
+                    mode="fix", errors=check_errors, cli_vars=cli_vars,
+                    overlay_path=check_overlay,
+                )
+                if any(e.startswith(DELETE_FILE_PREFIX) for e in check_errors):
+                    if not dry_run:
+                        filepath.unlink()
+                    info(f"  {filepath.name}: {'deleted' if not dry_run else 'would delete'}")
+                    fixed_files.append(filepath.name)
+                    deleted_files.add(filepath.name)
+                    del post_fix_data[filepath.name]
+                    continue
+
+        parent_data = _find_parent_pipeline(
+            data, parent_indexes.get(tmpl_config.parent.template, {}),
+            tmpl_config.parent.match_fns,
+            component_aliases=config.component_aliases,
+        )
+        if parent_data is None:
+            prefix = extract_component_prefix(filepath.name, data)
+            warn(f"{filepath.name}: no matching {tmpl_config.parent.template} pipeline found (expected prefix '{prefix}'), skipping")
+            continue
+
+        inherit = tmpl_config.parent.inherit_params if tmpl_config.parent else False
+        errors = []
+        result = render_and_merge(
+            config.config_dir, tmpl_config.file, data, filepath.name, branch,
+            parent_data=parent_data, mode="fix", errors=errors, warnings=[],
+            cli_vars=cli_vars, inherit_params=inherit, overlay_path=overlay,
+        )
+
+        if any(e.startswith(DELETE_FILE_PREFIX) for e in errors):
+            if not dry_run:
+                filepath.unlink()
+            info(f"  {filepath.name}: {'deleted' if not dry_run else 'would delete'}")
+            fixed_files.append(filepath.name)
+            deleted_files.add(filepath.name)
+            del post_fix_data[filepath.name]
+            continue
+
+        if result != data:
+            if not dry_run:
+                with open(filepath, "w") as f:
+                    ruamel.dump(result, f)
+            info(f"  {filepath.name}: {'fixed' if not dry_run else 'would fix'} via template")
+            fixed_files.append(filepath.name)
+
+        post_fix_data[filepath.name] = result
+
+    return fixed_files, post_fix_data
+
+
+# --- Main ---
+
+
+def main():
+    global verbose, json_mode
+
+    parser = argparse.ArgumentParser(
+        description="Validate Tekton PipelineRun files in the current repo.",
+    )
+    parser.add_argument(
+        "-b", "--branch",
+        help="Branch name for validation (checks out by default, see --no-checkout)",
+    )
+    parser.add_argument(
+        "--no-checkout",
+        action="store_true",
+        help="Use --branch for validation only, don't check out",
+    )
+    parser.add_argument(
+        "-n", "--namespace",
+        help="Only validate PipelineRuns in this namespace",
+    )
+    parser.add_argument("--fix", action="store_true", help="Write corrected files to working tree")
+    parser.add_argument(
+        "--config-dir", required=True,
+        help="Directory containing templates and config.yaml (e.g. embargo-templates/ or kc-migration-templates/)",
+    )
+    parser.add_argument(
+        "--config-file", default=None,
+        help="Explicit path to config YAML (overrides config.yaml in --config-dir)",
+    )
+    parser.add_argument(
+        "--var", action="append", metavar="KEY=VALUE",
+        help="Set a template variable (e.g. --var rhoai-version=2.25.7). Accessible in templates as vars['key'].",
+    )
+    parser.add_argument("--json", action="store_true", help="Output results as JSON")
+    parser.add_argument("--dry-run", action="store_true", help="Show what would be done")
+    parser.add_argument("--path", help="Path to the target repo (default: current directory)")
+    parser.add_argument(
+        "--parent-ref", default=None,
+        help="Git ref to load parent pipelines from (overrides config parent_ref)",
+    )
+    parser.add_argument(
+        "--tekton-layout", default=None, choices=["flat", "nested"],
+        help="Pipeline file layout: flat (.tekton/) or nested (pipelineruns/*/.tekton/). Overrides config tekton_layout.",
+    )
+    parser.add_argument("--verbose", action="store_true", help="Show detailed progress on stderr")
+    args = parser.parse_args()
+    verbose = args.verbose
+    json_mode = args.json
+
+    cli_vars = {}
+    for item in args.var or []:
+        if "=" not in item:
+            die(f"invalid --var format: '{item}' (expected KEY=VALUE)")
+        k, v = item.split("=", 1)
+        cli_vars[k] = v
+
+    # Resolve path args to absolute before any chdir
+    args.config_dir = str(Path(args.config_dir).resolve())
+    if args.config_file:
+        args.config_file = str(Path(args.config_file).resolve())
+
+    if args.path:
+        repo_root_arg = Path(args.path).resolve()
+        if not repo_root_arg.is_dir():
+            die(f"--path does not exist: {repo_root_arg}")
+        import os
+        os.chdir(repo_root_arg)
+
+    # Verify we're in a git repo
+    r = git("rev-parse", "--show-toplevel", check=False)
+    if r.returncode != 0:
+        die("not inside a git repository")
+    repo_root = Path(r.stdout.strip())
+
+    # Check out branch if specified (unless --no-checkout)
+    if args.branch and not args.no_checkout:
+        log(f"checking out {args.branch}...")
+        r = git("checkout", args.branch, check=False)
+        if r.returncode != 0:
+            die(f"failed to checkout '{args.branch}': {r.stderr.strip()}")
+
+    current_branch = args.branch or git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+
+    config = load_config(args.config_dir, args.config_file)
+
+    # Resolve layout: CLI override > config > default
+    layout = args.tekton_layout or config.tekton_layout
+    parent_ref = args.parent_ref or config.parent_ref
+
+    if layout == "nested":
+        tekton_dir = repo_root
+        if not any(repo_root.glob("pipelineruns/*/.tekton/*.yaml")):
+            info("no pipelineruns/*/.tekton/ files found")
+            return
+    else:
+        tekton_dir = repo_root / ".tekton"
+        if not tekton_dir.exists():
+            info("no .tekton/ directory found")
+            return
+
+    # Load external parent pipelines if configured
+    external_parent_indexes = None
+    if parent_ref:
+        info(f"==> Loading parent pipelines from {parent_ref}")
+        external_parent_indexes = _load_parent_pipelines_from_ref(
+            parent_ref, repo_root, config, layout=layout,
+        )
+
+    # Validate
+    prefix = "[dry-run] " if args.dry_run else ""
+    layout_desc = "pipelineruns/*/.tekton/" if layout == "nested" else ".tekton/"
+    info(f"==> {prefix}Validating {layout_desc} on branch {current_branch}")
+
+    results = validate_tekton_dir(
+        tekton_dir, current_branch, args.namespace,
+        config=config, cli_vars=cli_vars,
+        external_parent_indexes=external_parent_indexes,
+        layout=layout,
+    )
+
+    if not results:
+        total_yaml = len(list(_glob_tekton_files(tekton_dir, layout)))
+        if args.namespace and total_yaml:
+            info(f"  no PipelineRun files in namespace '{args.namespace}' ({total_yaml} files in other namespaces)")
+        else:
+            info("  no PipelineRun files found")
+        return
+
+    totals = {"ok": 0, "errors": 0, "warnings": 0}
+    has_errors = False
+
+    for filename, result in sorted(results.items()):
+        errors = result.get("errors", [])
+        warnings = result.get("warnings", [])
+        totals["errors"] += len(errors)
+        totals["warnings"] += len(warnings)
+        if errors:
+            has_errors = True
+        else:
+            totals["ok"] += 1
+
+    # Fix
+    final_results = results
+    final_totals = totals
+    fixed = []
+    pre_fix_errors = {}
+    if args.fix and has_errors:
+        pre_fix_errors = {
+            fname: result.get("errors", [])
+            for fname, result in results.items()
+            if result.get("errors")
+        }
+        fixed, post_fix_data = fix_tekton_dir(
+            tekton_dir, current_branch, args.namespace, args.dry_run,
+            config=config, cli_vars=cli_vars,
+            external_parent_indexes=external_parent_indexes,
+            layout=layout,
+        )
+
+        if fixed:
+            # Re-validate post-fix state in memory (no disk I/O needed)
+            final_results = validate_tekton_dir(
+                tekton_dir, current_branch, args.namespace,
+                config=config,
+                pipelines_data=post_fix_data,
+                external_parent_indexes=external_parent_indexes,
+            )
+            final_totals = {"ok": 0, "errors": 0, "warnings": 0}
+            for result in final_results.values():
+                errs = result.get("errors", [])
+                warns = result.get("warnings", [])
+                final_totals["errors"] += len(errs)
+                final_totals["warnings"] += len(warns)
+                if not errs:
+                    final_totals["ok"] += 1
+
+    # Print results
+    fixed_set = set(fixed) if fixed else set()
+    if not args.json:
+        unfixed_errors = 0
+        if not fixed:
+            # No fix ran — show all errors
+            for filename, result in sorted(final_results.items()):
+                errors = result.get("errors", [])
+                warnings = result.get("warnings", [])
+                if not errors and not warnings:
+                    info(f"  {filename}: ok")
+                else:
+                    unfixed_errors += len(errors)
+                    info(f"  {filename}:")
+                    for e in errors:
+                        info(f"    ERROR: {e}")
+                    for w in warnings:
+                        info(f"    warning: {w}")
+        else:
+            # Fix ran — fix_tekton_dir already printed per-file progress,
+            # only show remaining errors
+            for filename, result in sorted(final_results.items()):
+                errors = result.get("errors", [])
+                if errors and filename in fixed_set:
+                    unfixed_errors += len(errors)
+                    info(f"  {filename}: (partially fixed, {len(errors)} remaining)")
+                    for e in errors:
+                        info(f"    ERROR: {e}")
+                elif errors:
+                    unfixed_errors += len(errors)
+                    info(f"  {filename}:")
+                    for e in errors:
+                        info(f"    ERROR: {e}")
+
+        summary_parts = [f"{final_totals['ok']} ok", f"{unfixed_errors} errors", f"{final_totals['warnings']} warnings"]
+        if fixed:
+            summary_parts.append(f"{len(fixed)} {'fixed' if not args.dry_run else 'would fix'}")
+        info(f"\n==> {', '.join(summary_parts)}")
+
+    if args.json:
+        output = {"files": final_results, "summary": final_totals}
+        if args.fix and has_errors:
+            output["fixed"] = fixed if fixed else []
+        if fixed:
+            output["title"] = f"Validate and fix tekton file issues on {current_branch}"
+            output["changes"] = [
+                {"file": f, "details": pre_fix_errors.get(f, [])}
+                for f in fixed
+            ]
+        print(json.dumps(output, indent=2))
+
+    if final_totals["errors"]:
+        if args.fix and fixed:
+            fixed_set = set(fixed)
+            unfixable = any(
+                result.get("errors") for fname, result in final_results.items()
+                if fname not in fixed_set
+            )
+            if not unfixable:
+                sys.exit(0)
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
