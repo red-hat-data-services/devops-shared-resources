@@ -30,6 +30,7 @@ ENV_TRIGGER_ID = "GAP_TRIGGER_ID"
 ENV_PR_LABELS = "GAP_PR_LABELS"
 ENV_LEADER_REPO = "GAP_LEADER_REPO"
 ENV_LEADER_LABEL = "GAP_LEADER_LABEL"
+ENV_LEADER_PR_URL = "GAP_LEADER_PR_URL"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -42,11 +43,18 @@ from lib.pr_status_updater import (
     StatusUpdateResult,
     parse_pr_url,
 )
+from lib.state_file import (
+    OVERALL_STATUS_FAILURE,
+    OVERALL_STATUS_SUCCESS,
+    OVERALL_STATUSES,
+)
 
 DEFAULT_CHECK_NAME = "gated artifacts promoter"
 DEFAULT_LEADER_LABEL = "gated-artifacts-promoter"
 SUCCESS_PR_STATUS = "success"
 MERGE_FAILURE_PR_STATUS = "merge-failure"
+# Child statuses that mean Stage-1 classification is done for that PR.
+STAGE1_TERMINAL_PR_STATUSES = frozenset({SUCCESS_PR_STATUS, MERGE_FAILURE_PR_STATUS})
 TRIGGER_ID_RE = re.compile(r"^gap-[A-Za-z0-9._-]+$")
 # Parent directory for per-trigger Leader state files (sync / RHOAIENG-93564).
 GAP_LEADERS_DIR = "GAP Leaders"
@@ -96,6 +104,8 @@ class MonitorResult:
     merge_failure_urls: list[str]
     success_urls: list[str]
     dry_run: bool
+    overall_status: str | None = None
+    leader_status_posted: bool = False
 
 
 @dataclass(frozen=True)
@@ -180,7 +190,8 @@ def resolve_inputs_for_cli(
     state_file: str | None,
     trigger_id: str | None,
     labels: Sequence[str] | None,
-) -> tuple[str | None, str | None, list[str] | None]:
+    leader_pr_url: str | None = None,
+) -> tuple[str | None, str | None, list[str] | None, str | None]:
     """Merge CLI flags with GAP_* CI env vars (CLI wins when set)."""
     resolved_state = (state_file or "").strip() or _env_nonempty(ENV_STATE_FILE)
     resolved_trigger = (trigger_id or "").strip() or _env_nonempty(ENV_TRIGGER_ID)
@@ -189,7 +200,8 @@ def resolve_inputs_for_cli(
     else:
         from_env = split_labels_csv(os.environ.get(ENV_PR_LABELS))
         resolved_labels = from_env or None
-    return resolved_state, resolved_trigger, resolved_labels
+    resolved_leader = (leader_pr_url or "").strip() or _env_nonempty(ENV_LEADER_PR_URL)
+    return resolved_state, resolved_trigger, resolved_labels, resolved_leader
 
 
 def append_github_output(key: str, value: str, *, output_file: str | None = None) -> None:
@@ -326,6 +338,44 @@ def apply_success_statuses(payload: dict[str, Any], urls: Sequence[str]) -> None
     apply_pr_statuses(payload, {u: SUCCESS_PR_STATUS for u in urls})
 
 
+def compute_overall_status(payload: dict[str, Any]) -> str | None:
+    """Derive overall-status once every child PR has a Stage-1 final status.
+
+    Stage-1 finals: ``success`` / ``merge-failure`` (RHOAIENG-97052).
+
+    - all ``success`` → ``success``
+    - any ``merge-failure`` (and none still in progress) → ``failure``
+    - any non-terminal child (e.g. ``new``) → ``None`` (do not conclude yet)
+    """
+    entries = payload.get("pull-requests") or []
+    if not entries:
+        return None
+    statuses: list[str] = []
+    for index, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            raise GapPrMonitorError(f"pull-requests[{index}] must be an object.")
+        status = str(entry.get("pr-status") or "").strip()
+        if status not in STAGE1_TERMINAL_PR_STATUSES:
+            return None
+        statuses.append(status)
+    if any(status == MERGE_FAILURE_PR_STATUS for status in statuses):
+        return OVERALL_STATUS_FAILURE
+    return OVERALL_STATUS_SUCCESS
+
+
+def apply_overall_status(payload: dict[str, Any], overall_status: str | None) -> None:
+    """Set or clear top-level overall-status on the state payload."""
+    if overall_status is None:
+        payload.pop("overall-status", None)
+        return
+    if overall_status not in OVERALL_STATUSES:
+        raise GapPrMonitorError(
+            f"Invalid overall-status {overall_status!r}; "
+            f"expected one of {sorted(OVERALL_STATUSES)}."
+        )
+    payload["overall-status"] = overall_status
+
+
 def _run_gh(args: Sequence[str]) -> str:
     command = ["gh", *args]
     try:
@@ -432,10 +482,18 @@ def run_stage1_monitor(
     dry_run: bool = False,
     continue_on_error: bool = False,
     description: str | None = None,
+    leader_pr_url: str | None = None,
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> MonitorResult:
-    """Classify PRs, post statuses, and update state.json (Stage 1)."""
+    """Classify PRs, post statuses, and update state.json (Stage 1).
+
+    RHOAIENG-97052: once every child PR has a Stage-1 final status, write
+    ``overall-status`` into ``state.json``. When that value is ``success``
+    (every component PR succeeded) and ``leader_pr_url`` is provided, post a
+    green ``gated artifacts promoter`` status on the Leader PR so auto-merge
+    can land history on main.
+    """
     path = state_path.expanduser().resolve()
     payload = load_state(path)
     pr_urls = extract_pr_urls(payload)
@@ -502,6 +560,7 @@ def run_stage1_monitor(
         # Still persist what we know when continue_on_error.
         if status_updates and not dry_run:
             apply_pr_statuses(payload, status_updates)
+            # Partial runs stay in progress — do not conclude overall-status.
             save_state(path, payload)
         details = classify_errors + post_errors
         lines = [f"  - {u}: {e}" for u, e in details]
@@ -510,6 +569,48 @@ def run_stage1_monitor(
         )
 
     apply_pr_statuses(payload, status_updates)
+
+    # RHOAIENG-97052: conclude only when every component PR is Stage-1 final.
+    # Auto-merge the Leader when overall-status is success (all children success).
+    overall_status = compute_overall_status(payload)
+    apply_overall_status(payload, overall_status)
+
+    leader_status_posted = False
+    leader_url = (leader_pr_url or "").strip() or None
+    if overall_status == OVERALL_STATUS_SUCCESS and leader_url:
+        leader_desc = (
+            "GAP overall-status=success (every component PR final/success); "
+            "auto-merge Leader for history (RHOAIENG-97052)"
+        )
+        try:
+            leader_result: StatusUpdateResult = updater.post_status_for_pr(
+                leader_url,
+                "completed",
+                description=leader_desc,
+            )
+            leader_status_posted = not leader_result.skipped
+            if leader_status_posted:
+                updated.append(leader_url)
+            else:
+                skipped.append(leader_url)
+        except (ValueError, RuntimeError, GhCommandError) as exc:
+            if not continue_on_error:
+                if not dry_run:
+                    save_state(path, payload)
+                raise GapPrMonitorError(
+                    f"Failed to post Leader conclusion status for {leader_url}: {exc}"
+                ) from exc
+            print(
+                f"WARNING: Failed to post Leader conclusion status for {leader_url}: {exc}",
+                file=sys.stderr,
+            )
+    elif overall_status == OVERALL_STATUS_SUCCESS and not leader_url:
+        print(
+            "WARNING: overall-status=success but no Leader PR URL was provided "
+            f"(--leader-pr-url / {ENV_LEADER_PR_URL}); skipped Leader self-status.",
+            file=sys.stderr,
+        )
+
     if not dry_run:
         save_state(path, payload)
 
@@ -520,6 +621,8 @@ def run_stage1_monitor(
         merge_failure_urls=merge_failures,
         success_urls=successes,
         dry_run=dry_run,
+        overall_status=overall_status,
+        leader_status_posted=leader_status_posted,
     )
 
 
@@ -716,6 +819,8 @@ def run_scheduled_monitors(
                 dry_run=dry_run,
                 continue_on_error=continue_on_error,
                 description=description,
+                # Scheduled runs know each Leader URL from discovery (RHOAIENG-97052).
+                leader_pr_url=leader.url,
                 updater_factory=updater_factory,
                 gh_runner=gh_runner,
             )
@@ -817,6 +922,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--leader-pr-url",
+        default=None,
+        metavar="URL",
+        help=(
+            "Leader PR URL. When overall-status is success, post a green "
+            f"{DEFAULT_CHECK_NAME!r} status on this PR so auto-merge can "
+            f"preserve run history (RHOAIENG-97052). "
+            f"Also accepted via {ENV_LEADER_PR_URL}."
+        ),
+    )
+    parser.add_argument(
         "--check-name",
         default=DEFAULT_CHECK_NAME,
         help=f"Commit status context (default: {DEFAULT_CHECK_NAME!r}).",
@@ -895,10 +1011,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
 
-    state_file, trigger_id, labels = resolve_inputs_for_cli(
+    state_file, trigger_id, labels, leader_pr_url = resolve_inputs_for_cli(
         state_file=args.state_file,
         trigger_id=args.trigger_id,
         labels=args.labels,
+        leader_pr_url=args.leader_pr_url,
     )
     try:
         state_path = resolve_state_file(
@@ -919,6 +1036,7 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             continue_on_error=args.continue_on_error,
             description=args.description,
+            leader_pr_url=leader_pr_url,
         )
     except GapPrMonitorError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -931,6 +1049,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"{prefix}success: {url}")
     for url in result.merge_failure_urls:
         print(f"{prefix}merge-failure: {url}")
+    if result.overall_status is not None:
+        print(f"{prefix}overall-status: {result.overall_status}")
+        append_github_output("overall_status", result.overall_status)
+    if result.leader_status_posted:
+        print(f"{prefix}Posted Leader conclusion status (auto-merge signal)")
     for url in result.updated_urls:
         print(f"{prefix}Posted status for {url}")
     for url in result.skipped_urls:

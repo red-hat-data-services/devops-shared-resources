@@ -12,10 +12,12 @@ from scripts.gap_pr_monitor import (
     MonitorResult,
     OpenLeaderPr,
     PrMergeInfo,
+    apply_overall_status,
     apply_pr_statuses,
     apply_success_statuses,
     append_github_output,
     classify_pr,
+    compute_overall_status,
     extract_pr_urls,
     extract_trigger_id_from_labels,
     fetch_pr_merge_info,
@@ -311,14 +313,17 @@ def test_resolve_inputs_for_cli_prefers_cli_over_env(
     monkeypatch.setenv("GAP_STATE_FILE", "from-env.json")
     monkeypatch.setenv("GAP_TRIGGER_ID", "gap-from-env")
     monkeypatch.setenv("GAP_PR_LABELS", "gap-from-env-label")
-    state, trigger, labels = resolve_inputs_for_cli(
+    monkeypatch.setenv("GAP_LEADER_PR_URL", "https://github.com/org/leader/pull/1")
+    state, trigger, labels, leader = resolve_inputs_for_cli(
         state_file="cli-state.json",
         trigger_id="gap-from-cli",
         labels=["gap-cli-label"],
+        leader_pr_url="https://github.com/org/leader/pull/9",
     )
     assert state == "cli-state.json"
     assert trigger == "gap-from-cli"
     assert labels == ["gap-cli-label"]
+    assert leader == "https://github.com/org/leader/pull/9"
 
 
 def test_resolve_inputs_for_cli_reads_env_when_cli_empty(
@@ -329,14 +334,17 @@ def test_resolve_inputs_for_cli_reads_env_when_cli_empty(
     monkeypatch.setenv(
         "GAP_PR_LABELS", "gated-artifacts-promoter,gap-from-env-label"
     )
-    state, trigger, labels = resolve_inputs_for_cli(
+    monkeypatch.setenv("GAP_LEADER_PR_URL", "https://github.com/org/leader/pull/2")
+    state, trigger, labels, leader = resolve_inputs_for_cli(
         state_file=None,
         trigger_id=None,
         labels=None,
+        leader_pr_url=None,
     )
     assert state is None
     assert trigger == "gap-from-env"
     assert labels == ["gated-artifacts-promoter", "gap-from-env-label"]
+    assert leader == "https://github.com/org/leader/pull/2"
 
 
 def test_append_github_output_and_relative_path(tmp_path: Path) -> None:
@@ -648,6 +656,9 @@ def test_run_stage1_monitor_posts_success_and_merge_failure(tmp_path: Path) -> N
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["pull-requests"][0]["pr-status"] == "merge-failure"
     assert saved["pull-requests"][1]["pr-status"] == "success"
+    assert saved["overall-status"] == "failure"
+    assert result.overall_status == "failure"
+    assert result.leader_status_posted is False
 
 
 def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
@@ -688,6 +699,471 @@ def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
     ]
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["pull-requests"][0]["pr-status"] == "success"
+    assert saved["overall-status"] == "success"
+    assert result.overall_status == "success"
+
+
+def test_compute_overall_status_in_progress_and_terminal() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "new",
+                        "builds": [],
+                    }
+                ]
+            }
+        )
+        is None
+    )
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                ]
+            }
+        )
+        == "success"
+    )
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "merge-failure",
+                        "builds": [],
+                    },
+                ]
+            }
+        )
+        == "failure"
+    )
+
+
+def test_compute_overall_status_empty_prs() -> None:
+    assert compute_overall_status({"pull-requests": []}) is None
+
+
+def test_compute_overall_status_all_merge_failure() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "merge-failure",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "merge-failure",
+                        "builds": [],
+                    },
+                ]
+            }
+        )
+        == "failure"
+    )
+
+
+def test_compute_overall_status_two_success_one_failure() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "c",
+                        "pr-url": "https://github.com/o/c/pull/3",
+                        "pr-status": "merge-failure",
+                        "builds": [],
+                    },
+                ]
+            }
+        )
+        == "failure"
+    )
+
+
+def test_compute_overall_status_mixed_with_new_stays_in_progress() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "new",
+                        "builds": [],
+                    },
+                ]
+            }
+        )
+        is None
+    )
+
+
+def test_compute_overall_status_build_pending_not_stage1_final() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "build-pending",
+                        "builds": [],
+                    },
+                ]
+            }
+        )
+        is None
+    )
+
+
+def test_apply_overall_status_set_and_clear() -> None:
+    payload: dict[str, Any] = {"pull-requests": []}
+    apply_overall_status(payload, "success")
+    assert payload["overall-status"] == "success"
+    apply_overall_status(payload, "failure")
+    assert payload["overall-status"] == "failure"
+    apply_overall_status(payload, None)
+    assert "overall-status" not in payload
+
+
+def test_apply_overall_status_rejects_invalid() -> None:
+    with pytest.raises(GapPrMonitorError, match="Invalid overall-status"):
+        apply_overall_status({"pull-requests": []}, "pending")
+
+
+def test_run_stage1_monitor_posts_leader_conclusion_status(tmp_path: Path) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ],
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            }
+        }
+    )
+    leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12"
+    result = run_stage1_monitor(
+        path,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+        leader_pr_url=leader,
+    )
+    assert result.overall_status == "success"
+    assert result.leader_status_posted is True
+    posts = holder["u"].posts
+    assert (leader, "completed") in [(u, s) for u, s, _ in posts]
+    leader_post = next(p for p in posts if p[0] == leader)
+    assert "overall-status=success" in (leader_post[2].get("description") or "")
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["overall-status"] == "success"
+
+
+def test_run_stage1_monitor_writes_failure_without_leader_automerge(
+    tmp_path: Path,
+) -> None:
+    """All children final with a merge-failure → overall-status=failure, no Leader signal."""
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ],
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "CONFLICTING",
+                "mergeStateStatus": "DIRTY",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            }
+        }
+    )
+    leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12"
+    result = run_stage1_monitor(
+        path,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+        leader_pr_url=leader,
+    )
+    assert result.overall_status == "failure"
+    assert result.leader_status_posted is False
+    assert all(u != leader for u, _s, _k in holder["u"].posts)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["overall-status"] == "failure"
+
+
+def test_run_stage1_monitor_three_children_all_success_posts_leader(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/85",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "modelmesh-serving",
+                    "pr-url": "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            },
+            "85": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kubeflow/pull/85",
+            },
+            "67": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67",
+            },
+        }
+    )
+    leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/99"
+    result = run_stage1_monitor(
+        path,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+        leader_pr_url=leader,
+    )
+    assert result.overall_status == "success"
+    assert result.leader_status_posted is True
+    assert len(result.success_urls) == 3
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["overall-status"] == "success"
+    assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
+    assert (leader, "completed") in [(u, s) for u, s, _ in holder["u"].posts]
+
+
+def test_run_stage1_monitor_two_success_one_failure_no_leader_signal(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/85",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "modelmesh-serving",
+                    "pr-url": "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            },
+            "85": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kubeflow/pull/85",
+            },
+            "67": {
+                "state": "OPEN",
+                "mergeable": "CONFLICTING",
+                "mergeStateStatus": "DIRTY",
+                "url": "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67",
+            },
+        }
+    )
+    leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/99"
+    result = run_stage1_monitor(
+        path,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+        leader_pr_url=leader,
+    )
+    assert result.overall_status == "failure"
+    assert result.leader_status_posted is False
+    assert all(u != leader for u, _s, _k in holder["u"].posts)
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["overall-status"] == "failure"
+
+
+def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            }
+        }
+    )
+    result = run_stage1_monitor(
+        path,
+        updater_factory=FakeUpdater,
+        gh_runner=fake_gh,
+        leader_pr_url=None,
+    )
+    assert result.overall_status == "success"
+    assert result.leader_status_posted is False
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["overall-status"] == "success"
+    err = capsys.readouterr().err
+    assert "no Leader PR URL" in err
 
 
 def test_run_stage1_monitor_dry_run_does_not_write(tmp_path: Path) -> None:
@@ -715,6 +1191,7 @@ def test_run_stage1_monitor_dry_run_does_not_write(tmp_path: Path) -> None:
     )
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert all(e["pr-status"] == "new" for e in saved["pull-requests"])
+    assert "overall-status" not in saved
 
 
 def test_run_stage1_monitor_empty_prs_raises(tmp_path: Path) -> None:
@@ -773,6 +1250,8 @@ def test_run_stage1_monitor_continue_on_error_partial(tmp_path: Path) -> None:
     saved = json.loads(path.read_text(encoding="utf-8"))
     # Second PR still classified/persisted when continue_on_error
     assert saved["pull-requests"][1]["pr-status"] == "success"
+    # Partial run must not conclude overall-status
+    assert "overall-status" not in saved
 
 
 def test_run_stage1_monitor_post_error_hard_fail(tmp_path: Path) -> None:

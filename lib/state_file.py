@@ -27,6 +27,11 @@ PR_STATUSES = frozenset(
     }
 )
 
+# Leader-run conclusion (RHOAIENG-97052). Absent while the run is still in progress.
+OVERALL_STATUS_SUCCESS = "success"
+OVERALL_STATUS_FAILURE = "failure"
+OVERALL_STATUSES = frozenset({OVERALL_STATUS_SUCCESS, OVERALL_STATUS_FAILURE})
+
 
 class StateFileError(ValueError):
     """Raised when a state file payload is invalid."""
@@ -112,12 +117,19 @@ class StatePullRequest:
 
 @dataclass
 class PromoterState:
-    """Leader PR state.json root object (RHOAIENG-93564)."""
+    """Leader PR state.json root object (RHOAIENG-93564 / RHOAIENG-97052)."""
 
     pull_requests: list[StatePullRequest] = field(default_factory=list)
+    # Set when the GAP run has concluded; omitted from JSON while unset.
+    overall_status: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"pull-requests": [pr.to_dict() for pr in self.pull_requests]}
+        payload: dict[str, Any] = {
+            "pull-requests": [pr.to_dict() for pr in self.pull_requests]
+        }
+        if self.overall_status is not None:
+            payload["overall-status"] = self.overall_status
+        return payload
 
     def to_json(self, *, indent: int = 2) -> str:
         return json.dumps(self.to_dict(), indent=indent, sort_keys=False) + "\n"
@@ -159,14 +171,30 @@ def find_existing_state_path(repo_root: str | Path, trigger_id: str) -> str | No
     return f"{STATE_ROOT_DIR}/{matches[-1]}/state.json"
 
 
+def _normalize_overall_status(value: Any) -> str | None:
+    """Return a validated overall-status, or None when unset/blank."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text not in OVERALL_STATUSES:
+        raise StateFileError(
+            f"overall-status must be one of {sorted(OVERALL_STATUSES)}, got {value!r}"
+        )
+    return text
+
+
 def build_state(
     *,
     pull_requests: list[StatePullRequest] | list[dict[str, Any]] | None = None,
     prs: list[StatePullRequest] | list[dict[str, Any]] | None = None,
+    overall_status: str | None = None,
 ) -> PromoterState:
     """Build a validated PromoterState from PR records.
 
     Stage 1 (RHOAIENG-93524): each entry should use pr-status ``new`` and empty builds.
+    ``overall_status`` (RHOAIENG-97052) is optional until the run concludes.
     """
     raw = pull_requests if pull_requests is not None else (prs or [])
     normalized: list[StatePullRequest] = []
@@ -189,7 +217,10 @@ def build_state(
         else:
             raise StateFileError(f"pull-requests[{index}] must be a mapping")
 
-    state = PromoterState(pull_requests=normalized)
+    state = PromoterState(
+        pull_requests=normalized,
+        overall_status=_normalize_overall_status(overall_status),
+    )
     validate_state(state.to_dict())
     return state
 
@@ -213,7 +244,16 @@ def validate_state(data: Any) -> dict[str, Any]:
         else (_raise_pr_type(index))
         for index, item in enumerate(raw_prs)
     ]
-    return {"pull-requests": [pr.to_dict() for pr in prs]}
+    normalized: dict[str, Any] = {
+        "pull-requests": [pr.to_dict() for pr in prs]
+    }
+    # Accept either wire key or pythonic alias from callers.
+    overall = _normalize_overall_status(
+        data.get("overall-status", data.get("overall_status"))
+    )
+    if overall is not None:
+        normalized["overall-status"] = overall
+    return normalized
 
 
 def write_state_file(path: str | Path, state: PromoterState | dict[str, Any]) -> Path:
