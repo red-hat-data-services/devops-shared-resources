@@ -1,0 +1,7 @@
+metadata:
+  labels:
+    appstudio.openshift.io/application: rhoai-fbc-fragment-ci
+  annotations:
+    pipelinesascode.tekton.dev/on-cel-expression: |
+      event == "push" && target_branch == "{{branch}}"
+        && ( "catalog/**".pathChanged() || ".tekton/{{filename}}".pathChanged() )
