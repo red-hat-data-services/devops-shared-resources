@@ -3,6 +3,11 @@
 Stage-1 script: read leader `state.json`, classify each child PR, post commit
 statuses via `PRStatusUpdater`, update `pr-status`, write the file back.
 
+When every child is Stage-1 terminal, the monitor also sets `overall-status`
+and (optionally) posts a green `gated artifacts promoter` status on the
+**Leader PR itself** so auto-merge can preserve run history on `main`
+(RHOAIENG-97052).
+
 ## How merge conflicts are detected
 
 The monitor does **not** run `git merge` locally. It asks GitHub via the `gh` CLI:
@@ -25,6 +30,41 @@ If `mergeable` is `UNKNOWN` / null (GitHub still computing), the script waits br
 | Merge conflict (`CONFLICTING` / `DIRTY`) | `merge-failure` | `failure` |
 | Otherwise mergeable | `success` | `success` (dummy green gate) |
 | Already merged | `success` | skip post |
+
+### Overall status (RHOAIENG-97052)
+
+The monitor **writes** `overall-status` into `state.json` only when **every**
+component PR has reached a Stage-1 final status (`success` or `merge-failure`).
+
+| Children | `overall-status` written | Leader auto-merge signal |
+|----------|--------------------------|---------------------------|
+| Any still `new` / non-final | omitted | no |
+| All final, any `merge-failure` | `failure` | no (Stage-1: keep Leader open) |
+| All `success` | `success` | yes — green check on Leader |
+
+For Stage 1, the Leader is auto-merged only when every component PR is a
+**success**.
+
+When `overall-status` is `success` and the workflow passes the Leader PR URL
+(`GAP_LEADER_PR_URL` / `--leader-pr-url`), the monitor posts
+`gated artifacts promoter` = **success** on that Leader PR so auto-merge can
+land history on `main`.
+
+Example after all children succeed:
+
+```json
+{
+  "pull-requests": [
+    {
+      "repo": "kserve-branch",
+      "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+      "pr-status": "success",
+      "builds": []
+    }
+  ],
+  "overall-status": "success"
+}
+```
 
 ## State file path (RHOAIENG-93564)
 
@@ -54,9 +94,10 @@ The workflow passes GitHub context via env vars (no resolution logic in YAML):
 | `GAP_STATE_FILE` | `workflow_dispatch` input `state_file` |
 | `GAP_TRIGGER_ID` | `workflow_dispatch` input `trigger_id` |
 | `GAP_PR_LABELS` | Leader PR labels (comma-separated) |
+| `GAP_LEADER_PR_URL` | Leader PR HTML URL (e.g. `github.event.pull_request.html_url`) |
 
-The script resolves `state.json`, updates it, and writes `state_path=` to
-`GITHUB_OUTPUT` for the commit step.
+The script resolves `state.json`, updates it, and writes `state_path=` (and
+`overall_status=` when set) to `GITHUB_OUTPUT` for the commit step.
 
 ### Manual (local or workflow_dispatch)
 
@@ -67,9 +108,10 @@ python scripts/gap_pr_monitor.py --trigger-id gap-4e997b5f8c224668b51d2fc8b46774
 # by label(s)
 python scripts/gap_pr_monitor.py --label gap-4e997b5f8c224668b51d2fc8b4677495
 
-# explicit path override
+# explicit path override + Leader auto-merge signal
 python scripts/gap_pr_monitor.py \
-  --state-file GAP Leaders/2026-09-25_gap-4e997b5f8c224668b51d2fc8b4677495/state.json
+  --state-file GAP Leaders/2026-09-25_gap-4e997b5f8c224668b51d2fc8b4677495/state.json \
+  --leader-pr-url https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12
 ```
 
 Resolution order (`resolve_state_file`, after merging CLI + `GAP_*` env):
