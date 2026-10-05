@@ -50,10 +50,10 @@ Audits or enables the repository-level GitHub setting that permits pull request 
 
 ## Main-to-release feasibility gate (RHOAIENG-97053)
 
-An organization ruleset workflow checks whether proposed `stable` contents can
-merge into every active release, using the existing release sync exclusions.
+An organization ruleset workflow runs the existing main-to-release sync in
+dry-run mode for every active release, using the existing release sync exclusions.
 
 - `.github/workflows/main-release-feasibility.yml` — ruleset workflow source
-- `lib/main_release_feasibility.py` — isolated, non-committing merge simulations
-- `scripts/check_main_release_feasibility.py` — local/CI CLI with release diagnostics
+- `scripts/prepare_main_release_dry_run_inputs.py` — prepares action inputs from the supplied infra configuration
+- `red-hat-data-services/sync-git-branches` — merge engine, invoked with `dry_run: 'true'`
 - `docs/main-release-feasibility/README.md` — ruleset setup and local reproduction
