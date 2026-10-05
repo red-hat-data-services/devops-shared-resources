@@ -104,6 +104,11 @@ belong to the ruleset; the preparation script only determines action inputs from
 the supplied configuration. Missing credentials or configuration errors fail
 setup and the workflow.
 
+The workflow's `pull_request` and `merge_group` triggers filter for `stable` to
+avoid ordinary runs on this source repository's `main` PRs. GitHub ignores these
+event filters when executing ruleset-required workflows in component repositories;
+the ruleset's targets still control those runs.
+
 A failure blocks that component's stable PR until the main-to-release conflict is
 resolved. Other component PRs are independent. GAP's Stage-1 dummy status is a
 separate check and does not override a required workflow failure.

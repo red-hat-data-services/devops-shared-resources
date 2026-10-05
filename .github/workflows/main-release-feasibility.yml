@@ -1,8 +1,12 @@
 name: Main-to-release feasibility
 
 on:
+  # Filters limit ordinary runs in this source repository. Ruleset workflow
+  # runs ignore event filters and use the ruleset's repository/branch targets.
   pull_request:
+    branches: [stable]
   merge_group:
+    branches: [stable]
 
 permissions:
   contents: read

@@ -156,7 +156,10 @@ def test_repository_and_both_config_paths_are_required(args):
 
 
 def test_workflow_only_wires_prepared_inputs_and_runtime_credentials(workflow):
-    assert set(workflow["on"]) == {"pull_request", "merge_group"}
+    assert workflow["on"] == {
+        "pull_request": {"branches": ["stable"]},
+        "merge_group": {"branches": ["stable"]},
+    }
     assert workflow["permissions"] == {"contents": "read"}
     setup = workflow["jobs"]["setup"]
     script = _step(workflow, "setup", "inputs")
