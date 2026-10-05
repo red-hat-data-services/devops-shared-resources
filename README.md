@@ -47,3 +47,13 @@ Audits or enables the repository-level GitHub setting that permits pull request 
 - `scripts/manage_repository_automerge.py` — dry-run-first CLI accepting arguments or stdin
 - `docs/repository-automerge/README.md` — usage, permissions, and behavior
 - `tests/` — unit tests with mocked GitHub CLI calls
+
+## Main-to-release feasibility gate (RHOAIENG-97053)
+
+An organization ruleset workflow checks whether proposed `stable` contents can
+merge into every active release, using the existing release sync exclusions.
+
+- `.github/workflows/main-release-feasibility.yml` — ruleset workflow source
+- `lib/main_release_feasibility.py` — isolated, non-committing merge simulations
+- `scripts/check_main_release_feasibility.py` — local/CI CLI with release diagnostics
+- `docs/main-release-feasibility/README.md` — ruleset setup and local reproduction

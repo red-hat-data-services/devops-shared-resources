@@ -1,0 +1,92 @@
+name: Main-to-release feasibility
+
+# Select this workflow directly in an organization ruleset targeting stable.
+# Ruleset workflows ignore event filters; applicability is checked in the job.
+on:
+  pull_request:
+  merge_group:
+
+permissions:
+  contents: read
+
+jobs:
+  main-release-feasibility:
+    name: main-release-feasibility
+    # An explicit conditional enables pull_request ruleset runs in other repos.
+    if: github.event_name == 'pull_request' || github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Determine applicability
+        id: scope
+        env:
+          BASE_REF: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+        run: |
+          if [[ "$BASE_REF" == "stable" || "$BASE_REF" == "refs/heads/stable" ]]; then
+            echo "applicable=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "applicable=false" >> "$GITHUB_OUTPUT"
+            echo "## Main-to-release feasibility" >> "$GITHUB_STEP_SUMMARY"
+            echo "Not applicable: this workflow checks changes targeting stable." >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Checkout the workflow implementation
+        if: steps.scope.outputs.applicable == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: red-hat-data-services/devops-shared-resources
+          ref: ${{ github.workflow_sha }}
+          path: shared-resources
+          persist-credentials: false
+
+      - name: Create read-only infra token
+        if: steps.scope.outputs.applicable == 'true'
+        id: infra-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.RHDS_CI_APP_CLIENT_ID }}
+          private-key: ${{ secrets.RHDS_CI_APP_PRIVATE_KEY }}
+          owner: red-hat-data-services
+          repositories: rhods-devops-infra
+          permission-contents: read
+
+      - name: Checkout release configuration
+        if: steps.scope.outputs.applicable == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: red-hat-data-services/rhods-devops-infra
+          ref: main
+          path: infra
+          sparse-checkout: src/config
+          token: ${{ steps.infra-token.outputs.token }}
+          persist-credentials: false
+
+      - name: Checkout proposed stable contents
+        if: steps.scope.outputs.applicable == 'true'
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          repository: ${{ github.repository }}
+          # PR test-merge commit, or the merge queue's combined candidate.
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          path: component
+          persist-credentials: false
+
+      - name: Set up uv
+        if: steps.scope.outputs.applicable == 'true'
+        uses: astral-sh/setup-uv@94527f2e458b27549849d47d273a16bec83a01e9 # v7
+
+      - name: Check release merge feasibility
+        if: steps.scope.outputs.applicable == 'true'
+        env:
+          COMPONENT_REPOSITORY: ${{ github.repository }}
+          CANDIDATE_SHA: ${{ github.sha }}
+        run: |
+          uv run --python 3.12 --no-project \
+            --with-requirements shared-resources/requirements.txt \
+            python shared-resources/scripts/check_main_release_feasibility.py \
+            --repo-path component \
+            --repository "$COMPONENT_REPOSITORY" \
+            --source-ref "$CANDIDATE_SHA" \
+            --source-map infra/src/config/main-release-source-map.yaml \
+            --releases infra/src/config/releases.yaml
