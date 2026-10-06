@@ -38,7 +38,7 @@ spec:
     - name: url
       value: "{{ _ }}"
     - name: revision
-      value: "{{ '{{ cel: pac.target_branch.matches(\"^rhoai-\\\\d+\\\\.\\\\d+(-ea\\\\.\\\\d+)?$\") ? pac.target_branch : \"main\" }}' }}"
+      value: "{% raw %}{{ cel: pac.target_branch.matches(\"^rhoai-\\\\d+\\\\.\\\\d+(-ea\\\\.\\\\d+)?$\") ? pac.target_branch : \"main\" }}{% endraw %}"
     - name: pathInRepo
       value: "{{ _ }}"
   taskRunTemplate:
