@@ -28,6 +28,8 @@ from typing import Any, Callable, Sequence
 ENV_STATE_FILE = "GAP_STATE_FILE"
 ENV_TRIGGER_ID = "GAP_TRIGGER_ID"
 ENV_PR_LABELS = "GAP_PR_LABELS"
+ENV_LEADER_REPO = "GAP_LEADER_REPO"
+ENV_LEADER_LABEL = "GAP_LEADER_LABEL"
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -42,6 +44,7 @@ from lib.pr_status_updater import (
 )
 
 DEFAULT_CHECK_NAME = "gated artifacts promoter"
+DEFAULT_LEADER_LABEL = "gated-artifacts-promoter"
 SUCCESS_PR_STATUS = "success"
 MERGE_FAILURE_PR_STATUS = "merge-failure"
 TRIGGER_ID_RE = re.compile(r"^gap-[A-Za-z0-9._-]+$")
@@ -54,6 +57,8 @@ DATED_TRIGGER_DIR_RE = re.compile(
 
 # GitHub mergeStateStatus values that mean the PR cannot be merged cleanly.
 CONFLICT_MERGE_STATES = frozenset({"DIRTY", "CONFLICTING"})
+
+CommandRunner = Callable[[Sequence[str]], str]
 
 
 class GapPrMonitorError(RuntimeError):
@@ -91,6 +96,16 @@ class MonitorResult:
     merge_failure_urls: list[str]
     success_urls: list[str]
     dry_run: bool
+
+
+@dataclass(frozen=True)
+class OpenLeaderPr:
+    """One open Leader PR discovered for scheduled monitor runs."""
+
+    number: int
+    url: str
+    head_ref: str
+    labels: tuple[str, ...]
 
 
 def state_path_for_trigger(trigger_id: str, *, root: Path | None = None) -> Path:
@@ -508,6 +523,255 @@ def run_stage1_monitor(
     )
 
 
+def _run_git(args: Sequence[str], *, cwd: Path) -> str:
+    """Run a git command in ``cwd`` and return stripped stdout."""
+    command = ["git", *args]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            cwd=str(cwd),
+        )
+    except FileNotFoundError as exc:
+        raise GapPrMonitorError("git executable not found") from exc
+    if completed.returncode != 0:
+        output = (completed.stderr or completed.stdout or "").strip()
+        raise GapPrMonitorError(
+            f"git {' '.join(args)} failed ({completed.returncode}): {output}"
+        )
+    return (completed.stdout or "").strip()
+
+
+def list_open_leader_prs(
+    leader_repo: str,
+    *,
+    label: str = DEFAULT_LEADER_LABEL,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> list[OpenLeaderPr]:
+    """List open Leader PRs that carry the GAP label (RHOAIENG-97050)."""
+    repo = (leader_repo or "").strip()
+    if not repo or "/" not in repo:
+        raise GapPrMonitorError(
+            f"Invalid leader repo {leader_repo!r}; expected OWNER/REPO."
+        )
+    label_name = (label or "").strip() or DEFAULT_LEADER_LABEL
+    runner = gh_runner or _run_gh
+    raw = runner(
+        [
+            "pr",
+            "list",
+            "-R",
+            repo,
+            "--state",
+            "open",
+            "--label",
+            label_name,
+            "--json",
+            "number,url,headRefName,labels",
+            "--limit",
+            "100",
+        ]
+    )
+    try:
+        rows = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise GapPrMonitorError(
+            f"Invalid JSON from gh pr list for {repo}: {exc}"
+        ) from exc
+    if not isinstance(rows, list):
+        raise GapPrMonitorError(f"gh pr list for {repo} did not return an array.")
+
+    leaders: list[OpenLeaderPr] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        number = row.get("number")
+        url = str(row.get("url") or "").strip()
+        head_ref = str(row.get("headRefName") or "").strip()
+        if not isinstance(number, int) or not url or not head_ref:
+            continue
+        label_names: list[str] = []
+        for item in row.get("labels") or []:
+            if isinstance(item, dict) and item.get("name"):
+                label_names.append(str(item["name"]))
+            elif isinstance(item, str) and item.strip():
+                label_names.append(item.strip())
+        leaders.append(
+            OpenLeaderPr(
+                number=number,
+                url=url,
+                head_ref=head_ref,
+                labels=tuple(label_names),
+            )
+        )
+    return leaders
+
+
+def checkout_leader_branch(
+    repo_root: Path,
+    head_ref: str,
+    *,
+    remote: str = "origin",
+    git_runner: Callable[..., str] | None = None,
+) -> None:
+    """Fetch and check out a Leader PR head branch under ``repo_root``."""
+    ref = (head_ref or "").strip()
+    if not ref:
+        raise GapPrMonitorError("Leader head ref is empty.")
+    run = git_runner or (lambda args, cwd=repo_root: _run_git(args, cwd=cwd))
+    run(["fetch", remote, f"+refs/heads/{ref}:refs/remotes/{remote}/{ref}"], cwd=repo_root)
+    run(["checkout", "-B", ref, f"{remote}/{ref}"], cwd=repo_root)
+
+
+def commit_and_push_state(
+    repo_root: Path,
+    state_path: Path,
+    head_ref: str,
+    *,
+    remote: str = "origin",
+    dry_run: bool = False,
+    git_runner: Callable[..., str] | None = None,
+) -> bool:
+    """Commit state.json changes on the current Leader branch and push.
+
+    Returns True when a commit was created (or would be in dry-run).
+    """
+    run = git_runner or (lambda args, cwd=repo_root: _run_git(args, cwd=cwd))
+    rel = state_path_for_output(state_path, repo_root=repo_root)
+    if dry_run:
+        print(f"[dry-run] would commit and push {rel} on {head_ref}")
+        return True
+    run(["config", "user.name", "github-actions[bot]"], cwd=repo_root)
+    run(
+        ["config", "user.email", "github-actions[bot]@users.noreply.github.com"],
+        cwd=repo_root,
+    )
+    run(["add", "--", rel], cwd=repo_root)
+    staged = run(["diff", "--cached", "--name-only"], cwd=repo_root)
+    if not staged.strip():
+        print(f"No state file changes to commit for {head_ref}.")
+        return False
+    run(
+        ["commit", "-m", "Update GAP state from scheduled PR monitor (RHOAIENG-97050)"],
+        cwd=repo_root,
+    )
+    run(["push", remote, f"HEAD:{head_ref}"], cwd=repo_root)
+    print(f"Pushed state update for Leader branch {head_ref}")
+    return True
+
+
+def run_scheduled_monitors(
+    repo_root: Path,
+    *,
+    leader_repo: str,
+    label: str = DEFAULT_LEADER_LABEL,
+    check_name: str = DEFAULT_CHECK_NAME,
+    dry_run: bool = False,
+    continue_on_error: bool = True,
+    description: str | None = None,
+    remote: str = "origin",
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+    git_runner: Callable[..., str] | None = None,
+    updater_factory: Callable[..., PRStatusUpdater] | None = None,
+) -> int:
+    """Discover open Leaders and run the Stage-1 monitor on each (RHOAIENG-97050).
+
+    Checkout / commit / push stay in this script so the Actions workflow can
+    stay a thin wrapper. Existing pull_request and workflow_dispatch paths are
+    unchanged.
+    """
+    leaders = list_open_leader_prs(
+        leader_repo, label=label, gh_runner=gh_runner
+    )
+    if not leaders:
+        print(
+            f"No open Leader PRs with label {label!r} in {leader_repo}; "
+            "nothing to do."
+        )
+        return 0
+
+    print(f"Scheduled monitor: {len(leaders)} open Leader PR(s) in {leader_repo}")
+    failures: list[str] = []
+    root = repo_root.expanduser().resolve()
+
+    for leader in leaders:
+        print(f"--- Leader #{leader.number} {leader.url} ({leader.head_ref}) ---")
+        try:
+            checkout_leader_branch(
+                root,
+                leader.head_ref,
+                remote=remote,
+                git_runner=git_runner,
+            )
+            state_path = resolve_state_file(
+                labels=list(leader.labels),
+                root=root,
+                allow_gap_dir_fallback=True,
+            )
+            result = run_stage1_monitor(
+                state_path,
+                check_name=check_name,
+                dry_run=dry_run,
+                continue_on_error=continue_on_error,
+                description=description,
+                updater_factory=updater_factory,
+                gh_runner=gh_runner,
+            )
+            prefix = "[dry-run] " if result.dry_run else ""
+            print(
+                f"{prefix}Processed "
+                f"{len(result.success_urls) + len(result.merge_failure_urls)} "
+                f"child PR(s) from {result.state_path}"
+            )
+            commit_and_push_state(
+                root,
+                result.state_path,
+                leader.head_ref,
+                remote=remote,
+                dry_run=dry_run,
+                git_runner=git_runner,
+            )
+        except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
+            message = f"Leader #{leader.number} ({leader.url}): {exc}"
+            print(f"ERROR: {message}", file=sys.stderr)
+            failures.append(message)
+            if not continue_on_error:
+                return 1
+
+    if failures:
+        print(
+            f"ERROR: {len(failures)}/{len(leaders)} Leader PR(s) failed "
+            "during scheduled monitor.",
+            file=sys.stderr,
+        )
+        return 1
+    return 0
+
+
+def should_run_schedule_mode(*, schedule_flag: bool) -> bool:
+    """True when CLI ``--schedule`` is set or Actions event is ``schedule``."""
+    if schedule_flag:
+        return True
+    return os.environ.get("GITHUB_EVENT_NAME", "").strip() == "schedule"
+
+
+def resolve_leader_repo(explicit: str | None) -> str:
+    """Resolve OWNER/REPO for Leader discovery (CLI, GAP_LEADER_REPO, GITHUB_REPOSITORY)."""
+    for candidate in (
+        (explicit or "").strip(),
+        _env_nonempty(ENV_LEADER_REPO) or "",
+        os.environ.get("GITHUB_REPOSITORY", "").strip(),
+    ):
+        if candidate:
+            return candidate
+    raise GapPrMonitorError(
+        "Cannot resolve Leader repo for schedule mode. Pass --leader-repo, "
+        f"set {ENV_LEADER_REPO}, or run in Actions (GITHUB_REPOSITORY)."
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -575,17 +839,67 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Keep processing remaining PRs if one inspection/update fails.",
     )
+    parser.add_argument(
+        "--schedule",
+        action="store_true",
+        help=(
+            "RHOAIENG-97050: discover open Leader PRs (GAP label) and run the "
+            "Stage-1 monitor on each. Also selected automatically when "
+            "GITHUB_EVENT_NAME=schedule."
+        ),
+    )
+    parser.add_argument(
+        "--leader-repo",
+        default=None,
+        metavar="OWNER/REPO",
+        help=(
+            "Leader repository for --schedule / schedule events "
+            f"(default: {ENV_LEADER_REPO} or GITHUB_REPOSITORY)."
+        ),
+    )
+    parser.add_argument(
+        "--leader-label",
+        default=None,
+        metavar="NAME",
+        help=(
+            "Label that identifies Leader PRs for schedule discovery "
+            f"(default: {ENV_LEADER_LABEL} or {DEFAULT_LEADER_LABEL!r})."
+        ),
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    repo_root = Path(args.repo_root)
+
+    if should_run_schedule_mode(schedule_flag=args.schedule):
+        label = (
+            (args.leader_label or "").strip()
+            or _env_nonempty(ENV_LEADER_LABEL)
+            or DEFAULT_LEADER_LABEL
+        )
+        try:
+            leader_repo = resolve_leader_repo(args.leader_repo)
+            return run_scheduled_monitors(
+                repo_root,
+                leader_repo=leader_repo,
+                label=label,
+                check_name=args.check_name,
+                dry_run=args.dry_run,
+                # Schedule should not stop the whole batch on one Leader failure.
+                continue_on_error=True,
+                description=args.description,
+            )
+        except GapPrMonitorError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 1
+
     state_file, trigger_id, labels = resolve_inputs_for_cli(
         state_file=args.state_file,
         trigger_id=args.trigger_id,
         labels=args.labels,
     )
-    repo_root = Path(args.repo_root)
     try:
         state_path = resolve_state_file(
             state_file=state_file,

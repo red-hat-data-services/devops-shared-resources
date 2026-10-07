@@ -10,6 +10,7 @@ from lib.pr_status_updater import GhCommandError, PullRequestRef, StatusUpdateRe
 from scripts.gap_pr_monitor import (
     GapPrMonitorError,
     MonitorResult,
+    OpenLeaderPr,
     PrMergeInfo,
     apply_pr_statuses,
     apply_success_statuses,
@@ -18,12 +19,16 @@ from scripts.gap_pr_monitor import (
     extract_pr_urls,
     extract_trigger_id_from_labels,
     fetch_pr_merge_info,
+    list_open_leader_prs,
     load_state,
     main,
     resolve_inputs_for_cli,
+    resolve_leader_repo,
     resolve_state_file,
+    run_scheduled_monitors,
     run_stage1_monitor,
     save_state,
+    should_run_schedule_mode,
     split_labels_csv,
     state_path_for_output,
     state_path_for_trigger,
@@ -922,3 +927,155 @@ def test_main_reports_monitor_error(
     monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
     assert main(["--state-file", str(path)]) == 1
     assert "ERROR: nope" in capsys.readouterr().err
+
+
+# ---------------------------------------------------------------------------
+# Scheduled monitor (RHOAIENG-97050)
+# ---------------------------------------------------------------------------
+
+
+def test_list_open_leader_prs_parses_gh_json() -> None:
+    payload = [
+        {
+            "number": 28,
+            "url": "https://github.com/org/gap/pull/28",
+            "headRefName": "gap-leader/gap-abc",
+            "labels": [
+                {"name": "gated-artifacts-promoter"},
+                {"name": "gap-abc"},
+            ],
+        }
+    ]
+
+    def fake_gh(args: list[str]) -> str:
+        assert args[:2] == ["pr", "list"]
+        assert "--label" in args
+        return json.dumps(payload)
+
+    leaders = list_open_leader_prs("org/gap", gh_runner=fake_gh)
+    assert len(leaders) == 1
+    assert leaders[0] == OpenLeaderPr(
+        number=28,
+        url="https://github.com/org/gap/pull/28",
+        head_ref="gap-leader/gap-abc",
+        labels=("gated-artifacts-promoter", "gap-abc"),
+    )
+
+
+def test_should_run_schedule_mode_from_flag_and_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("GITHUB_EVENT_NAME", raising=False)
+    assert should_run_schedule_mode(schedule_flag=True) is True
+    assert should_run_schedule_mode(schedule_flag=False) is False
+    monkeypatch.setenv("GITHUB_EVENT_NAME", "schedule")
+    assert should_run_schedule_mode(schedule_flag=False) is True
+
+
+def test_resolve_leader_repo_prefers_cli_then_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GAP_LEADER_REPO", "from/env")
+    monkeypatch.setenv("GITHUB_REPOSITORY", "from/actions")
+    assert resolve_leader_repo("cli/repo") == "cli/repo"
+    assert resolve_leader_repo(None) == "from/env"
+    monkeypatch.delenv("GAP_LEADER_REPO", raising=False)
+    assert resolve_leader_repo(None) == "from/actions"
+
+
+def test_run_scheduled_monitors_no_open_leaders(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.list_open_leader_prs",
+        lambda *args, **kwargs: [],
+    )
+    code = run_scheduled_monitors(tmp_path, leader_repo="org/gap", dry_run=True)
+    assert code == 0
+    assert "No open Leader PRs" in capsys.readouterr().out
+
+
+def test_run_scheduled_monitors_runs_each_leader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state = (
+        tmp_path
+        / "GAP Leaders"
+        / "2026-10-07_gap-abc"
+        / "state.json"
+    )
+    state.parent.mkdir(parents=True)
+    save_state(state, _sample_state())
+
+    leaders = [
+        OpenLeaderPr(
+            number=28,
+            url="https://github.com/org/gap/pull/28",
+            head_ref="gap-leader/gap-abc",
+            labels=("gated-artifacts-promoter", "gap-abc"),
+        )
+    ]
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.list_open_leader_prs",
+        lambda *args, **kwargs: leaders,
+    )
+    checkouts: list[str] = []
+    commits: list[str] = []
+
+    def fake_checkout(repo_root, head_ref, **kwargs):
+        checkouts.append(head_ref)
+
+    def fake_commit(repo_root, state_path, head_ref, **kwargs):
+        commits.append(head_ref)
+        return True
+
+    def fake_run(state_path, **kwargs):
+        return MonitorResult(
+            state_path=Path(state_path),
+            updated_urls=[],
+            skipped_urls=[],
+            merge_failure_urls=[],
+            success_urls=["https://github.com/rhoai-rhtap/kserve-branch/pull/15"],
+            dry_run=True,
+        )
+
+    monkeypatch.setattr("scripts.gap_pr_monitor.checkout_leader_branch", fake_checkout)
+    monkeypatch.setattr("scripts.gap_pr_monitor.commit_and_push_state", fake_commit)
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+
+    code = run_scheduled_monitors(tmp_path, leader_repo="org/gap", dry_run=True)
+    assert code == 0
+    assert checkouts == ["gap-leader/gap-abc"]
+    assert commits == ["gap-leader/gap-abc"]
+
+
+def test_main_schedule_uses_scheduled_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    called: dict[str, object] = {}
+
+    def fake_scheduled(repo_root, **kwargs):
+        called["repo_root"] = Path(repo_root)
+        called["leader_repo"] = kwargs["leader_repo"]
+        return 0
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.run_scheduled_monitors", fake_scheduled
+    )
+    code = main(
+        [
+            "--schedule",
+            "--leader-repo",
+            "org/gap",
+            "--repo-root",
+            str(tmp_path),
+            "--dry-run",
+        ]
+    )
+    assert code == 0
+    assert called["repo_root"] == tmp_path
+    assert called["leader_repo"] == "org/gap"

@@ -54,9 +54,23 @@ The workflow passes GitHub context via env vars (no resolution logic in YAML):
 | `GAP_STATE_FILE` | `workflow_dispatch` input `state_file` |
 | `GAP_TRIGGER_ID` | `workflow_dispatch` input `trigger_id` |
 | `GAP_PR_LABELS` | Leader PR labels (comma-separated) |
+| `GAP_LEADER_REPO` | Optional override for schedule discovery (default: `GITHUB_REPOSITORY`) |
+| `GAP_LEADER_LABEL` | Optional Leader label for schedule discovery (default: `gated-artifacts-promoter`) |
 
 The script resolves `state.json`, updates it, and writes `state_path=` to
 `GITHUB_OUTPUT` for the commit step.
+
+### Scheduled runs (RHOAIENG-97050)
+
+When Actions sets `GITHUB_EVENT_NAME=schedule` (or you pass `--schedule`), the
+**same** script discovers every **open** Leader PR labeled
+`gated-artifacts-promoter`, checks out each head branch, runs the Stage-1
+monitor, and commits/pushes `state.json` updates. Existing `pull_request` and
+`workflow_dispatch` behavior is unchanged.
+
+```bash
+python scripts/gap_pr_monitor.py --schedule --leader-repo org/gap --dry-run
+```
 
 ### Manual (local or workflow_dispatch)
 
