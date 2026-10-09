@@ -118,6 +118,35 @@ def test_dry_run_prints_commands(capsys: pytest.CaptureFixture[str]) -> None:
     assert "dry-run-sha" not in captured
 
 
+def test_post_status_for_pr_honors_explicit_head_sha() -> None:
+    calls: list[list[str]] = []
+
+    def fake_runner(command: list[str]) -> MagicMock:
+        calls.append(command)
+        result = MagicMock()
+        result.returncode = 0
+        if command[1] == "api" and command[2].endswith("/pulls/7"):
+            result.stdout = (
+                '{"sha":"live-head","owner":"org","repo":"repo","state":"open"}\n'
+            )
+        elif command[1] == "api" and "/commits/" in command[2] and command[2].endswith("/statuses"):
+            result.stdout = ""
+        else:
+            result.stdout = ""
+        result.stderr = ""
+        return result
+
+    updater = PRStatusUpdater(check_name="gated artifacts promoter", runner=fake_runner)
+    result = updater.post_status_for_pr(
+        "https://github.com/org/repo/pull/7",
+        "success",
+        head_sha="published-sha",
+    )
+    assert result.head_sha == "published-sha"
+    assert "repos/org/repo/commits/published-sha/statuses" in calls[1][2]
+    assert "repos/org/repo/statuses/published-sha" in calls[2][4]
+
+
 def test_post_status_uses_head_repo_for_fork_pr() -> None:
     calls: list[list[str]] = []
 
