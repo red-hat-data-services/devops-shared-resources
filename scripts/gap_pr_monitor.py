@@ -801,10 +801,7 @@ def post_leader_success(
     updater: PRStatusUpdater,
 ) -> StatusUpdateResult:
     """Post Leader green against an explicit published commit SHA."""
-    description = (
-        "GAP overall-status=success (every component PR final/success); "
-        "auto-merge Leader for history (RHOAIENG-97052)"
-    )
+    description = "GAP Stage 1: overall success"
     return updater.post_status_for_pr(
         leader_pr_url,
         "completed",

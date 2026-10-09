@@ -962,7 +962,7 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(tmp_path: Path) -> No
     assert (leader, "completed") in [(u, s) for u, s, _ in posts]
     leader_post = next(p for p in posts if p[0] == leader)
     assert leader_post[2].get("head_sha") == "published-sha-abc"
-    assert "overall-status=success" in (leader_post[2].get("description") or "")
+    assert leader_post[2].get("description") == "GAP Stage 1: overall success"
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["overall-status"] == "success"
 
