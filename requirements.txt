@@ -1,2 +1,5 @@
 PyYAML>=6.0
 requests>=2.31.0
+cel-python
+jinja2
+ruamel.yaml

