@@ -377,7 +377,7 @@ def test_main_writes_github_output_from_ci_env(
         )
 
     monkeypatch.setattr(
-        "scripts.gap_pr_monitor.run_stage1_monitor", fake_run
+        "scripts.gap_pr_monitor.run_monitor", fake_run
     )
     assert main(["--repo-root", str(root), "--dry-run"]) == 0
     assert "state_path=GAP Leaders/2026-09-25_gap-cienv/state.json" in out.read_text(
@@ -878,7 +878,7 @@ def test_main_success(
             dry_run=False,
         )
 
-    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor", fake_run)
     code = main(["--state-file", str(path)])
     assert code == 0
     out = capsys.readouterr().out
@@ -907,7 +907,7 @@ def test_main_with_trigger_id(
             dry_run=False,
         )
 
-    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor", fake_run)
     code = main(["--trigger-id", "gap-abc123", "--repo-root", str(tmp_path)])
     assert code == 0
     assert seen["path"] == expected.resolve()
@@ -924,7 +924,7 @@ def test_main_reports_monitor_error(
     def fake_run(state_path, **kwargs):
         raise GapPrMonitorError("nope")
 
-    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor", fake_run)
     assert main(["--state-file", str(path)]) == 1
     assert "ERROR: nope" in capsys.readouterr().err
 
@@ -1044,7 +1044,7 @@ def test_run_scheduled_monitors_runs_each_leader(
 
     monkeypatch.setattr("scripts.gap_pr_monitor.checkout_leader_branch", fake_checkout)
     monkeypatch.setattr("scripts.gap_pr_monitor.commit_and_push_state", fake_commit)
-    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor", fake_run)
 
     code = run_scheduled_monitors(tmp_path, leader_repo="org/gap", dry_run=True)
     assert code == 0

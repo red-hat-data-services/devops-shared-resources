@@ -29,11 +29,12 @@ Posts GitHub commit statuses for Gated Artifacts Promoter collaborator PRs (RHOA
 - `docs/pr-status-updater/README.md` — usage
 - `tests/` — unit tests (`pytest`; see docs)
 
-## GAP PR monitor (Stage 1)
+## GAP PR monitor
 
-Reads a leader `state.json`, classifies each child PR (success or merge-failure),
-posts the matching `gated artifacts promoter` commit status, and updates
-`pr-status` (RHOAIENG-93565; state layout RHOAIENG-93564).
+Reads a leader `state.json`, evaluates component build checks and the
+main-to-release feasibility workflow, posts the matching `gated artifacts promoter`
+commit status, and updates `pr-status` (RHOAIENG-93565, RHOAIENG-97054; state
+layout RHOAIENG-93564).
 
 - `scripts/gap_pr_monitor.py` — CLI (uses `lib/pr_status_updater.py`)
 - `docs/gap-pr-monitor/README.md` — usage

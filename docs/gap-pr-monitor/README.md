@@ -1,7 +1,36 @@
-# GAP PR monitor (RHOAIENG-93565)
+# GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054)
 
-Stage-1 script: read leader `state.json`, classify each child PR, post commit
-statuses via `PRStatusUpdater`, update `pr-status`, write the file back.
+Read leader `state.json`, evaluate each child PR, post commit statuses via
+`PRStatusUpdater`, update `pr-status`, and write the file back.
+
+Stage 2 requires two gates before a repository PR can pass:
+
+- every component build selected from that repository's `.tekton` PipelineRuns
+- every job in the main-to-release feasibility workflow
+
+Both gates use the same check-run retrieval and conclusion rules. A missing
+check, a query error, or any completed conclusion other than `success` does
+not pass. Unresolved checks fail six hours after the head commit's committer
+timestamp. A new commit starts a new window; reruns of the same commit do not.
+The build producer defaults to the `konflux-internal-p02` GitHub App
+(`GAP_BUILD_CHECK_APP_SLUG` / `GAP_BUILD_CHECK_APP_ID` select another
+environment). PipelineRun names come from the repository configuration,
+including `{{pull_request_number}}` and component labels that differ from the
+check name.
+
+| Repository PR condition | `pr-status` | Commit status |
+|-------------------------|-------------|---------------|
+| Merge conflict | `merge-failure` | `failure` |
+| Feasibility check failed or timed out | `merge-failure` | `failure` |
+| Any expected component build failed, skipped, or timed out | `build-failure` | `failure` |
+| A required check is queued, running, or missing | `build-pending` | `pending` |
+| No component build is triggered, and feasibility succeeded | `success` | `success` |
+| All expected builds and feasibility jobs succeeded | `success` | `success` |
+| Already merged | `success` | skip post |
+
+A failed repository gate posts a failing promoter status on that PR. Merging
+the leader PR to keep run history does not mark the repository PR successful.
+`builds[].image` is left unchanged; image URIs are not required for the gate.
 
 ## How merge conflicts are detected
 
@@ -17,14 +46,6 @@ gh pr view <number> -R <owner>/<repo> --json state,mergeable,mergeStateStatus,ur
 | `mergeStateStatus` | `DIRTY` (also treated as conflict) |
 
 If `mergeable` is `UNKNOWN` / null (GitHub still computing), the script waits briefly and re-queries once.
-
-## Stage-1 outcomes
-
-| Child PR condition | `pr-status` | Commit status |
-|--------------------|-------------|---------------|
-| Merge conflict (`CONFLICTING` / `DIRTY`) | `merge-failure` | `failure` |
-| Otherwise mergeable | `success` | `success` (dummy green gate) |
-| Already merged | `success` | skip post |
 
 ## State file path (RHOAIENG-93564)
 
@@ -64,8 +85,8 @@ The script resolves `state.json`, updates it, and writes `state_path=` to
 
 When Actions sets `GITHUB_EVENT_NAME=schedule` (or you pass `--schedule`), the
 **same** script discovers every **open** Leader PR labeled
-`gated-artifacts-promoter`, checks out each head branch, runs the Stage-1
-monitor, and commits/pushes `state.json` updates. Existing `pull_request` and
+`gated-artifacts-promoter`, checks out each head branch, runs the same
+build and feasibility monitor, and commits/pushes `state.json` updates. Existing `pull_request` and
 `workflow_dispatch` behavior is unchanged.
 
 ```bash
