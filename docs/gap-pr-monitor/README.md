@@ -45,10 +45,11 @@ component PR has reached a Stage-1 final status (`success` or `merge-failure`).
 For Stage 1, the Leader is auto-merged only when every component PR is a
 **success**.
 
-When `overall-status` is `success` and the workflow passes the Leader PR URL
-(`GAP_LEADER_PR_URL` / `--leader-pr-url`), the monitor posts
-`gated artifacts promoter` = **success** on that Leader PR so auto-merge can
-land history on `main`.
+With `--publish-state`, ordering is: classify children → write `state.json` →
+commit/push → then (only if `overall-status` is `success` and a Leader PR URL
+is set via `GAP_LEADER_PR_URL` / `--leader-pr-url`) post
+`gated artifacts promoter` = **success** on the **published** Leader head SHA
+so auto-merge cannot race ahead of the state commit.
 
 Example after all children succeed:
 
@@ -85,7 +86,7 @@ Thin workflow in `gated-artifacts-promoter` only:
 
 1. Checkout leader repo + `devops-shared-resources`
 2. Install deps
-3. Run `python scripts/gap_pr_monitor.py --repo-root . --allow-gap-dir-fallback`
+3. Run `python scripts/gap_pr_monitor.py --repo-root . --allow-gap-dir-fallback --publish-state`
 
 The workflow passes GitHub context via env vars (no resolution logic in YAML):
 
@@ -98,15 +99,17 @@ The workflow passes GitHub context via env vars (no resolution logic in YAML):
 | `GAP_LEADER_LABEL` | Optional Leader label for schedule discovery (default: `gated-artifacts-promoter`) |
 | `GAP_LEADER_PR_URL` | Leader PR HTML URL (e.g. `github.event.pull_request.html_url`) |
 
-The script resolves `state.json`, updates it, and writes `state_path=` (and
-`overall_status=` when set) to `GITHUB_OUTPUT` for the commit step.
+The script resolves `state.json`, updates it, publishes the commit (when
+`--publish-state`), and writes `state_path=`, `overall_status=`, and
+`published_sha=` to `GITHUB_OUTPUT`.
 
 ### Scheduled runs (RHOAIENG-97050)
 
 When Actions sets `GITHUB_EVENT_NAME=schedule` (or you pass `--schedule`), the
 **same** script discovers every **open** Leader PR labeled
-`gated-artifacts-promoter`, checks out each head branch, runs the Stage-1
-monitor, and commits/pushes `state.json` updates. Existing `pull_request` and
+`gated-artifacts-promoter`, checks out each head branch, runs
+publish-then-signal for each, and continues on per-Leader errors. The thin
+workflow schedules this hourly (`0 * * * *`). Existing `pull_request` and
 `workflow_dispatch` behavior is unchanged.
 
 ```bash
@@ -122,10 +125,11 @@ python scripts/gap_pr_monitor.py --trigger-id gap-4e997b5f8c224668b51d2fc8b46774
 # by label(s)
 python scripts/gap_pr_monitor.py --label gap-4e997b5f8c224668b51d2fc8b4677495
 
-# explicit path override + Leader auto-merge signal
+# publish state then Leader auto-merge signal (Actions path)
 python scripts/gap_pr_monitor.py \
   --state-file GAP Leaders/2026-09-25_gap-4e997b5f8c224668b51d2fc8b4677495/state.json \
-  --leader-pr-url https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12
+  --leader-pr-url https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12 \
+  --publish-state
 ```
 
 Resolution order (`resolve_state_file`, after merging CLI + `GAP_*` env):

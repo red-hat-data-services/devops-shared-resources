@@ -6,12 +6,18 @@ from typing import Any
 
 import pytest
 
-from lib.pr_status_updater import GhCommandError, PullRequestRef, StatusUpdateResult
+from lib.pr_status_updater import (
+    GhCommandError,
+    PullHeadInfo,
+    PullRequestRef,
+    StatusUpdateResult,
+)
 from scripts.gap_pr_monitor import (
     GapPrMonitorError,
     MonitorResult,
     OpenLeaderPr,
     PrMergeInfo,
+    PublishResult,
     apply_overall_status,
     apply_pr_statuses,
     apply_success_statuses,
@@ -24,9 +30,11 @@ from scripts.gap_pr_monitor import (
     list_open_leader_prs,
     load_state,
     main,
+    publish_state,
     resolve_inputs_for_cli,
     resolve_leader_repo,
     resolve_state_file,
+    run_monitor_publish_and_signal,
     run_scheduled_monitors,
     run_stage1_monitor,
     save_state,
@@ -34,6 +42,7 @@ from scripts.gap_pr_monitor import (
     split_labels_csv,
     state_path_for_output,
     state_path_for_trigger,
+    verify_leader_head,
 )
 
 
@@ -86,6 +95,15 @@ class FakeUpdater:
         self.dry_run = dry_run
         self.posts: list[tuple[str, str, dict]] = []
         self.fail_urls: set[str] = set()
+        self.head_sha: str = "published-sha-abc"
+
+    def get_pull_head(self, pr: PullRequestRef) -> PullHeadInfo:
+        return PullHeadInfo(
+            sha=self.head_sha,
+            status_owner=pr.owner,
+            status_repo=pr.repo,
+            pr_state="OPEN",
+        )
 
     def post_status_for_pr(self, pr_url: str, status: str, **kwargs):
         if pr_url in self.fail_urls:
@@ -95,7 +113,7 @@ class FakeUpdater:
         owner, repo = slug.split("/")
         return StatusUpdateResult(
             pr=PullRequestRef(owner, repo, int(number_s.rstrip("/"))),
-            head_sha="abc",
+            head_sha=str(kwargs.get("head_sha") or self.head_sha),
             state="failure" if status == "failure" else "success",
             context=self.check_name,
             dry_run=self.dry_run,
@@ -916,17 +934,34 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(tmp_path: Path) -> No
         }
     )
     leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12"
-    result = run_stage1_monitor(
+    publish_calls: list[str] = []
+
+    def fake_publish(repo_root, state_path, head_ref, **kwargs):
+        publish_calls.append(head_ref)
+        # State must already be saved before publish (ordering under test).
+        saved_before = json.loads(Path(state_path).read_text(encoding="utf-8"))
+        assert saved_before["overall-status"] == "success"
+        return PublishResult(sha="published-sha-abc", committed=True)
+
+    import scripts.gap_pr_monitor as mod
+    mod.publish_state = fake_publish  # type: ignore[assignment]
+    result = run_monitor_publish_and_signal(
         path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
         updater_factory=factory,
         gh_runner=fake_gh,
-        leader_pr_url=leader,
     )
     assert result.overall_status == "success"
     assert result.leader_status_posted is True
+    assert result.published_sha == "published-sha-abc"
+    assert publish_calls == ["leader-branch"]
     posts = holder["u"].posts
     assert (leader, "completed") in [(u, s) for u, s, _ in posts]
     leader_post = next(p for p in posts if p[0] == leader)
+    assert leader_post[2].get("head_sha") == "published-sha-abc"
     assert "overall-status=success" in (leader_post[2].get("description") or "")
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["overall-status"] == "success"
@@ -971,7 +1006,6 @@ def test_run_stage1_monitor_writes_failure_without_leader_automerge(
         path,
         updater_factory=factory,
         gh_runner=fake_gh,
-        leader_pr_url=leader,
     )
     assert result.overall_status == "failure"
     assert result.leader_status_posted is False
@@ -1038,11 +1072,20 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
         }
     )
     leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/99"
-    result = run_stage1_monitor(
+
+    def fake_publish(repo_root, state_path, head_ref, **kwargs):
+        return PublishResult(sha="published-sha-abc", committed=True)
+
+    import scripts.gap_pr_monitor as mod
+    mod.publish_state = fake_publish  # type: ignore[assignment]
+    result = run_monitor_publish_and_signal(
         path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
         updater_factory=factory,
         gh_runner=fake_gh,
-        leader_pr_url=leader,
     )
     assert result.overall_status == "success"
     assert result.leader_status_posted is True
@@ -1115,7 +1158,6 @@ def test_run_stage1_monitor_two_success_one_failure_no_leader_signal(
         path,
         updater_factory=factory,
         gh_runner=fake_gh,
-        leader_pr_url=leader,
     )
     assert result.overall_status == "failure"
     assert result.leader_status_posted is False
@@ -1152,11 +1194,19 @@ def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
             }
         }
     )
-    result = run_stage1_monitor(
+    def fake_publish(repo_root, state_path, head_ref, **kwargs):
+        return PublishResult(sha="published-sha-abc", committed=True)
+
+    import scripts.gap_pr_monitor as mod
+    mod.publish_state = fake_publish  # type: ignore[assignment]
+    result = run_monitor_publish_and_signal(
         path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=None,
+        publish=True,
         updater_factory=FakeUpdater,
         gh_runner=fake_gh,
-        leader_pr_url=None,
     )
     assert result.overall_status == "success"
     assert result.leader_status_posted is False
@@ -1357,7 +1407,7 @@ def test_main_success(
             dry_run=False,
         )
 
-    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor_publish_and_signal", lambda state_path, **kwargs: fake_run(state_path, **kwargs))
     code = main(["--state-file", str(path)])
     assert code == 0
     out = capsys.readouterr().out
@@ -1386,7 +1436,7 @@ def test_main_with_trigger_id(
             dry_run=False,
         )
 
-    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor_publish_and_signal", lambda state_path, **kwargs: fake_run(state_path, **kwargs))
     code = main(["--trigger-id", "gap-abc123", "--repo-root", str(tmp_path)])
     assert code == 0
     assert seen["path"] == expected.resolve()
@@ -1522,13 +1572,32 @@ def test_run_scheduled_monitors_runs_each_leader(
         )
 
     monkeypatch.setattr("scripts.gap_pr_monitor.checkout_leader_branch", fake_checkout)
-    monkeypatch.setattr("scripts.gap_pr_monitor.commit_and_push_state", fake_commit)
-    monkeypatch.setattr("scripts.gap_pr_monitor.run_stage1_monitor", fake_run)
+
+    seen: dict[str, object] = {}
+
+    def fake_coord(state_path, **kwargs):
+        commits.append(kwargs.get("head_ref") or "")
+        seen["publish"] = kwargs.get("publish")
+        seen["leader_pr_url"] = kwargs.get("leader_pr_url")
+        return MonitorResult(
+            state_path=Path(state_path),
+            updated_urls=[],
+            skipped_urls=[],
+            merge_failure_urls=[],
+            success_urls=["https://github.com/rhoai-rhtap/kserve-branch/pull/15"],
+            dry_run=True,
+            published_sha="deadbeef",
+            leader_status_posted=True,
+        )
+
+    monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor_publish_and_signal", fake_coord)
 
     code = run_scheduled_monitors(tmp_path, leader_repo="org/gap", dry_run=True)
     assert code == 0
     assert checkouts == ["gap-leader/gap-abc"]
     assert commits == ["gap-leader/gap-abc"]
+    assert seen["publish"] is True
+    assert seen["leader_pr_url"] == "https://github.com/org/gap/pull/28"
 
 
 def test_main_schedule_uses_scheduled_path(
@@ -1558,3 +1627,362 @@ def test_main_schedule_uses_scheduled_path(
     assert code == 0
     assert called["repo_root"] == tmp_path
     assert called["leader_repo"] == "org/gap"
+
+
+# ---------------------------------------------------------------------------
+# Publish-then-signal ordering (Chris review / RHOAIENG-97052)
+# ---------------------------------------------------------------------------
+
+
+def test_publish_state_returns_sha_without_empty_commit(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "GAP Leaders" / "2026-10-09_gap-x" / "state.json"
+    state.parent.mkdir(parents=True)
+    save_state(state, _sample_state())
+    calls: list[list[str]] = []
+
+    def fake_git(args, cwd=None):
+        calls.append(list(args))
+        if args[:2] == ["diff", "--cached"]:
+            return ""
+        if args[:2] == ["rev-parse", "HEAD"]:
+            return "existing-sha"
+        return ""
+
+    published = publish_state(
+        tmp_path,
+        state,
+        "leader-branch",
+        git_runner=fake_git,
+    )
+    assert published.sha == "existing-sha"
+    assert published.committed is False
+    assert not any(c[:1] == ["commit"] for c in calls)
+
+
+def test_publish_state_commits_when_staged(
+    tmp_path: Path,
+) -> None:
+    state = tmp_path / "state.json"
+    save_state(state, _sample_state())
+    calls: list[list[str]] = []
+
+    def fake_git(args, cwd=None):
+        calls.append(list(args))
+        if args[:2] == ["diff", "--cached"]:
+            return "state.json"
+        if args[:2] == ["rev-parse", "HEAD"]:
+            return "new-sha"
+        return ""
+
+    published = publish_state(
+        tmp_path,
+        state,
+        "leader-branch",
+        git_runner=fake_git,
+    )
+    assert published.sha == "new-sha"
+    assert published.committed is True
+    assert any(c[:1] == ["commit"] for c in calls)
+    assert any(c[:1] == ["push"] for c in calls)
+
+
+def test_verify_leader_head_rejects_moved_sha() -> None:
+    updater = FakeUpdater(check_name="gated artifacts promoter")
+    updater.head_sha = "other-sha"
+    with pytest.raises(GapPrMonitorError, match="Leader head moved"):
+        verify_leader_head(
+            "https://github.com/org/gap/pull/1",
+            "published-sha",
+            updater=updater,
+        )
+
+
+def test_coordinator_posts_leader_only_after_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    order: list[str] = []
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    original_save = save_state
+
+    def tracking_save(state_path, payload):
+        order.append("save")
+        original_save(state_path, payload)
+
+    def fake_publish(repo_root, state_path, head_ref, **kwargs):
+        order.append("publish")
+        assert "save" in order
+        return PublishResult(sha="published-sha-abc", committed=True)
+
+    monkeypatch.setattr("scripts.gap_pr_monitor.save_state", tracking_save)
+    monkeypatch.setattr("scripts.gap_pr_monitor.publish_state", fake_publish)
+
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            }
+        }
+    )
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+    )
+    order.append("leader_post_done" if result.leader_status_posted else "leader_missing")
+    assert order[:2] == ["save", "publish"]
+    assert result.leader_status_posted is True
+    leader_post = next(p for p in holder["u"].posts if p[0] == leader)
+    assert leader_post[2].get("head_sha") == "published-sha-abc"
+
+
+def test_coordinator_failure_publishes_without_leader_green(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "CONFLICTING",
+                "mergeStateStatus": "DIRTY",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            }
+        }
+    )
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+    )
+    assert result.overall_status == "failure"
+    assert result.leader_status_posted is False
+    assert result.published_sha == "published-sha-abc"
+    assert all(u != leader for u, _s, _k in holder["u"].posts)
+
+
+def test_main_publish_state_flag_uses_coordinator(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(path, _sample_state())
+    seen: dict[str, object] = {}
+
+    def fake_coord(state_path, **kwargs):
+        seen["publish"] = kwargs.get("publish")
+        seen["leader"] = kwargs.get("leader_pr_url")
+        return MonitorResult(
+            state_path=Path(state_path),
+            updated_urls=[],
+            skipped_urls=[],
+            merge_failure_urls=[],
+            success_urls=[],
+            dry_run=False,
+            overall_status="success",
+            leader_status_posted=True,
+            published_sha="abc123",
+        )
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.run_monitor_publish_and_signal", fake_coord
+    )
+    code = main(
+        [
+            "--state-file",
+            str(path),
+            "--publish-state",
+            "--leader-pr-url",
+            "https://github.com/org/gap/pull/1",
+        ]
+    )
+    assert code == 0
+    assert seen["publish"] is True
+    assert seen["leader"] == "https://github.com/org/gap/pull/1"
+
+
+def test_publish_state_dry_run_skips_commit_and_push(tmp_path: Path) -> None:
+    state = tmp_path / "state.json"
+    save_state(state, _sample_state())
+    calls: list[list[str]] = []
+
+    def fake_git(args, cwd=None):
+        calls.append(list(args))
+        if args[:2] == ["rev-parse", "HEAD"]:
+            return "dry-sha"
+        return ""
+
+    published = publish_state(
+        tmp_path,
+        state,
+        "leader-branch",
+        dry_run=True,
+        git_runner=fake_git,
+    )
+    assert published.sha == "dry-sha"
+    assert published.dry_run is True
+    assert not any(c[:1] == ["commit"] for c in calls)
+    assert not any(c[:1] == ["push"] for c in calls)
+
+
+def test_coordinator_without_publish_skips_leader_green(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    publish_calls: list[object] = []
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: publish_calls.append((a, k))
+        or PublishResult(sha="should-not-run", committed=True),
+    )
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            }
+        }
+    )
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=False,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+    )
+    assert result.overall_status == "success"
+    assert result.leader_status_posted is False
+    assert result.published_sha is None
+    assert publish_calls == []
+    assert all(u != leader for u, _s, _k in holder["u"].posts)
+
+
+def test_run_stage1_monitor_no_longer_posts_leader_directly(
+    tmp_path: Path,
+) -> None:
+    """Leader green moved to publish-then-signal coordinator."""
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    fake_gh = _gh_payloads_by_number(
+        {
+            "15": {
+                "state": "OPEN",
+                "mergeable": "MERGEABLE",
+                "mergeStateStatus": "CLEAN",
+                "url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+            }
+        }
+    )
+    result = run_stage1_monitor(
+        path,
+        updater_factory=factory,
+        gh_runner=fake_gh,
+    )
+    assert result.overall_status == "success"
+    assert result.leader_status_posted is False
+    # Only the child PR status is posted; Leader green is coordinator-only.
+    assert [u for u, _s, _k in holder["u"].posts] == [
+        "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    ]
+

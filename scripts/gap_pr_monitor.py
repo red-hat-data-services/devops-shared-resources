@@ -106,6 +106,16 @@ class MonitorResult:
     dry_run: bool
     overall_status: str | None = None
     leader_status_posted: bool = False
+    published_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class PublishResult:
+    """Outcome of committing/pushing Leader state.json (RHOAIENG-97052)."""
+
+    sha: str
+    committed: bool
+    dry_run: bool = False
 
 
 @dataclass(frozen=True)
@@ -482,17 +492,14 @@ def run_stage1_monitor(
     dry_run: bool = False,
     continue_on_error: bool = False,
     description: str | None = None,
-    leader_pr_url: str | None = None,
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> MonitorResult:
-    """Classify PRs, post statuses, and update state.json (Stage 1).
+    """Classify children, post child statuses, write overall-status, save state.
 
-    RHOAIENG-97052: once every child PR has a Stage-1 final status, write
-    ``overall-status`` into ``state.json``. When that value is ``success``
-    (every component PR succeeded) and ``leader_pr_url`` is provided, post a
-    green ``gated artifacts promoter`` status on the Leader PR so auto-merge
-    can land history on main.
+    Leader success signaling is intentionally **not** done here. Callers that
+    need auto-merge must publish the saved state first, then post Leader green
+    against that published SHA (see ``run_monitor_publish_and_signal``).
     """
     path = state_path.expanduser().resolve()
     payload = load_state(path)
@@ -549,18 +556,19 @@ def run_stage1_monitor(
             post_errors.append((decision.url, str(exc)))
             if not continue_on_error:
                 if status_updates and not dry_run:
-                    # Persist decisions already computed before failing hard.
                     apply_pr_statuses(payload, status_updates)
+                    # Invalidate any stale overall success from a prior run.
+                    apply_overall_status(payload, None)
                     save_state(path, payload)
                 raise GapPrMonitorError(
                     f"Failed to post status for {decision.url}: {exc}"
                 ) from exc
 
     if classify_errors or post_errors:
-        # Still persist what we know when continue_on_error.
         if status_updates and not dry_run:
             apply_pr_statuses(payload, status_updates)
-            # Partial runs stay in progress — do not conclude overall-status.
+            # Partial runs stay in progress — clear stale overall-status.
+            apply_overall_status(payload, None)
             save_state(path, payload)
         details = classify_errors + post_errors
         lines = [f"  - {u}: {e}" for u, e in details]
@@ -571,45 +579,8 @@ def run_stage1_monitor(
     apply_pr_statuses(payload, status_updates)
 
     # RHOAIENG-97052: conclude only when every component PR is Stage-1 final.
-    # Auto-merge the Leader when overall-status is success (all children success).
     overall_status = compute_overall_status(payload)
     apply_overall_status(payload, overall_status)
-
-    leader_status_posted = False
-    leader_url = (leader_pr_url or "").strip() or None
-    if overall_status == OVERALL_STATUS_SUCCESS and leader_url:
-        leader_desc = (
-            "GAP overall-status=success (every component PR final/success); "
-            "auto-merge Leader for history (RHOAIENG-97052)"
-        )
-        try:
-            leader_result: StatusUpdateResult = updater.post_status_for_pr(
-                leader_url,
-                "completed",
-                description=leader_desc,
-            )
-            leader_status_posted = not leader_result.skipped
-            if leader_status_posted:
-                updated.append(leader_url)
-            else:
-                skipped.append(leader_url)
-        except (ValueError, RuntimeError, GhCommandError) as exc:
-            if not continue_on_error:
-                if not dry_run:
-                    save_state(path, payload)
-                raise GapPrMonitorError(
-                    f"Failed to post Leader conclusion status for {leader_url}: {exc}"
-                ) from exc
-            print(
-                f"WARNING: Failed to post Leader conclusion status for {leader_url}: {exc}",
-                file=sys.stderr,
-            )
-    elif overall_status == OVERALL_STATUS_SUCCESS and not leader_url:
-        print(
-            "WARNING: overall-status=success but no Leader PR URL was provided "
-            f"(--leader-pr-url / {ENV_LEADER_PR_URL}); skipped Leader self-status.",
-            file=sys.stderr,
-        )
 
     if not dry_run:
         save_state(path, payload)
@@ -622,7 +593,7 @@ def run_stage1_monitor(
         success_urls=successes,
         dry_run=dry_run,
         overall_status=overall_status,
-        leader_status_posted=leader_status_posted,
+        leader_status_posted=False,
     )
 
 
@@ -728,6 +699,50 @@ def checkout_leader_branch(
     run(["checkout", "-B", ref, f"{remote}/{ref}"], cwd=repo_root)
 
 
+def publish_state(
+    repo_root: Path,
+    state_path: Path,
+    head_ref: str,
+    *,
+    remote: str = "origin",
+    dry_run: bool = False,
+    commit_message: str = "Update GAP state from PR monitor (RHOAIENG-97052)",
+    git_runner: Callable[..., str] | None = None,
+) -> PublishResult:
+    """Commit and push state.json, returning the published commit SHA.
+
+    When the state file is unchanged, no empty commit is created; the current
+    ``HEAD`` SHA is returned so Leader signaling can still target it.
+    """
+    run = git_runner or (lambda args, cwd=repo_root: _run_git(args, cwd=cwd))
+    rel = state_path_for_output(state_path, repo_root=repo_root)
+    if dry_run:
+        sha = run(["rev-parse", "HEAD"], cwd=repo_root) or "dry-run-sha"
+        print(f"[dry-run] would commit and push {rel} on {head_ref} (sha={sha})")
+        return PublishResult(sha=sha, committed=True, dry_run=True)
+
+    run(["config", "user.name", "github-actions[bot]"], cwd=repo_root)
+    run(
+        ["config", "user.email", "github-actions[bot]@users.noreply.github.com"],
+        cwd=repo_root,
+    )
+    run(["add", "--", rel], cwd=repo_root)
+    staged = run(["diff", "--cached", "--name-only"], cwd=repo_root)
+    committed = False
+    if staged.strip():
+        run(["commit", "-m", commit_message], cwd=repo_root)
+        committed = True
+        run(["push", remote, f"HEAD:{head_ref}"], cwd=repo_root)
+        print(f"Pushed state update for Leader branch {head_ref}")
+    else:
+        print(f"No state file changes to commit for {head_ref}.")
+    sha = run(["rev-parse", "HEAD"], cwd=repo_root)
+    if not sha:
+        raise GapPrMonitorError("Could not resolve published commit SHA after publish.")
+    return PublishResult(sha=sha, committed=committed, dry_run=False)
+
+
+# Back-compat alias used by older schedule helpers/tests.
 def commit_and_push_state(
     repo_root: Path,
     state_path: Path,
@@ -737,32 +752,161 @@ def commit_and_push_state(
     dry_run: bool = False,
     git_runner: Callable[..., str] | None = None,
 ) -> bool:
-    """Commit state.json changes on the current Leader branch and push.
+    """Commit/push state; returns True when a new commit was created."""
+    result = publish_state(
+        repo_root,
+        state_path,
+        head_ref,
+        remote=remote,
+        dry_run=dry_run,
+        git_runner=git_runner,
+    )
+    return result.committed
 
-    Returns True when a commit was created (or would be in dry-run).
-    """
+
+def current_git_branch(
+    repo_root: Path,
+    *,
+    git_runner: Callable[..., str] | None = None,
+) -> str:
+    """Return the current branch name under ``repo_root``."""
     run = git_runner or (lambda args, cwd=repo_root: _run_git(args, cwd=cwd))
-    rel = state_path_for_output(state_path, repo_root=repo_root)
-    if dry_run:
-        print(f"[dry-run] would commit and push {rel} on {head_ref}")
-        return True
-    run(["config", "user.name", "github-actions[bot]"], cwd=repo_root)
-    run(
-        ["config", "user.email", "github-actions[bot]@users.noreply.github.com"],
-        cwd=repo_root,
+    branch = run(["rev-parse", "--abbrev-ref", "HEAD"], cwd=repo_root)
+    if not branch or branch == "HEAD":
+        raise GapPrMonitorError(
+            "Checked-out Leader tree is not on a branch; cannot publish state."
+        )
+    return branch
+
+
+def verify_leader_head(
+    leader_pr_url: str,
+    expected_sha: str,
+    *,
+    updater: PRStatusUpdater,
+) -> None:
+    """Fail if the Leader PR head is no longer the published SHA."""
+    head = updater.get_pull_head(parse_pr_url(leader_pr_url))
+    if head.sha != expected_sha:
+        raise GapPrMonitorError(
+            f"Leader head moved after state publication: expected {expected_sha}, "
+            f"found {head.sha}. Re-run the monitor; not posting Leader success."
+        )
+
+
+def post_leader_success(
+    leader_pr_url: str,
+    published_sha: str,
+    *,
+    updater: PRStatusUpdater,
+) -> StatusUpdateResult:
+    """Post Leader green against an explicit published commit SHA."""
+    description = (
+        "GAP overall-status=success (every component PR final/success); "
+        "auto-merge Leader for history (RHOAIENG-97052)"
     )
-    run(["add", "--", rel], cwd=repo_root)
-    staged = run(["diff", "--cached", "--name-only"], cwd=repo_root)
-    if not staged.strip():
-        print(f"No state file changes to commit for {head_ref}.")
-        return False
-    run(
-        ["commit", "-m", "Update GAP state from scheduled PR monitor (RHOAIENG-97050)"],
-        cwd=repo_root,
+    return updater.post_status_for_pr(
+        leader_pr_url,
+        "completed",
+        description=description,
+        head_sha=published_sha,
     )
-    run(["push", remote, f"HEAD:{head_ref}"], cwd=repo_root)
-    print(f"Pushed state update for Leader branch {head_ref}")
-    return True
+
+
+def run_monitor_publish_and_signal(
+    state_path: Path,
+    *,
+    repo_root: Path,
+    head_ref: str | None = None,
+    leader_pr_url: str | None = None,
+    publish: bool = False,
+    check_name: str = DEFAULT_CHECK_NAME,
+    dry_run: bool = False,
+    continue_on_error: bool = False,
+    description: str | None = None,
+    remote: str = "origin",
+    updater_factory: Callable[..., PRStatusUpdater] | None = None,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+    git_runner: Callable[..., str] | None = None,
+) -> MonitorResult:
+    """Coordinator: monitor → publish state → Leader green on published SHA.
+
+    Ordering (Chris review / RHOAIENG-97052):
+      classify children → save state → commit/push → post Leader success on that SHA
+    """
+    result = run_stage1_monitor(
+        state_path,
+        check_name=check_name,
+        dry_run=dry_run,
+        continue_on_error=continue_on_error,
+        description=description,
+        updater_factory=updater_factory,
+        gh_runner=gh_runner,
+    )
+
+    if not publish:
+        if (
+            result.overall_status == OVERALL_STATUS_SUCCESS
+            and not (leader_pr_url or "").strip()
+        ):
+            # Local/non-publish runs still warn when a Leader URL is missing.
+            pass
+        return result
+
+    branch = (head_ref or "").strip() or current_git_branch(
+        repo_root, git_runner=git_runner
+    )
+    published = publish_state(
+        repo_root,
+        result.state_path,
+        branch,
+        remote=remote,
+        dry_run=dry_run,
+        git_runner=git_runner,
+    )
+
+    leader_url = (leader_pr_url or "").strip() or None
+    leader_status_posted = False
+    updated = list(result.updated_urls)
+    skipped = list(result.skipped_urls)
+
+    if result.overall_status == OVERALL_STATUS_SUCCESS and leader_url:
+        factory = updater_factory or PRStatusUpdater
+        updater = factory(check_name=check_name, dry_run=dry_run)
+        if not dry_run:
+            verify_leader_head(leader_url, published.sha, updater=updater)
+        try:
+            leader_result = post_leader_success(
+                leader_url, published.sha, updater=updater
+            )
+            leader_status_posted = not leader_result.skipped
+            if leader_status_posted:
+                updated.append(leader_url)
+            else:
+                skipped.append(leader_url)
+        except (ValueError, RuntimeError, GhCommandError) as exc:
+            raise GapPrMonitorError(
+                f"Failed to post Leader conclusion status for {leader_url} "
+                f"on {published.sha}: {exc}"
+            ) from exc
+    elif result.overall_status == OVERALL_STATUS_SUCCESS and not leader_url:
+        print(
+            "WARNING: overall-status=success but no Leader PR URL was provided "
+            f"(--leader-pr-url / {ENV_LEADER_PR_URL}); skipped Leader self-status.",
+            file=sys.stderr,
+        )
+
+    return MonitorResult(
+        state_path=result.state_path,
+        updated_urls=updated,
+        skipped_urls=skipped,
+        merge_failure_urls=result.merge_failure_urls,
+        success_urls=result.success_urls,
+        dry_run=result.dry_run,
+        overall_status=result.overall_status,
+        leader_status_posted=leader_status_posted,
+        published_sha=published.sha,
+    )
 
 
 def run_scheduled_monitors(
@@ -779,12 +923,7 @@ def run_scheduled_monitors(
     git_runner: Callable[..., str] | None = None,
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
 ) -> int:
-    """Discover open Leaders and run the Stage-1 monitor on each (RHOAIENG-97050).
-
-    Checkout / commit / push stay in this script so the Actions workflow can
-    stay a thin wrapper. Existing pull_request and workflow_dispatch paths are
-    unchanged.
-    """
+    """Discover open Leaders and run publish-then-signal on each (RHOAIENG-97050)."""
     leaders = list_open_leader_prs(
         leader_repo, label=label, gh_runner=gh_runner
     )
@@ -813,16 +952,20 @@ def run_scheduled_monitors(
                 root=root,
                 allow_gap_dir_fallback=True,
             )
-            result = run_stage1_monitor(
+            result = run_monitor_publish_and_signal(
                 state_path,
+                repo_root=root,
+                head_ref=leader.head_ref,
+                leader_pr_url=leader.url,
+                publish=True,
                 check_name=check_name,
                 dry_run=dry_run,
                 continue_on_error=continue_on_error,
                 description=description,
-                # Scheduled runs know each Leader URL from discovery (RHOAIENG-97052).
-                leader_pr_url=leader.url,
+                remote=remote,
                 updater_factory=updater_factory,
                 gh_runner=gh_runner,
+                git_runner=git_runner,
             )
             prefix = "[dry-run] " if result.dry_run else ""
             print(
@@ -830,14 +973,10 @@ def run_scheduled_monitors(
                 f"{len(result.success_urls) + len(result.merge_failure_urls)} "
                 f"child PR(s) from {result.state_path}"
             )
-            commit_and_push_state(
-                root,
-                result.state_path,
-                leader.head_ref,
-                remote=remote,
-                dry_run=dry_run,
-                git_runner=git_runner,
-            )
+            if result.published_sha:
+                print(f"{prefix}published-sha: {result.published_sha}")
+            if result.leader_status_posted:
+                print(f"{prefix}Posted Leader conclusion status (auto-merge signal)")
         except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
             message = f"Leader #{leader.number} ({leader.url}): {exc}"
             print(f"ERROR: {message}", file=sys.stderr)
@@ -926,10 +1065,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="URL",
         help=(
-            "Leader PR URL. When overall-status is success, post a green "
-            f"{DEFAULT_CHECK_NAME!r} status on this PR so auto-merge can "
-            f"preserve run history (RHOAIENG-97052). "
-            f"Also accepted via {ENV_LEADER_PR_URL}."
+            "Leader PR URL. With --publish-state, after the state commit is "
+            "pushed and overall-status is success, post a green "
+            f"{DEFAULT_CHECK_NAME!r} status on the published SHA "
+            f"(RHOAIENG-97052). Also accepted via {ENV_LEADER_PR_URL}."
+        ),
+    )
+    parser.add_argument(
+        "--publish-state",
+        action="store_true",
+        help=(
+            "RHOAIENG-97052: commit and push state.json from Python, then post "
+            "Leader success against that published commit SHA (never before)."
         ),
     )
     parser.add_argument(
@@ -1025,18 +1172,20 @@ def main(argv: list[str] | None = None) -> int:
             root=repo_root,
             allow_gap_dir_fallback=args.allow_gap_dir_fallback,
         )
-        # Emit path for thin Actions workflows (commit / follow-up steps).
+        # Emit path for thin Actions workflows (optional follow-up steps).
         append_github_output(
             "state_path",
             state_path_for_output(state_path, repo_root=repo_root),
         )
-        result = run_stage1_monitor(
+        result = run_monitor_publish_and_signal(
             state_path,
+            repo_root=repo_root,
+            leader_pr_url=leader_pr_url,
+            publish=args.publish_state,
             check_name=args.check_name,
             dry_run=args.dry_run,
             continue_on_error=args.continue_on_error,
             description=args.description,
-            leader_pr_url=leader_pr_url,
         )
     except GapPrMonitorError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
@@ -1052,6 +1201,9 @@ def main(argv: list[str] | None = None) -> int:
     if result.overall_status is not None:
         print(f"{prefix}overall-status: {result.overall_status}")
         append_github_output("overall_status", result.overall_status)
+    if result.published_sha:
+        print(f"{prefix}published-sha: {result.published_sha}")
+        append_github_output("published_sha", result.published_sha)
     if result.leader_status_posted:
         print(f"{prefix}Posted Leader conclusion status (auto-merge signal)")
     for url in result.updated_urls:

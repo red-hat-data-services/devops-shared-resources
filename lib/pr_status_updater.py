@@ -375,21 +375,29 @@ class PRStatusUpdater:
         *,
         description: str | None = None,
         target_url: str | None = None,
+        head_sha: str | None = None,
     ) -> StatusUpdateResult:
+        """Post a commit status for a PR.
+
+        When ``head_sha`` is provided, the status is posted against that exact
+        commit (RHOAIENG-97052 publish-then-signal). Otherwise the current PR
+        head SHA is resolved at post time.
+        """
         pr = parse_pr_url(pr_url)
         github_state = normalize_status(state)
         description = validate_description(description)
         target_url = validate_target_url(target_url)
         head = self.get_pull_head(pr)
+        sha = (head_sha or "").strip() or head.sha
         existing = self.get_latest_status_for_context(
-            head.status_owner, head.status_repo, head.sha
+            head.status_owner, head.status_repo, sha
         )
         if existing and self._should_skip_status_update(
             existing, github_state, description, target_url
         ):
             return StatusUpdateResult(
                 pr=pr,
-                head_sha=head.sha,
+                head_sha=sha,
                 state=github_state,
                 context=self.check_name,
                 dry_run=self.dry_run,
@@ -400,7 +408,7 @@ class PRStatusUpdater:
             self.build_status_command(
                 head.status_owner,
                 head.status_repo,
-                head.sha,
+                sha,
                 github_state,
                 description=description,
                 target_url=target_url,
@@ -409,7 +417,7 @@ class PRStatusUpdater:
         )
         return StatusUpdateResult(
             pr=pr,
-            head_sha=head.sha,
+            head_sha=sha,
             state=github_state,
             context=self.check_name,
             dry_run=self.dry_run,
