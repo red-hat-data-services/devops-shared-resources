@@ -27,11 +27,13 @@ from scripts.gap_pr_monitor import (
     extract_pr_urls,
     extract_trigger_id_from_labels,
     fetch_pr_merge_info,
+    LATEST_LEADER_PR_SENTINEL,
     list_open_leader_prs,
     load_state,
     main,
     publish_state,
     resolve_inputs_for_cli,
+    resolve_leader_pr_url_input,
     resolve_leader_repo,
     resolve_state_file,
     run_monitor_publish_and_signal,
@@ -1489,6 +1491,54 @@ def test_list_open_leader_prs_parses_gh_json() -> None:
         head_ref="gap-leader/gap-abc",
         labels=("gated-artifacts-promoter", "gap-abc"),
     )
+
+
+def test_resolve_leader_pr_url_input_passes_through_url() -> None:
+    url = "https://github.com/org/gap/pull/99"
+    assert (
+        resolve_leader_pr_url_input(
+            url,
+            leader_repo="org/gap",
+            gh_runner=lambda args: "[]",
+        )
+        == url
+    )
+
+
+def test_resolve_leader_pr_url_input_latest_picks_highest_number() -> None:
+    payload = [
+        {
+            "number": 12,
+            "url": "https://github.com/org/gap/pull/12",
+            "headRefName": "leader-old",
+            "labels": [{"name": "gated-artifacts-promoter"}],
+        },
+        {
+            "number": 40,
+            "url": "https://github.com/org/gap/pull/40",
+            "headRefName": "leader-new",
+            "labels": [{"name": "gated-artifacts-promoter"}],
+        },
+    ]
+
+    def fake_gh(args: list[str]) -> str:
+        return json.dumps(payload)
+
+    resolved = resolve_leader_pr_url_input(
+        LATEST_LEADER_PR_SENTINEL,
+        leader_repo="org/gap",
+        gh_runner=fake_gh,
+    )
+    assert resolved == "https://github.com/org/gap/pull/40"
+
+
+def test_resolve_leader_pr_url_input_latest_errors_when_none_open() -> None:
+    with pytest.raises(GapPrMonitorError, match="No open Leader PRs"):
+        resolve_leader_pr_url_input(
+            "latest_leader_pr",
+            leader_repo="org/gap",
+            gh_runner=lambda args: "[]",
+        )
 
 
 def test_should_run_schedule_mode_from_flag_and_env(

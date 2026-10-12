@@ -51,6 +51,8 @@ from lib.state_file import (
 
 DEFAULT_CHECK_NAME = "gated artifacts promoter"
 DEFAULT_LEADER_LABEL = "gated-artifacts-promoter"
+# workflow_dispatch may pass this instead of a concrete Leader PR URL.
+LATEST_LEADER_PR_SENTINEL = "LATEST_LEADER_PR"
 SUCCESS_PR_STATUS = "success"
 MERGE_FAILURE_PR_STATUS = "merge-failure"
 # Child statuses that mean Stage-1 classification is done for that PR.
@@ -1051,6 +1053,45 @@ def should_run_schedule_mode(*, schedule_flag: bool) -> bool:
     return os.environ.get("GITHUB_EVENT_NAME", "").strip() == "schedule"
 
 
+def is_latest_leader_pr_sentinel(value: str | None) -> bool:
+    """True when the caller wants the newest open Leader PR discovered via gh."""
+    return (value or "").strip().upper() == LATEST_LEADER_PR_SENTINEL
+
+
+def resolve_leader_pr_url_input(
+    leader_pr_url: str | None,
+    *,
+    leader_repo: str,
+    label: str = DEFAULT_LEADER_LABEL,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> str | None:
+    """Return a concrete Leader PR URL, resolving ``LATEST_LEADER_PR`` when set."""
+    raw = (leader_pr_url or "").strip()
+    if not raw:
+        return None
+    if not is_latest_leader_pr_sentinel(raw):
+        return raw
+
+    leaders = list_open_leader_prs(leader_repo, label=label, gh_runner=gh_runner)
+    if not leaders:
+        raise GapPrMonitorError(
+            f"No open Leader PRs with label {label!r} in {leader_repo}; "
+            f"cannot resolve {LATEST_LEADER_PR_SENTINEL}."
+        )
+    chosen = max(leaders, key=lambda leader: leader.number)
+    if len(leaders) > 1:
+        print(
+            f"WARNING: {len(leaders)} open Leader PR(s); "
+            f"{LATEST_LEADER_PR_SENTINEL} selected #{chosen.number} {chosen.url}",
+            file=sys.stderr,
+        )
+    print(
+        f"Resolved {LATEST_LEADER_PR_SENTINEL} to Leader "
+        f"#{chosen.number} {chosen.url}"
+    )
+    return chosen.url
+
+
 def resolve_leader_repo(explicit: str | None) -> str:
     """Resolve OWNER/REPO for Leader discovery (CLI, GAP_LEADER_REPO, GITHUB_REPOSITORY)."""
     for candidate in (
@@ -1115,9 +1156,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         metavar="URL",
         help=(
-            "Leader PR URL. With --publish-state, after the state commit is "
-            "pushed and overall-status is success, post a green "
-            f"{DEFAULT_CHECK_NAME!r} status on the published SHA "
+            "Leader PR URL, or "
+            f"{LATEST_LEADER_PR_SENTINEL} to discover the newest open Leader "
+            f"labeled {DEFAULT_LEADER_LABEL!r}. With --publish-state, after "
+            "the state commit is pushed and overall-status is success, post a "
+            f"green {DEFAULT_CHECK_NAME!r} status on the published SHA "
             f"(RHOAIENG-97052). Also accepted via {ENV_LEADER_PR_URL}."
         ),
     )
@@ -1214,7 +1257,19 @@ def main(argv: list[str] | None = None) -> int:
         labels=args.labels,
         leader_pr_url=args.leader_pr_url,
     )
+    leader_label = (
+        (args.leader_label or "").strip()
+        or _env_nonempty(ENV_LEADER_LABEL)
+        or DEFAULT_LEADER_LABEL
+    )
     try:
+        if leader_pr_url and is_latest_leader_pr_sentinel(leader_pr_url):
+            leader_repo = resolve_leader_repo(args.leader_repo)
+            leader_pr_url = resolve_leader_pr_url_input(
+                leader_pr_url,
+                leader_repo=leader_repo,
+                label=leader_label,
+            )
         state_path = resolve_state_file(
             state_file=state_file,
             trigger_id=trigger_id,

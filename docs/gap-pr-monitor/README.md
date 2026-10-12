@@ -101,7 +101,7 @@ The workflow passes GitHub context via env vars (no resolution logic in YAML):
 | `GAP_PR_LABELS` | Leader PR labels (comma-separated) |
 | `GAP_LEADER_REPO` | Optional override for schedule discovery (default: `GITHUB_REPOSITORY`) |
 | `GAP_LEADER_LABEL` | Optional Leader label for schedule discovery (default: `gated-artifacts-promoter`) |
-| `GAP_LEADER_PR_URL` | Leader PR HTML URL (e.g. `github.event.pull_request.html_url`) |
+| `GAP_LEADER_PR_URL` | Leader PR HTML URL, or `LATEST_LEADER_PR` on `workflow_dispatch` |
 
 The script resolves `state.json`, updates it, publishes the commit (when
 `--publish-state`), and writes `state_path=`, `overall_status=`, and
