@@ -51,6 +51,10 @@ is set via `GAP_LEADER_PR_URL` / `--leader-pr-url`) post
 `gated artifacts promoter` = **success** on the **published** Leader head SHA
 so auto-merge cannot race ahead of the state commit.
 
+If another workflow run updated the same Leader branch, publish fetches the
+remote tip, retries `git push` with `pull --rebase` between attempts (up to
+three), instead of failing the job on a non-fast-forward push.
+
 Example after all children succeed:
 
 ```json

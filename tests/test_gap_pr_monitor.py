@@ -1661,6 +1661,50 @@ def test_publish_state_returns_sha_without_empty_commit(
     assert not any(c[:1] == ["commit"] for c in calls)
 
 
+def test_push_head_with_rebase_retries_after_rejection(tmp_path: Path) -> None:
+    from scripts.gap_pr_monitor import _push_head_with_rebase
+
+    calls: list[list[str]] = []
+    push_attempts = [0]
+
+    def fake_git(args, cwd=None):
+        calls.append(list(args))
+        if args[:1] == ["push"]:
+            push_attempts[0] += 1
+            if push_attempts[0] == 1:
+                raise GapPrMonitorError(
+                    "git push failed (1): rejected; fetch first"
+                )
+            return ""
+        return ""
+
+    _push_head_with_rebase(
+        tmp_path,
+        "gap-leader/gap-abc",
+        git_runner=fake_git,
+    )
+    assert push_attempts[0] == 2
+    assert ["fetch", "origin", "gap-leader/gap-abc"] in calls
+    assert ["pull", "--rebase", "origin", "gap-leader/gap-abc"] in calls
+
+
+def test_push_head_with_rebase_raises_after_max_attempts(tmp_path: Path) -> None:
+    from scripts.gap_pr_monitor import _push_head_with_rebase
+
+    def fake_git(args, cwd=None):
+        if args[:1] == ["push"]:
+            raise GapPrMonitorError("git push failed (1): rejected")
+        return ""
+
+    with pytest.raises(GapPrMonitorError, match="rejected"):
+        _push_head_with_rebase(
+            tmp_path,
+            "leader-branch",
+            git_runner=fake_git,
+            max_attempts=2,
+        )
+
+
 def test_publish_state_commits_when_staged(
     tmp_path: Path,
 ) -> None:
@@ -1674,6 +1718,10 @@ def test_publish_state_commits_when_staged(
             return "state.json"
         if args[:2] == ["rev-parse", "HEAD"]:
             return "new-sha"
+        if args[:1] == ["fetch"]:
+            return ""
+        if args[:1] == ["push"]:
+            return ""
         return ""
 
     published = publish_state(
@@ -1686,6 +1734,7 @@ def test_publish_state_commits_when_staged(
     assert published.committed is True
     assert any(c[:1] == ["commit"] for c in calls)
     assert any(c[:1] == ["push"] for c in calls)
+    assert any(c[:1] == ["fetch"] for c in calls)
 
 
 def test_verify_leader_head_rejects_moved_sha() -> None:

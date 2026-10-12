@@ -618,6 +618,54 @@ def _run_git(args: Sequence[str], *, cwd: Path) -> str:
     return (completed.stdout or "").strip()
 
 
+def _is_push_rejection(message: str) -> bool:
+    """True when ``git push`` failed because the remote branch moved."""
+    lower = message.lower()
+    return (
+        "rejected" in lower
+        or "non-fast-forward" in lower
+        or "fetch first" in lower
+    )
+
+
+def _push_head_with_rebase(
+    repo_root: Path,
+    head_ref: str,
+    *,
+    remote: str = "origin",
+    git_runner: Callable[..., str],
+    max_attempts: int = 3,
+) -> None:
+    """Push ``HEAD`` to ``head_ref``, rebasing onto the remote tip between attempts."""
+    refspec = f"HEAD:{head_ref}"
+    last_error = ""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            git_runner(["fetch", remote, head_ref], cwd=repo_root)
+        except GapPrMonitorError as exc:
+            raise GapPrMonitorError(
+                f"Could not fetch {remote}/{head_ref} before state publish: {exc}"
+            ) from exc
+        try:
+            git_runner(["push", remote, refspec], cwd=repo_root)
+            return
+        except GapPrMonitorError as exc:
+            last_error = str(exc)
+            if attempt >= max_attempts or not _is_push_rejection(last_error):
+                raise
+            try:
+                git_runner(
+                    ["pull", "--rebase", remote, head_ref],
+                    cwd=repo_root,
+                )
+            except GapPrMonitorError as rebase_exc:
+                raise GapPrMonitorError(
+                    f"State publish push was rejected and rebase failed "
+                    f"({last_error}): {rebase_exc}"
+                ) from rebase_exc
+    raise GapPrMonitorError(last_error or "State publish push failed.")
+
+
 def list_open_leader_prs(
     leader_repo: str,
     *,
@@ -732,7 +780,12 @@ def publish_state(
     if staged.strip():
         run(["commit", "-m", commit_message], cwd=repo_root)
         committed = True
-        run(["push", remote, f"HEAD:{head_ref}"], cwd=repo_root)
+        _push_head_with_rebase(
+            repo_root,
+            head_ref,
+            remote=remote,
+            git_runner=run,
+        )
         print(f"Pushed state update for Leader branch {head_ref}")
     else:
         print(f"No state file changes to commit for {head_ref}.")
