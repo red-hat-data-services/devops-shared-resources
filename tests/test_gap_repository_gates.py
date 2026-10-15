@@ -696,24 +696,42 @@ def test_mixed_component_results_fail_the_repository(tmp_path: Path) -> None:
     assert all(item["pr-status"] != "success" for item in _saved(path)["pull-requests"])
 
 
-def test_pending_component_blocks_and_times_out_on_the_original_deadline(tmp_path: Path) -> None:
+def test_unfinished_build_stays_pending_past_the_revision_deadline(tmp_path: Path) -> None:
     github = _GitHub()
     github.check_runs = [
-        _build_check("odh-eval-hub-on-pull-request-65317", status="in_progress", conclusion=None),
+        _build_check(
+            "odh-eval-hub-on-pull-request-65317",
+            status="queued",
+            conclusion=None,
+        ),
         *_feasibility_success_payloads(),
     ]
     path = _state(tmp_path, builds=[])
     result, updater = _run(path, github)
     assert result.pending_urls == [URL]
+    assert result.build_failure_urls == []
     assert updater.posts[0][1] == "pending"
     assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
 
-    expired, updater = _run(path, github, now=COMMITTER + timedelta(hours=6))
-    assert expired.build_failure_urls == [URL]
-    assert updater.posts[0][1] == "failure"
-    assert expired.reports
-    assert "timed out after 6h" in expired.reports[0]
-    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-failure"
+    for status in ("queued", "in_progress"):
+        github.check_runs[0] = _build_check(
+            "odh-eval-hub-on-pull-request-65317",
+            status=status,
+            conclusion=None,
+        )
+        still_running, updater = _run(path, github, now=COMMITTER + timedelta(hours=7))
+        assert still_running.pending_urls == [URL], status
+        assert still_running.build_failure_urls == []
+        assert updater.posts[0][1] == "pending"
+        assert "timed out" not in " ".join(still_running.reports)
+        assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
+
+    github.check_runs[0] = _build_check("odh-eval-hub-on-pull-request-65317")
+    passed, updater = _run(path, github, now=COMMITTER + timedelta(hours=7))
+    assert passed.success_urls == [URL]
+    assert passed.build_failure_urls == []
+    assert updater.posts[0][1] == "success"
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
 
 
 def test_missing_check_is_not_a_no_build_success(tmp_path: Path) -> None:
@@ -725,7 +743,9 @@ def test_missing_check_is_not_a_no_build_success(tmp_path: Path) -> None:
     assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
 
 
-def test_mixed_tekton_change_keeps_a_missing_build_pending_until_deadline(tmp_path: Path) -> None:
+def test_mixed_tekton_change_keeps_a_missing_build_pending_past_the_deadline(
+    tmp_path: Path,
+) -> None:
     github = _GitHub()
     github.files = ["README.md", ".tekton/other.yaml"]
     github.check_runs = [*_feasibility_success_payloads()]
@@ -736,12 +756,13 @@ def test_mixed_tekton_change_keeps_a_missing_build_pending_until_deadline(tmp_pa
     assert updater.posts[0][1] == "pending"
     assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
 
-    expired, updater = _run(path, github, now=COMMITTER + timedelta(hours=6))
-    assert expired.success_urls == []
-    assert expired.build_failure_urls == [URL]
-    assert updater.posts[0][1] == "failure"
-    assert "timed out after 6h" in expired.reports[0]
-    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-failure"
+    still_missing, updater = _run(path, github, now=COMMITTER + timedelta(hours=6))
+    assert still_missing.success_urls == []
+    assert still_missing.build_failure_urls == []
+    assert still_missing.pending_urls == [URL]
+    assert updater.posts[0][1] == "pending"
+    assert "timed out" not in " ".join(still_missing.reports)
+    assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
 
 
 def test_mixed_tekton_change_fails_when_the_selected_build_fails(tmp_path: Path) -> None:
@@ -1025,35 +1046,15 @@ def test_merge_conflict_stays_merge_failure_without_checks(tmp_path: Path) -> No
     assert _saved(path)["pull-requests"][0]["pr-status"] == "merge-failure"
 
 
-def test_new_commit_starts_a_new_six_hour_window(tmp_path: Path) -> None:
+def test_missing_build_stays_pending_past_the_revision_deadline(tmp_path: Path) -> None:
     github = _GitHub()
     github.check_runs = [*_feasibility_success_payloads()]
     path = _state(tmp_path, builds=[])
     expired, _updater = _run(path, github, now=COMMITTER + timedelta(hours=6, seconds=1))
-    assert expired.build_failure_urls == [URL]
-
-    github.head_sha = "c" * 40
-    github.committer_date = "2026-10-06T16:00:00Z"
-    for payload in github.check_runs:
-        payload["head_sha"] = github.head_sha
-    for job in github.jobs:
-        job["head_sha"] = github.head_sha
-
-    holder: dict[str, _Updater] = {}
-
-    def factory(*, check_name: str, dry_run: bool = False) -> _Updater:
-        holder["updater"] = _Updater(check_name=check_name, dry_run=dry_run)
-        return holder["updater"]
-
-    refreshed = run_monitor(
-        path,
-        updater_factory=factory,
-        gh_runner=github,
-        now=datetime(2026, 10, 6, 16, 30, tzinfo=timezone.utc),
-        build_app_slug="konflux-internal-p02",
-        build_app_id=906404,
-    )
-    assert refreshed.pending_urls == [URL]
+    assert expired.pending_urls == [URL]
+    assert expired.build_failure_urls == []
+    assert expired.merge_failure_urls == []
+    assert "timed out" not in " ".join(expired.reports)
     assert _saved(path)["pull-requests"][0]["pr-status"] == "build-pending"
 
 
@@ -1062,7 +1063,12 @@ def test_truncated_commit_list_uses_the_captured_head_sha(tmp_path: Path) -> Non
     github.hide_head_commit = True
     github.author_date = "2026-10-06T08:00:00Z"
     github.committer_date = "2026-10-06T10:00:00Z"
-    github.check_runs = [*_feasibility_success_payloads()]
+    github.workflow_status = "in_progress"
+    github.workflow_conclusion = ""
+    github.check_runs = [
+        _build_check("odh-eval-hub-on-pull-request-65317"),
+        *_feasibility_success_payloads(),
+    ]
     path = _state(tmp_path, builds=[])
     listed = github._listed_commits()
     assert len(listed) == 100
@@ -1085,7 +1091,8 @@ def test_truncated_commit_list_uses_the_captured_head_sha(tmp_path: Path) -> Non
         github,
         now=datetime(2026, 10, 6, 16, 0, tzinfo=timezone.utc),
     )
-    assert expired.build_failure_urls == [URL]
+    assert expired.merge_failure_urls == [URL]
+    assert expired.build_failure_urls == []
     assert expired.pending_urls == []
     assert "timed out after 6h" in expired.reports[0]
     assert github.commit_shas == [SHA, SHA]

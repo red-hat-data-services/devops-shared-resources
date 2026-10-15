@@ -31,6 +31,7 @@ from lib.git_utils import (
     is_local_path,
     list_commits_between,
     normalize_repo_url,
+    remote_branch_exists,
     resolve_branch_ref,
     push_branch,
     run_git,
@@ -183,6 +184,13 @@ def _require_github_token(entry: dict[str, Any], token: str | None) -> None:
 
 def _uses_source_pr_head(entry: dict[str, Any]) -> bool:
     return entry["sync_type"] == "pr" and entry["pr"]["head_strategy"] == "source"
+
+
+def _target_branch_missing(entry: dict[str, Any], *, token: str | None) -> bool:
+    """Return whether a PR sync has no target branch to open against."""
+    if entry["sync_type"] != "pr":
+        return False
+    return not remote_branch_exists(entry["dest"]["url"], entry["dest"]["branch"], token=token)
 
 
 def _validate_source_pr_head(entry: dict[str, Any]) -> None:
@@ -339,6 +347,11 @@ def run_sync_entry(
     if not dry_run:
         _require_github_token(entry, token)
 
+    # A newly onboarded component has no stable branch yet. Create it from
+    # the source tip. An existing target stays on the PR path.
+    if _target_branch_missing(entry, token=token):
+        sync_type = "push"
+
     if dry_run:
         pr_head = source["branch"] if _uses_source_pr_head(entry) else pr_branch
         return SyncOutcome(
@@ -357,7 +370,7 @@ def run_sync_entry(
 
     workdir: Path | None = None
     try:
-        if _uses_source_pr_head(entry):
+        if sync_type == "pr" and _uses_source_pr_head(entry):
             _validate_source_pr_head(entry)
             assert token is not None
             workdir, commits_to_sync = _collect_sync_commits(entry, token=token)

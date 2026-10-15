@@ -116,6 +116,41 @@ def test_unfinished_and_missing_checks_stay_pending_until_the_deadline() -> None
     assert again.timed_out is True
 
 
+def test_unresolved_builds_can_stay_pending_past_the_deadline() -> None:
+    expected = (_expected(),)
+    deadline = NOW
+    missing = evaluate_checks(
+        expected,
+        [],
+        now=deadline,
+        deadline=deadline,
+        timeout_unresolved=False,
+    )
+    assert missing.outcome == "pending"
+    assert missing.timed_out is False
+
+    queued = evaluate_checks(
+        expected,
+        [_run(status="queued", conclusion=None)],
+        now=deadline + timedelta(hours=2),
+        deadline=deadline,
+        timeout_unresolved=False,
+    )
+    assert queued.outcome == "pending"
+    assert "queued" in queued.findings[0].reason
+    assert "timed out" not in queued.findings[0].reason
+
+    failed = evaluate_checks(
+        expected,
+        [_run(conclusion="failure")],
+        now=deadline,
+        deadline=deadline,
+        timeout_unresolved=False,
+    )
+    assert failed.outcome == "fail"
+    assert failed.timed_out is False
+
+
 def test_completed_failure_does_not_wait_for_the_timeout() -> None:
     result = evaluate_checks(
         (_expected(),),

@@ -199,13 +199,15 @@ def evaluate_checks(
     deadline: datetime | None,
     query_error: str | None = None,
     revision: str | None = None,
+    timeout_unresolved: bool = True,
 ) -> GateResult:
     """Evaluate caller-selected checks against the current revision.
 
     An empty expected set passes only when retrieval succeeded. Query errors
-    and missing checks stay unresolved until ``deadline``, then fail. A
-    completed non-success conclusion fails immediately. Runs for a different
-    ``revision`` are ignored.
+    stay unresolved until ``deadline``, then fail. Missing and unfinished
+    checks do the same when ``timeout_unresolved`` is true; when it is false
+    they stay pending after the deadline. A completed non-success conclusion
+    fails immediately. Runs for a different ``revision`` are ignored.
     """
     moment = _as_utc(now)
     limit = _as_utc(deadline) if deadline is not None else None
@@ -222,7 +224,13 @@ def evaluate_checks(
         return _result((finding,))
 
     findings = tuple(
-        _evaluate_one(item, latest_matching(item, runs), now=moment, deadline=limit)
+        _evaluate_one(
+            item,
+            latest_matching(item, runs),
+            now=moment,
+            deadline=limit,
+            timeout_unresolved=timeout_unresolved,
+        )
         for item in expected
     )
     return _result(findings)
@@ -234,6 +242,7 @@ def _evaluate_one(
     *,
     now: datetime,
     deadline: datetime | None,
+    timeout_unresolved: bool = True,
 ) -> CheckFinding:
     if run is None:
         return _unresolved_finding(
@@ -242,6 +251,7 @@ def _evaluate_one(
             now=now,
             deadline=deadline,
             name=expected.name or expected.name_suffix,
+            apply_deadline=timeout_unresolved,
         )
     if run.status != "completed":
         state = run.status or "unfinished"
@@ -255,6 +265,7 @@ def _evaluate_one(
             revision=run.head_sha,
             status=run.status,
             conclusion=run.conclusion,
+            apply_deadline=timeout_unresolved,
         )
     conclusion = (run.conclusion or "").lower()
     if conclusion == PASSING_CONCLUSION:
@@ -292,8 +303,9 @@ def _unresolved_finding(
     revision: str | None = None,
     status: str | None = None,
     conclusion: str | None = None,
+    apply_deadline: bool = True,
 ) -> CheckFinding:
-    if deadline is not None and now >= deadline:
+    if apply_deadline and deadline is not None and now >= deadline:
         return CheckFinding(
             key=key,
             outcome=OUTCOME_FAIL,

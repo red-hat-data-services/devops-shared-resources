@@ -36,6 +36,10 @@ The orchestrator defaults to `pr-head: source` (main/master → stable) with **n
 `ignore-files`. Set `pr-head: sync-branch` on an entry when you need
 `ignore-files` (e.g. `.tekton/*`).
 
+A newly onboarded component has no `stable` branch. That sync pushes the
+source tip as `stable` and does not open a child PR. Once `stable` exists,
+later runs stay on the main→stable PR path.
+
 ## Config
 
 Infra config is `src/config/main-stable-source-map.yaml` (mirrors

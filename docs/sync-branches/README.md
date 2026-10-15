@@ -125,6 +125,10 @@ pr:
 - `push`: push a bootstrap branch without opening a PR
 - `commit-merge`: merge directly into the target branch and push
 
+When `sync-type` is `pr` and the target branch does not exist yet, the run
+uses `push` instead and creates that branch from the source tip. An existing
+target branch stays on the PR path and is not force-pushed.
+
 ## Testing
 
 ```bash

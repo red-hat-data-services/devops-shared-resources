@@ -200,6 +200,42 @@ def rev_parse(repo_path: str | Path, ref: str) -> str:
     return run_git(["rev-parse", ref], cwd=repo_path).stdout.strip()
 
 
+def remote_branch_exists(
+    repo_url: str,
+    branch: str,
+    *,
+    token: str | None = None,
+) -> bool:
+    """Return whether ``branch`` exists on ``repo_url``.
+
+    A missing ref is false. A failed lookup is raised so a transport or
+    repository error is not treated as "the branch needs creating".
+    """
+    ref = f"refs/heads/{branch}"
+    if is_local_path(repo_url):
+        repo = normalize_repo_url(repo_url)
+        result = run_git(["show-ref", "--verify", "--quiet", ref], cwd=repo, check=False)
+        if result.returncode in (0, 1):
+            return result.returncode == 0
+        output = (result.stdout or "") + (result.stderr or "")
+        raise GitCommandError(
+            ["git", "show-ref", "--verify", "--quiet", ref],
+            result.returncode,
+            output.strip(),
+        )
+
+    url = authenticated_clone_url(repo_url, token)
+    result = run_git(["ls-remote", "--heads", url, ref], check=False)
+    if result.returncode != 0:
+        output = (result.stdout or "") + (result.stderr or "")
+        raise GitCommandError(
+            ["git", "ls-remote", "--heads", ref],
+            result.returncode,
+            output.strip(),
+        )
+    return bool(result.stdout.strip())
+
+
 def resolve_branch_ref(
     repo_path: str | Path,
     branch: str,

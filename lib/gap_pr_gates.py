@@ -3,7 +3,9 @@
 The reusable check evaluator scores each selected check. This module applies
 GAP's repository rules: every expected component build must succeed, a failed
 feasibility job blocks the repository even when builds succeed, and an
-unresolved result fails once the revision's six-hour deadline has passed.
+unresolved feasibility result fails once the revision's six-hour deadline has
+passed. A component build that is still missing, queued, or running stays
+pending; only a completed non-success conclusion is a build failure.
 """
 
 from __future__ import annotations
@@ -179,12 +181,15 @@ def _evaluate_builds(
             deadline=deadline,
             query_error=f"could not read PipelineRun configuration: {exc}",
         )
+    # Konflux often starts after the source commit is already older than six
+    # hours. An unfinished or not-yet-created build has not failed.
     return evaluate_checks(
         expected,
         check_runs,
         now=now,
         deadline=deadline,
         revision=pull_request.head_sha,
+        timeout_unresolved=False,
     )
 
 

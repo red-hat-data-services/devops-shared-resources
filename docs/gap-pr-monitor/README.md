@@ -8,10 +8,12 @@ Stage 2 requires two gates before a repository PR can pass:
 - every component build selected from that repository's `.tekton` PipelineRuns
 - every job in the main-to-release feasibility workflow
 
-Both gates use the same check-run retrieval and conclusion rules. A missing
-check, a query error, or any completed conclusion other than `success` does
-not pass. Unresolved checks fail six hours after the head commit's committer
-timestamp. A new commit starts a new window; reruns of the same commit do not.
+Both gates use the same check-run retrieval and conclusion rules. A query
+error, or any completed conclusion other than `success`, does not pass.
+Unresolved feasibility checks fail six hours after the head commit's committer
+timestamp. A component build that is still queued, running, or missing stays
+`build-pending` until that check completes; it is not a build failure. A new
+commit starts a new feasibility window; reruns of the same commit do not.
 The build producer defaults to the `konflux-internal-p02` GitHub App
 (`GAP_BUILD_CHECK_APP_SLUG` / `GAP_BUILD_CHECK_APP_ID` select another
 environment). PipelineRun names come from the repository configuration,
@@ -22,8 +24,8 @@ check name.
 |-------------------------|-------------|---------------|
 | Merge conflict | `merge-failure` | `failure` |
 | Feasibility check failed or timed out | `merge-failure` | `failure` |
-| Any expected component build failed, skipped, or timed out | `build-failure` | `failure` |
-| A required check is queued, running, or missing | `build-pending` | `pending` |
+| Any expected component build completed without success | `build-failure` | `failure` |
+| A required build or feasibility check is queued, running, or missing | `build-pending` | `pending` |
 | No component build is triggered, and feasibility succeeded | `success` | `success` |
 | All expected builds and feasibility jobs succeeded | `success` | `success` |
 | Already merged | `success` | skip post |
