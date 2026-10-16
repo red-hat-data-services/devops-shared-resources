@@ -31,6 +31,7 @@ from scripts.gap_pr_monitor import (
     list_open_leader_prs,
     load_state,
     main,
+    post_leader_conclusion,
     publish_state,
     resolve_inputs_for_cli,
     resolve_leader_pr_url_input,
@@ -990,7 +991,7 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
     assert (leader, "completed") in [(u, s) for u, s, _ in posts]
     leader_post = next(p for p in posts if p[0] == leader)
     assert leader_post[2].get("head_sha") == "published-sha-abc"
-    assert leader_post[2].get("description") == "GAP Stage 1: overall success"
+    assert leader_post[2].get("description") == "GAP: overall success"
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["overall-status"] == "success"
 
@@ -998,7 +999,7 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
 def test_run_stage1_monitor_writes_failure_without_leader_automerge(
     tmp_path: Path,
 ) -> None:
-    """All children final with a merge-failure → overall-status=failure, no Leader signal."""
+    """Stage-1 path alone does not post Leader green (coordinator owns that)."""
     path = tmp_path / "state.json"
     save_state(
         path,
@@ -1859,10 +1860,11 @@ def test_coordinator_posts_leader_only_after_publish(
     assert leader_post[2].get("head_sha") == "published-sha-abc"
 
 
-def test_coordinator_failure_publishes_without_leader_green(
+def test_coordinator_failure_publishes_and_greens_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """RHAI-8079: overall failure still greens Leader after publish (history)."""
     path = tmp_path / "state.json"
     save_state(
         path,
@@ -1903,6 +1905,139 @@ def test_coordinator_failure_publishes_without_leader_green(
         updater_factory=factory,
     )
     assert result.overall_status == "failure"
+    assert result.leader_status_posted is True
+    assert result.published_sha == "published-sha-abc"
+    assert leader in result.updated_urls
+    leader_post = next(p for p in holder["u"].posts if p[0] == leader)
+    assert leader_post[1] == "completed"
+    assert leader_post[2].get("head_sha") == "published-sha-abc"
+    assert leader_post[2].get("description") == "GAP: overall failure"
+
+
+def test_coordinator_mixed_children_failure_greens_leader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """All children final with any failure → overall failure → Leader green."""
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/85",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "modelmesh-serving",
+                    "pr-url": "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67",
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={
+            "https://github.com/rhoai-rhtap/kserve-branch/pull/15": "success",
+            "https://github.com/rhoai-rhtap/kubeflow/pull/85": "success",
+            "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67": "merge-failure",
+        },
+        overall="failure",
+    )
+    leader = "https://github.com/org/gap/pull/42"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+    )
+    assert result.overall_status == "failure"
+    assert result.leader_status_posted is True
+    assert result.published_sha == "published-sha-abc"
+    leader_post = next(p for p in holder["u"].posts if p[0] == leader)
+    assert leader_post[1] == "completed"
+    assert leader_post[2].get("description") == "GAP: overall failure"
+
+
+def test_post_leader_conclusion_rejects_non_terminal_overall() -> None:
+    updater = FakeUpdater(check_name="gated artifacts promoter")
+    with pytest.raises(GapPrMonitorError, match="overall-status"):
+        post_leader_conclusion(
+            "https://github.com/org/gap/pull/1",
+            "sha-abc",
+            overall_status="pending",
+            updater=updater,
+        )
+    assert updater.posts == []
+
+
+def test_coordinator_pending_overall_skips_leader_green(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """While children are still pending, do not green the Leader (RHAI-8079)."""
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={child: "build-pending"},
+        overall=None,
+    )
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+    )
+    assert result.overall_status is None
     assert result.leader_status_posted is False
     assert result.published_sha == "published-sha-abc"
     assert "u" not in holder

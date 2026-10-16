@@ -35,7 +35,7 @@ the leader PR to keep run history does not mark the repository PR successful.
 When every child has a final gate status, the monitor also sets `overall-status`
 and (optionally) posts a green `gated artifacts promoter` status on the
 **Leader PR itself** so auto-merge can preserve run history on `main`
-(RHOAIENG-97052).
+(RHOAIENG-97052 / RHAI-8079). Pending children never conclude the Leader.
 
 ## How merge conflicts are detected
 
@@ -61,14 +61,16 @@ component PR has a final gate status (`success`, `merge-failure`, or
 | Children | `overall-status` written | Leader auto-merge signal |
 |----------|--------------------------|---------------------------|
 | Any still `new` or `build-pending` | omitted | no |
-| All final, any `merge-failure` or `build-failure` | `failure` | no (keep Leader open) |
+| All final, any `merge-failure` or `build-failure` | `failure` | yes — green check on Leader (history) |
 | All `success` | `success` | yes — green check on Leader |
 
-The Leader is auto-merged only when every component PR is a **success**.
+Once every child has concluded, the Leader is greened for **success or failure**
+so GitHub auto-merge can land that run’s history on `main` (RHAI-8079). Child
+PRs that failed stay failed; only the Leader gets the conclude signal.
 
 With `--publish-state`, ordering is: evaluate children → write `state.json` →
-commit/push → then (only if `overall-status` is `success` and a Leader PR URL
-is set via `GAP_LEADER_PR_URL` / `--leader-pr-url`) post
+commit/push → then (when `overall-status` is set and a Leader PR URL is provided
+via `GAP_LEADER_PR_URL` / `--leader-pr-url`) post
 `gated artifacts promoter` = **success** on the **published** Leader head SHA
 so auto-merge cannot race ahead of the state commit.
 

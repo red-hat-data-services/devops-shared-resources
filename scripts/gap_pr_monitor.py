@@ -875,19 +875,48 @@ def verify_leader_head(
         )
 
 
-def post_leader_success(
+def post_leader_conclusion(
     leader_pr_url: str,
     published_sha: str,
     *,
+    overall_status: str,
     updater: PRStatusUpdater,
 ) -> StatusUpdateResult:
-    """Post Leader green against an explicit published commit SHA."""
-    description = "GAP Stage 1: overall success"
+    """Post Leader green on the published SHA once overall-status is set (RHAI-8079).
+
+    GitHub auto-merge only needs a successful required check. We still green the
+    Leader for ``failure`` so run history can land on ``main`` after every child
+    has concluded (not while any child is still pending).
+    """
+    if overall_status == OVERALL_STATUS_SUCCESS:
+        description = "GAP: overall success"
+    elif overall_status == OVERALL_STATUS_FAILURE:
+        description = "GAP: overall failure"
+    else:
+        raise GapPrMonitorError(
+            f"Cannot post Leader conclusion for overall-status={overall_status!r}"
+        )
     return updater.post_status_for_pr(
         leader_pr_url,
         "completed",
         description=description,
         head_sha=published_sha,
+    )
+
+
+# Back-compat name used by older call sites/tests.
+def post_leader_success(
+    leader_pr_url: str,
+    published_sha: str,
+    *,
+    updater: PRStatusUpdater,
+    overall_status: str = OVERALL_STATUS_SUCCESS,
+) -> StatusUpdateResult:
+    return post_leader_conclusion(
+        leader_pr_url,
+        published_sha,
+        overall_status=overall_status,
+        updater=updater,
     )
 
 
@@ -909,8 +938,9 @@ def run_monitor_publish_and_signal(
 ) -> MonitorResult:
     """Coordinator: monitor → publish state → Leader green on published SHA.
 
-    Ordering (Chris review / RHOAIENG-97052):
-      classify children → save state → commit/push → post Leader success on that SHA
+    Ordering (RHOAIENG-97052 / RHAI-8079):
+      evaluate children → save state → commit/push → post Leader green when
+      overall-status is success or failure (never while children are pending).
     """
     result = run_monitor(
         state_path,
@@ -923,12 +953,6 @@ def run_monitor_publish_and_signal(
     )
 
     if not publish:
-        if (
-            result.overall_status == OVERALL_STATUS_SUCCESS
-            and not (leader_pr_url or "").strip()
-        ):
-            # Local/non-publish runs still warn when a Leader URL is missing.
-            pass
         return result
 
     branch = (head_ref or "").strip() or current_git_branch(
@@ -947,15 +971,22 @@ def run_monitor_publish_and_signal(
     leader_status_posted = False
     updated = list(result.updated_urls)
     skipped = list(result.skipped_urls)
+    concluded = result.overall_status in (
+        OVERALL_STATUS_SUCCESS,
+        OVERALL_STATUS_FAILURE,
+    )
 
-    if result.overall_status == OVERALL_STATUS_SUCCESS and leader_url:
+    if concluded and leader_url:
         factory = updater_factory or PRStatusUpdater
         updater = factory(check_name=check_name, dry_run=dry_run)
         if not dry_run:
             verify_leader_head(leader_url, published.sha, updater=updater)
         try:
-            leader_result = post_leader_success(
-                leader_url, published.sha, updater=updater
+            leader_result = post_leader_conclusion(
+                leader_url,
+                published.sha,
+                overall_status=result.overall_status or "",
+                updater=updater,
             )
             leader_status_posted = not leader_result.skipped
             if leader_status_posted:
@@ -967,10 +998,11 @@ def run_monitor_publish_and_signal(
                 f"Failed to post Leader conclusion status for {leader_url} "
                 f"on {published.sha}: {exc}"
             ) from exc
-    elif result.overall_status == OVERALL_STATUS_SUCCESS and not leader_url:
+    elif concluded and not leader_url:
         print(
-            "WARNING: overall-status=success but no Leader PR URL was provided "
-            f"(--leader-pr-url / {ENV_LEADER_PR_URL}); skipped Leader self-status.",
+            f"WARNING: overall-status={result.overall_status} but no Leader PR URL "
+            f"was provided (--leader-pr-url / {ENV_LEADER_PR_URL}); "
+            "skipped Leader self-status.",
             file=sys.stderr,
         )
 
@@ -1608,17 +1640,19 @@ def build_parser() -> argparse.ArgumentParser:
             "Leader PR URL, or "
             f"{LATEST_LEADER_PR_SENTINEL} to discover the newest open Leader "
             f"labeled {DEFAULT_LEADER_LABEL!r}. With --publish-state, after "
-            "the state commit is pushed and overall-status is success, post a "
-            f"green {DEFAULT_CHECK_NAME!r} status on the published SHA "
-            f"(RHOAIENG-97052). Also accepted via {ENV_LEADER_PR_URL}."
+            "the state commit is pushed and overall-status is success or "
+            f"failure, post a green {DEFAULT_CHECK_NAME!r} status on the "
+            "published SHA (RHOAIENG-97052 / RHAI-8079). Also accepted via "
+            f"{ENV_LEADER_PR_URL}."
         ),
     )
     parser.add_argument(
         "--publish-state",
         action="store_true",
         help=(
-            "RHOAIENG-97052: commit and push state.json from Python, then post "
-            "Leader success against that published commit SHA (never before)."
+            "RHOAIENG-97052 / RHAI-8079: commit and push state.json from Python, "
+            "then post Leader green against that published commit SHA when "
+            "overall-status is set (never before; never while children pending)."
         ),
     )
     parser.add_argument(
