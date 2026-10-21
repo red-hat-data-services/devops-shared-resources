@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 from lib.tekton_matchers import (
@@ -96,6 +98,18 @@ class TestExactComponentMatch:
         parent = _make_data("odh-dashboard-v3-5-on-push")
         child = _make_data("odh-dashboard-on-pull-request")
         assert exact_component_match(parent, child)
+
+    @pytest.mark.parametrize("event", ["on-pull-request", "pull-request"])
+    @pytest.mark.parametrize("parent_component,expected", [
+        ("odh-workbench-codeserver-minimal-cpu-py312", True),
+        ("odh-workbench-codeserver-datascience-cpu-py312", False),
+    ])
+    def test_pr_name_patterns_match_only_same_component(self, event, parent_component, expected):
+        parent = _make_data(f"{parent_component}-v3-6-on-push")
+        child = _make_data(
+            f"odh-workbench-codeserver-minimal-cpu-py312-{event}-{{{{pull_request_number}}}}"
+        )
+        assert exact_component_match(parent, child) is expected
 
     def test_different_prefixes(self):
         parent = _make_data("odh-dashboard-v3-5-on-push")

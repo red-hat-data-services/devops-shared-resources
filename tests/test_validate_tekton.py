@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 from lib.tekton import (
@@ -142,6 +144,27 @@ def test_component_prefix_from_metadata_name_schedule():
 def test_component_prefix_from_metadata_name_pr_with_suffix():
     data = {"metadata": {"name": "odh-training-operator-on-pull-request-21567"}}
     assert extract_component_prefix("whatever.yaml", data) == "odh-training-operator"
+
+
+@pytest.mark.parametrize("event", ["on-pull-request", "pull-request"])
+@pytest.mark.parametrize("suffix", ["", "-12345", "-{{pull_request_number}}"])
+@pytest.mark.parametrize("version", ["", "-v3-6", "-v3-6-ea-2"])
+def test_component_prefix_from_pr_metadata_without_filename(event, suffix, version):
+    component = "odh-workbench-codeserver-minimal-cpu-py312"
+    data = {"metadata": {"name": f"{component}{version}-{event}{suffix}"}}
+    assert extract_component_prefix("", data) == component
+
+
+@pytest.mark.parametrize("event", ["push", "pull-request", "schedule"])
+def test_component_prefix_prefers_standard_event_marker(event):
+    component = "odh-pull-request-handler"
+    data = {"metadata": {"name": f"{component}-on-{event}"}}
+    assert extract_component_prefix("", data) == component
+
+
+def test_component_prefix_does_not_strip_partial_pr_marker():
+    data = {"metadata": {"name": "odh-pull-requester"}}
+    assert extract_component_prefix("", data) is None
 
 
 def test_component_prefix_no_match():
@@ -632,6 +655,40 @@ def test_validate_pr_without_push_pipeline_reports_error():
         pr_result = results.get("odh-dashboard-pull-request.yaml", {})
         assert any("push pipeline" in e.lower() for e in pr_result.get("errors", [])), \
             f"expected 'push pipeline' error, got: {pr_result.get('errors', [])}"
+
+
+@pytest.mark.parametrize("event", ["on-pull-request", "pull-request"])
+def test_fix_and_revalidate_pr_with_external_parent_preserves_name(tmp_path, event):
+    """Both PR name patterns must match a release parent without being renamed."""
+    from ruamel.yaml import YAML
+
+    config = _vt.load_config(str(REPO_ROOT / "tekton-templates" / "kc-migration"))
+    parent = _ruamel_load("valid-push.yaml")
+    parent["spec"]["params"].append({"name": "release-only", "value": "inherited"})
+    parents = {"push": {"odh-dashboard": parent}}
+    child = _ruamel_load("valid-pull-request.yaml")
+    name = f"odh-dashboard-{event}-{{{{pull_request_number}}}}"
+    child["metadata"]["name"] = name
+    filename = "odh-dashboard-pull-request.yaml"
+    path = tmp_path / filename
+    yaml = YAML()
+    with path.open("w") as stream:
+        yaml.dump(child, stream)
+
+    fixed, _ = _vt.fix_tekton_dir(
+        tmp_path, "main", None, dry_run=False, config=config,
+        external_parent_indexes=parents,
+    )
+    assert filename in fixed
+    fixed_data = yaml.load(path.read_text())
+    assert fixed_data["metadata"]["name"] == name
+    assert fixed_data["metadata"]["labels"]["appstudio.openshift.io/component"] == "odh-dashboard-v3-5"
+    assert get_param(fixed_data, "release-only") == "inherited"
+
+    results = _vt.validate_tekton_dir(
+        tmp_path, "main", None, config=config, external_parent_indexes=parents,
+    )
+    assert results[filename]["errors"] == []
 
 
 def test_render_pr_reports_absent_annotations():

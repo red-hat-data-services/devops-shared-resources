@@ -72,16 +72,20 @@ def _preserve_type(old_val, new_val):
 def extract_component_prefix(filename: str, data: dict | None = None) -> str | None:
     """Extract component prefix from a tekton pipeline.
 
-    Prefers metadata.name (consistent '-on-push'/'-on-pull-request'/'-on-schedule' convention)
-    over filename when data is provided.
+    Prefers metadata.name over filename when data is provided. Accepts the
+    '-on-push'/'-on-pull-request'/'-on-schedule' convention as well as PR names
+    using '-pull-request' without '-on-'.
 
     'odh-dashboard-v3-5-on-push' → 'odh-dashboard'
     'odh-dashboard-on-pull-request' → 'odh-dashboard'
+    'odh-dashboard-pull-request-{{pull_request_number}}' → 'odh-dashboard'
     """
     if data:
         meta_name = data.get("metadata", {}).get("name", "")
         if meta_name:
             prefix = re.sub(r"-on-(push|pull-request|schedule).*$", "", meta_name)
+            if prefix == meta_name:
+                prefix = re.sub(r"-pull-request(?:-.*)?$", "", meta_name)
             prefix = re.sub(r"-v\d+-\d+.*$", "", prefix)
             if prefix != meta_name:
                 return prefix
