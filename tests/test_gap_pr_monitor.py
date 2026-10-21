@@ -12,16 +12,20 @@ from lib.pr_status_updater import (
     PullRequestRef,
     StatusUpdateResult,
 )
+from lib.gap_pr_gates import RepositoryGateDecision
 from scripts.gap_pr_monitor import (
+    DEFERRED_CHILD_GREEN_DESCRIPTION,
     GapPrMonitorError,
     MonitorResult,
     OpenLeaderPr,
+    PrDecision,
     PrMergeInfo,
     PublishResult,
     apply_overall_status,
     apply_pr_statuses,
     apply_success_statuses,
     append_github_output,
+    children_batch_concluded,
     classify_pr,
     compute_overall_status,
     extract_pr_urls,
@@ -37,14 +41,17 @@ from scripts.gap_pr_monitor import (
     resolve_leader_pr_url_input,
     resolve_leader_repo,
     resolve_state_file,
+    run_monitor,
     run_monitor_publish_and_signal,
     run_scheduled_monitors,
     run_stage1_monitor,
     save_state,
+    should_defer_child_success_status,
     should_run_schedule_mode,
     split_labels_csv,
     state_path_for_output,
     state_path_for_trigger,
+    status_decision_for_post,
     verify_leader_head,
 )
 
@@ -2203,4 +2210,513 @@ def test_run_stage1_monitor_no_longer_posts_leader_directly(
     assert [u for u, _s, _k in holder["u"].posts] == [
         "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     ]
+
+
+# ---------------------------------------------------------------------------
+# RHAI-8261: defer green on good children until the batch concludes
+# ---------------------------------------------------------------------------
+
+
+def test_children_batch_concluded_helpers() -> None:
+    assert children_batch_concluded([]) is False
+    assert children_batch_concluded(["success"]) is True
+    assert children_batch_concluded(["success", "merge-failure"]) is True
+    assert children_batch_concluded(["success", "build-failure"]) is True
+    assert children_batch_concluded(["success", "build-pending"]) is False
+    assert children_batch_concluded(["new", "success"]) is False
+    assert children_batch_concluded(["build-pending"]) is False
+
+
+@pytest.mark.parametrize(
+    ("pr_status", "batch_concluded", "expected"),
+    [
+        ("success", False, True),
+        ("success", True, False),
+        ("merge-failure", False, False),
+        ("build-failure", False, False),
+        ("build-pending", False, False),
+        ("new", False, False),
+    ],
+)
+def test_should_defer_child_success_status(
+    pr_status: str,
+    batch_concluded: bool,
+    expected: bool,
+) -> None:
+    assert (
+        should_defer_child_success_status(
+            pr_status=pr_status,
+            batch_concluded=batch_concluded,
+        )
+        is expected
+    )
+
+
+def test_status_decision_for_post_defers_success_when_batch_open() -> None:
+    decision = RepositoryGateDecision(
+        url="https://github.com/org/a/pull/1",
+        pr_status="success",
+        cli_status="success",
+        description="component builds and feasibility checks passed",
+        reason="ok",
+        head_sha="a" * 40,
+    )
+    deferred = status_decision_for_post(decision, batch_concluded=False)
+    assert isinstance(deferred, RepositoryGateDecision)
+    assert deferred.pr_status == "success"
+    assert deferred.cli_status == "pending"
+    assert deferred.description == DEFERRED_CHILD_GREEN_DESCRIPTION
+    # Original decision unchanged (frozen replace).
+    assert decision.cli_status == "success"
+
+
+def test_status_decision_for_post_keeps_success_when_batch_done() -> None:
+    decision = RepositoryGateDecision(
+        url="https://github.com/org/a/pull/1",
+        pr_status="success",
+        cli_status="success",
+        description="ok",
+        reason="ok",
+        head_sha="a" * 40,
+    )
+    posted = status_decision_for_post(decision, batch_concluded=True)
+    assert posted is decision
+    assert posted.cli_status == "success"
+
+
+def test_status_decision_for_post_keeps_failure_while_batch_open() -> None:
+    decision = RepositoryGateDecision(
+        url="https://github.com/org/a/pull/1",
+        pr_status="build-failure",
+        cli_status="failure",
+        description="build failed",
+        reason="fail",
+        head_sha="a" * 40,
+    )
+    posted = status_decision_for_post(decision, batch_concluded=False)
+    assert posted is decision
+    assert posted.cli_status == "failure"
+
+
+def test_status_decision_for_post_skips_merged() -> None:
+    decision = RepositoryGateDecision(
+        url="https://github.com/org/a/pull/1",
+        pr_status="success",
+        cli_status="success",
+        description="already merged",
+        reason="merged",
+        head_sha="a" * 40,
+        skip_status_post=True,
+    )
+    assert status_decision_for_post(decision, batch_concluded=False) is decision
+
+
+def test_status_decision_for_post_works_with_stage1_pr_decision() -> None:
+    decision = PrDecision(
+        url="https://github.com/org/a/pull/1",
+        pr_status="success",
+        cli_status="completed",
+        description="GAP Stage 1 dummy gate",
+    )
+    deferred = status_decision_for_post(decision, batch_concluded=False)
+    assert isinstance(deferred, PrDecision)
+    assert deferred.cli_status == "pending"
+    assert deferred.description == DEFERRED_CHILD_GREEN_DESCRIPTION
+
+
+def _gate(
+    url: str,
+    pr_status: str,
+    cli_status: str,
+    *,
+    description: str = "gate",
+) -> RepositoryGateDecision:
+    return RepositoryGateDecision(
+        url=url,
+        pr_status=pr_status,
+        cli_status=cli_status,
+        description=description,
+        reason=pr_status,
+        head_sha="c" * 40,
+    )
+
+
+def test_run_monitor_defers_success_while_sibling_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """RHAI-8261: good child stays pending on GitHub until batch concludes."""
+    good = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    pending = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": good,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": pending,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    decisions = {
+        good: _gate(good, "success", "success", description="builds passed"),
+        pending: _gate(pending, "build-pending", "pending", description="still running"),
+    }
+
+    def fake_decide(url: str, **kwargs: Any) -> RepositoryGateDecision:
+        return decisions[url]
+
+    monkeypatch.setattr("scripts.gap_pr_monitor._decide_url", fake_decide)
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
+    assert result.overall_status is None
+    assert set(result.success_urls) == {good}
+    assert set(result.pending_urls) == {pending}
+    posts = {(u, s): kw for u, s, kw in holder["u"].posts}
+    assert (good, "pending") in posts
+    assert posts[(good, "pending")].get("description") == DEFERRED_CHILD_GREEN_DESCRIPTION
+    assert (pending, "pending") in posts
+    assert (good, "success") not in posts
+    assert (good, "completed") not in posts
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    by_url = {e["pr-url"]: e["pr-status"] for e in saved["pull-requests"]}
+    assert by_url[good] == "success"
+    assert by_url[pending] == "build-pending"
+    assert "overall-status" not in saved
+
+
+def test_run_monitor_greens_only_good_children_when_batch_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    good = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    bad = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": good,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": bad,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    decisions = {
+        good: _gate(good, "success", "success"),
+        bad: _gate(bad, "build-failure", "failure"),
+    }
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._decide_url",
+        lambda url, **kwargs: decisions[url],
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
+    assert result.overall_status == "failure"
+    assert set(result.success_urls) == {good}
+    assert set(result.build_failure_urls) == {bad}
+    posts = {(u, s) for u, s, _ in holder["u"].posts}
+    assert (good, "success") in posts
+    assert (bad, "failure") in posts
+    assert (good, "pending") not in posts
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["overall-status"] == "failure"
+
+
+def test_run_monitor_greens_all_children_when_all_succeed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    a = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    b = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
+    c = "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {"repo": "kserve-branch", "pr-url": a, "pr-status": "new", "builds": []},
+                {"repo": "kubeflow", "pr-url": b, "pr-status": "new", "builds": []},
+                {
+                    "repo": "modelmesh-serving",
+                    "pr-url": c,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    decisions = {
+        a: _gate(a, "success", "success"),
+        b: _gate(b, "success", "success"),
+        c: _gate(c, "success", "success"),
+    }
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._decide_url",
+        lambda url, **kwargs: decisions[url],
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
+    assert result.overall_status == "success"
+    assert set(result.success_urls) == {a, b, c}
+    posts = {(u, s) for u, s, _ in holder["u"].posts}
+    assert posts == {(a, "success"), (b, "success"), (c, "success")}
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert saved["overall-status"] == "success"
+    assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
+
+
+def test_run_monitor_posts_failure_immediately_while_sibling_pending(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bad = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    pending = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": bad,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": pending,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    decisions = {
+        bad: _gate(bad, "merge-failure", "failure"),
+        pending: _gate(pending, "build-pending", "pending"),
+    }
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._decide_url",
+        lambda url, **kwargs: decisions[url],
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
+    assert result.overall_status is None
+    posts = {(u, s) for u, s, _ in holder["u"].posts}
+    assert (bad, "failure") in posts
+    assert (pending, "pending") in posts
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    assert "overall-status" not in saved
+
+
+def test_run_monitor_single_success_child_still_greens(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A one-child batch that succeeds is already concluded — green immediately."""
+    only = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": only,
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._decide_url",
+        lambda url, **kwargs: _gate(only, "success", "success"),
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
+    assert result.overall_status == "success"
+    assert holder["u"].posts[0][:2] == (only, "success")
+
+
+def test_coordinator_defers_child_green_until_batch_then_greens_leader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Pending sibling: no child green, no Leader green, no overall-status."""
+    good = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    pending = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": good,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": pending,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    decisions = {
+        good: _gate(good, "success", "success"),
+        pending: _gate(pending, "build-pending", "pending"),
+    }
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._decide_url",
+        lambda url, **kwargs: decisions[url],
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        u = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        holder.setdefault("u", u)
+        # Coordinator may construct a second updater for Leader; share posts.
+        if "u" in holder and holder["u"] is not u:
+            u.posts = holder["u"].posts
+            holder["u"] = u
+        return holder["u"]
+
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+        gh_runner=lambda *_: "",
+    )
+    assert result.overall_status is None
+    assert result.leader_status_posted is False
+    child_posts = [(u, s) for u, s, _ in holder["u"].posts if u != leader]
+    assert (good, "pending") in child_posts
+    assert (good, "success") not in child_posts
+    assert all(u != leader for u, _s, _k in holder["u"].posts)
+
+
+def test_coordinator_greens_good_children_and_leader_on_mixed_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    good = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    bad = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": good,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": bad,
+                    "pr-status": "new",
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    decisions = {
+        good: _gate(good, "success", "success"),
+        bad: _gate(bad, "merge-failure", "failure"),
+    }
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._decide_url",
+        lambda url, **kwargs: decisions[url],
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    all_posts: list[tuple[str, str, dict[str, Any]]] = []
+
+    class SharedUpdater(FakeUpdater):
+        def post_status_for_pr(self, pr_url: str, status: str, **kwargs: Any):
+            result = super().post_status_for_pr(pr_url, status, **kwargs)
+            all_posts.append((pr_url, status, kwargs))
+            return result
+
+    def factory(*, check_name: str, dry_run: bool = False) -> SharedUpdater:
+        return SharedUpdater(check_name=check_name, dry_run=dry_run)
+
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+        gh_runner=lambda *_: "",
+    )
+    assert result.overall_status == "failure"
+    assert result.leader_status_posted is True
+    posts = {(u, s) for u, s, _ in all_posts}
+    assert (good, "success") in posts
+    assert (bad, "failure") in posts
+    assert (leader, "completed") in posts
+    leader_kw = next(kw for u, s, kw in all_posts if u == leader and s == "completed")
+    assert leader_kw.get("description") == "GAP: overall failure"
 

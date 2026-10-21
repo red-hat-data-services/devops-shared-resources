@@ -26,12 +26,17 @@ check name.
 | Feasibility check failed or timed out | `merge-failure` | `failure` |
 | Any expected component build completed without success | `build-failure` | `failure` |
 | A required build or feasibility check is queued, running, or missing | `build-pending` | `pending` |
-| No component build is triggered, and feasibility succeeded | `success` | `success` |
-| All expected builds and feasibility jobs succeeded | `success` | `success` |
+| Good child, but a sibling is still pending | `success` | `pending` (deferred; RHAI-8261) |
+| No component build is triggered, and feasibility succeeded | `success` | `success` (after all siblings conclude) |
+| All expected builds and feasibility jobs succeeded | `success` | `success` (after all siblings conclude) |
 | Already merged | `success` | skip post |
 
-A failed repository gate posts a failing promoter status on that PR. Merging
-the leader PR to keep run history does not mark the repository PR successful.
+A failed repository gate posts a failing promoter status on that PR immediately.
+A **successful** child does **not** get a green `gated artifacts promoter` check
+until **every** child in the Leader state has a terminal `pr-status` (RHAI-8261).
+Until then the good child stays `pending` on GitHub so it cannot auto-merge early;
+`pr-status` in `state.json` still records `success`. Merging the leader PR to keep
+run history does not mark a failed repository PR successful.
 `builds[].image` is left unchanged; image URIs are not required for the gate.
 
 When every child has a final gate status, the monitor also sets `overall-status`
@@ -60,15 +65,15 @@ The monitor **writes** `overall-status` into `state.json` only when **every**
 component PR has a final gate status (`success`, `merge-failure`, or
 `build-failure`). `build-pending` and `new` stay in progress.
 
-| Children | `overall-status` written | Leader auto-merge signal |
-|----------|--------------------------|---------------------------|
-| Any still `new` or `build-pending` | omitted | no |
-| All final, any `merge-failure` or `build-failure` | `failure` | yes — green check on Leader (history) |
-| All `success` | `success` | yes — green check on Leader |
+| Children | `overall-status` written | Leader auto-merge signal | Good-child green |
+|----------|--------------------------|---------------------------|------------------|
+| Any still `new` or `build-pending` | omitted | no | no (stay pending) |
+| All final, any `merge-failure` or `build-failure` | `failure` | yes — green on Leader (history) | yes — only `success` children |
+| All `success` | `success` | yes — green on Leader | yes — all children |
 
 Once every child has concluded, the Leader is greened for **success or failure**
-so GitHub auto-merge can land that run’s history on `main` (RHAI-8079). Child
-PRs that failed stay failed; only the Leader gets the conclude signal.
+so GitHub auto-merge can land that run’s history on `main` (RHAI-8079). The same
+moment greens only the **good** children (RHAI-8261); failed children stay red.
 
 With `--publish-state`, ordering is: evaluate children → write `state.json` →
 commit/push → then (when `overall-status` is set and a Leader PR URL is provided

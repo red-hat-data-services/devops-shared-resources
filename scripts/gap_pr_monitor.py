@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054).
+"""GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054, RHAI-8079, RHAI-8261).
 
 Read leader state.json, evaluate each child PR's component builds and
 main-to-release feasibility checks, post the gated artifacts promoter commit
-status, and update pr-status.
+status, and update pr-status. Good children are greened only after every
+sibling has concluded (RHAI-8261).
 
 State path (RHOAIENG-93564 / sync layout):
 GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json
@@ -78,6 +79,10 @@ BUILD_FAILURE_PR_STATUS = PR_STATUS_BUILD_FAILURE
 # Child statuses that conclude a repository PR. build-pending and new stay open.
 STAGE1_TERMINAL_PR_STATUSES = frozenset(
     {SUCCESS_PR_STATUS, MERGE_FAILURE_PR_STATUS, BUILD_FAILURE_PR_STATUS}
+)
+# RHAI-8261: hold green on good children until every sibling has concluded.
+DEFERRED_CHILD_GREEN_DESCRIPTION = (
+    "GAP: waiting for other component PRs to conclude (RHAI-8261)"
 )
 TRIGGER_ID_RE = re.compile(r"^gap-[A-Za-z0-9._-]+$")
 # Parent directory for per-trigger Leader state files (sync / RHOAIENG-93564).
@@ -414,6 +419,46 @@ def apply_overall_status(payload: dict[str, Any], overall_status: str | None) ->
     payload["overall-status"] = overall_status
 
 
+def children_batch_concluded(pr_statuses: Sequence[str]) -> bool:
+    """True when every child has a terminal gate status (RHAI-8261)."""
+    if not pr_statuses:
+        return False
+    return all(status in STAGE1_TERMINAL_PR_STATUSES for status in pr_statuses)
+
+
+def should_defer_child_success_status(
+    *,
+    pr_status: str,
+    batch_concluded: bool,
+) -> bool:
+    """Defer green on a good child until the whole batch has concluded."""
+    return pr_status == SUCCESS_PR_STATUS and not batch_concluded
+
+
+def status_decision_for_post(
+    decision: RepositoryGateDecision | PrDecision,
+    *,
+    batch_concluded: bool,
+) -> RepositoryGateDecision | PrDecision:
+    """Return the decision to POST; may downgrade success→pending (RHAI-8261).
+
+    ``pr-status`` in state.json still records the evaluated outcome; only the
+    GitHub commit status is deferred so good children cannot auto-merge early.
+    """
+    if getattr(decision, "skip_status_post", False):
+        return decision
+    if not should_defer_child_success_status(
+        pr_status=decision.pr_status,
+        batch_concluded=batch_concluded,
+    ):
+        return decision
+    return replace(
+        decision,
+        cli_status="pending",
+        description=DEFERRED_CHILD_GREEN_DESCRIPTION,
+    )
+
+
 def _run_gh(args: Sequence[str]) -> str:
     command = ["gh", *args]
     try:
@@ -557,6 +602,10 @@ def run_stage1_monitor(
     merge_failures: list[str] = []
     successes: list[str] = []
     post_errors: list[tuple[str, str]] = []
+    # RHAI-8261: evaluate the whole batch before greening any success child.
+    batch_concluded = children_batch_concluded(
+        [decision.pr_status for decision in decisions]
+    )
 
     for decision in decisions:
         status_updates[decision.url] = decision.pr_status
@@ -569,11 +618,14 @@ def run_stage1_monitor(
             skipped.append(decision.url)
             continue
 
-        desc = description if description is not None else decision.description
+        to_post = status_decision_for_post(
+            decision, batch_concluded=batch_concluded
+        )
+        desc = description if description is not None else to_post.description
         try:
             result: StatusUpdateResult = updater.post_status_for_pr(
                 decision.url,
-                decision.cli_status,
+                to_post.cli_status,
                 description=desc,
             )
             if result.skipped:
@@ -1460,15 +1512,19 @@ def _publish_gate_decision(
     build_app_slug: str,
     build_app_id: int | None,
     retry_unknown: bool,
+    batch_concluded: bool,
 ) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
     """Publish a decision, or re-evaluate once when the head has moved.
 
     A second move is left for the next poll. The stale decision is not posted
-    to the untested commit.
+    to the untested commit. Success greens are deferred until the batch has
+    concluded (RHAI-8261); ``pr_status`` on the returned decision stays evaluated.
     """
     if decision.skip_status_post:
         return decision, None
-    result = _post_gate_status(updater, decision, description)
+    to_post = status_decision_for_post(decision, batch_concluded=batch_concluded)
+    assert isinstance(to_post, RepositoryGateDecision)
+    result = _post_gate_status(updater, to_post, description)
     if not result.deferred:
         return decision, result
     fresh = _decide_url(
@@ -1481,7 +1537,9 @@ def _publish_gate_decision(
     )
     if fresh.skip_status_post:
         return fresh, None
-    result = _post_gate_status(updater, fresh, description)
+    to_post = status_decision_for_post(fresh, batch_concluded=batch_concluded)
+    assert isinstance(to_post, RepositoryGateDecision)
+    result = _post_gate_status(updater, to_post, description)
     if result.deferred:
         return None, result
     return fresh, result
@@ -1512,6 +1570,9 @@ def _publish_decisions(
     successes: list[str] = []
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
+    batch_concluded = children_batch_concluded(
+        [decision.pr_status for decision in decisions]
+    )
 
     for original in decisions:
         url = original.url
@@ -1525,6 +1586,7 @@ def _publish_decisions(
                 build_app_slug=build_app_slug,
                 build_app_id=build_app_id,
                 retry_unknown=retry_unknown,
+                batch_concluded=batch_concluded,
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))
