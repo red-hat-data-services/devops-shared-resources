@@ -74,7 +74,8 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
 
     Prefers metadata.name over filename when data is provided. Accepts the
     '-on-push'/'-on-pull-request'/'-on-schedule' convention as well as PR names
-    using '-pull-request' without '-on-'.
+    ending in '-pull-request', optionally followed by a number or
+    '{{pull_request_number}}', without '-on-'.
 
     'odh-dashboard-v3-5-on-push' → 'odh-dashboard'
     'odh-dashboard-on-pull-request' → 'odh-dashboard'
@@ -85,7 +86,10 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
         if meta_name:
             prefix = re.sub(r"-on-(push|pull-request|schedule).*$", "", meta_name)
             if prefix == meta_name:
-                prefix = re.sub(r"-pull-request(?:-.*)?$", "", meta_name)
+                prefix = re.sub(
+                    r"-pull-request(?:-(?:\d+|\{\{\s*pull_request_number\s*\}\}))?$",
+                    "", meta_name,
+                )
             prefix = re.sub(r"-v\d+-\d+.*$", "", prefix)
             if prefix != meta_name:
                 return prefix

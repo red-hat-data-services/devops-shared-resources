@@ -111,6 +111,12 @@ class TestExactComponentMatch:
         )
         assert exact_component_match(parent, child) is expected
 
+    def test_pr_marker_in_component_name_is_preserved(self):
+        parent = _make_data("odh-pull-request-handler-v3-6-on-push")
+        child = _make_data("odh-pull-request-handler-pull-request-123")
+        assert exact_component_match(parent, child)
+        assert not exact_component_match(_make_data("odh-v3-6-on-push"), child)
+
     def test_different_prefixes(self):
         parent = _make_data("odh-dashboard-v3-5-on-push")
         child = _make_data("odh-operator-on-pull-request")

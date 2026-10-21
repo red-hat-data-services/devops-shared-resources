@@ -149,8 +149,10 @@ def test_component_prefix_from_metadata_name_pr_with_suffix():
 @pytest.mark.parametrize("event", ["on-pull-request", "pull-request"])
 @pytest.mark.parametrize("suffix", ["", "-12345", "-{{pull_request_number}}"])
 @pytest.mark.parametrize("version", ["", "-v3-6", "-v3-6-ea-2"])
-def test_component_prefix_from_pr_metadata_without_filename(event, suffix, version):
-    component = "odh-workbench-codeserver-minimal-cpu-py312"
+@pytest.mark.parametrize("component", [
+    "odh-workbench-codeserver-minimal-cpu-py312", "odh-pull-request-handler",
+])
+def test_component_prefix_from_pr_metadata_without_filename(event, suffix, version, component):
     data = {"metadata": {"name": f"{component}{version}-{event}{suffix}"}}
     assert extract_component_prefix("", data) == component
 
@@ -162,8 +164,9 @@ def test_component_prefix_prefers_standard_event_marker(event):
     assert extract_component_prefix("", data) == component
 
 
-def test_component_prefix_does_not_strip_partial_pr_marker():
-    data = {"metadata": {"name": "odh-pull-requester"}}
+@pytest.mark.parametrize("name", ["odh-pull-requester", "odh-pull-request-handler"])
+def test_component_prefix_does_not_strip_partial_pr_marker(name):
+    data = {"metadata": {"name": name}}
     assert extract_component_prefix("", data) is None
 
 
@@ -658,18 +661,23 @@ def test_validate_pr_without_push_pipeline_reports_error():
 
 
 @pytest.mark.parametrize("event", ["on-pull-request", "pull-request"])
-def test_fix_and_revalidate_pr_with_external_parent_preserves_name(tmp_path, event):
+@pytest.mark.parametrize("component", ["odh-dashboard", "odh-pull-request-handler"])
+def test_fix_and_revalidate_pr_with_external_parent_preserves_name(tmp_path, event, component):
     """Both PR name patterns must match a release parent without being renamed."""
     from ruamel.yaml import YAML
 
     config = _vt.load_config(str(REPO_ROOT / "tekton-templates" / "kc-migration"))
     parent = _ruamel_load("valid-push.yaml")
+    parent["metadata"]["name"] = f"{component}-v3-5-on-push"
+    parent["metadata"]["labels"]["appstudio.openshift.io/component"] = f"{component}-v3-5"
     parent["spec"]["params"].append({"name": "release-only", "value": "inherited"})
-    parents = {"push": {"odh-dashboard": parent}}
+    unrelated_parent = _ruamel_load("valid-push.yaml")
+    unrelated_parent["metadata"]["name"] = "odh-unrelated-v3-5-on-push"
+    parents = {"push": {component: parent, "odh-unrelated": unrelated_parent}}
     child = _ruamel_load("valid-pull-request.yaml")
-    name = f"odh-dashboard-{event}-{{{{pull_request_number}}}}"
+    name = f"{component}-{event}-{{{{pull_request_number}}}}"
     child["metadata"]["name"] = name
-    filename = "odh-dashboard-pull-request.yaml"
+    filename = f"{component}-pull-request.yaml"
     path = tmp_path / filename
     yaml = YAML()
     with path.open("w") as stream:
@@ -682,7 +690,7 @@ def test_fix_and_revalidate_pr_with_external_parent_preserves_name(tmp_path, eve
     assert filename in fixed
     fixed_data = yaml.load(path.read_text())
     assert fixed_data["metadata"]["name"] == name
-    assert fixed_data["metadata"]["labels"]["appstudio.openshift.io/component"] == "odh-dashboard-v3-5"
+    assert fixed_data["metadata"]["labels"]["appstudio.openshift.io/component"] == f"{component}-v3-5"
     assert get_param(fixed_data, "release-only") == "inherited"
 
     results = _vt.validate_tekton_dir(
