@@ -56,6 +56,13 @@ def is_push_pipeline_by_cel(name, data):
     on-cel-expression instead of on-event annotations, and metadata.name
     does not end with '-on-push'.
     """
+    # Incorrect CEL must not hide an explicitly identified PR pipeline.
+    on_event = get_annotation(data, "pipelinesascode.tekton.dev/on-event")
+    if on_event and "pull_request" in on_event:
+        return False
+    # Preserve push/schedule names whose component contains 'pull-request'.
+    if is_pr_pipeline(name, data) and not name.endswith(("-push", "-schedule")):
+        return False
     cel = get_annotation(data, "pipelinesascode.tekton.dev/on-cel-expression")
     return bool(cel and 'event == "push"' in cel)
 

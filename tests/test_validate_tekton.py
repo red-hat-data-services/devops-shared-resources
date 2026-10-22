@@ -716,6 +716,50 @@ def test_fix_and_revalidate_pr_with_external_parent_preserves_name(tmp_path, eve
     assert results[filename]["errors"] == []
 
 
+@pytest.mark.parametrize("valid_parent_cel", [True, False])
+def test_pr_with_push_cel_is_not_misclassified_and_revalidated_as_push(tmp_path, valid_parent_cel):
+    """Reproduce must-gather's generated PR with a push CEL and no on-event annotation."""
+    from ruamel.yaml import YAML
+
+    config = _vt.load_config(str(REPO_ROOT / "tekton-templates" / "kc-migration"))
+    push_cel = 'event == "push"\n&& target_branch == "rhoai-3.6"\n'
+    parent = _ruamel_load("valid-push.yaml")
+    parent["metadata"]["name"] = "odh-must-gather-v3-6-on-push"
+    parent["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"] = (
+        push_cel if valid_parent_cel else push_cel + "&&&"
+    )
+    parents = {"push": {"odh-must-gather": parent}}
+    child = _ruamel_load("valid-pull-request.yaml")
+    child["metadata"]["name"] = "odh-must-gather-on-pull-request-51472"
+    child["metadata"]["annotations"].pop("pipelinesascode.tekton.dev/on-event")
+    child["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"] = push_cel
+    filename = "odh-must-gather-pull-request.yaml"
+    path = tmp_path / filename
+    yaml = YAML()
+    with path.open("w") as stream:
+        yaml.dump(child, stream)
+
+    before = _vt.validate_tekton_dir(
+        tmp_path, "main", None, config=config, external_parent_indexes=parents,
+    )
+    assert before[filename]["pipeline_type"] == "pull-request"
+    assert before[filename]["errors"]
+
+    _vt.fix_tekton_dir(
+        tmp_path, "main", None, dry_run=False, config=config, external_parent_indexes=parents,
+    )
+    after = _vt.validate_tekton_dir(
+        tmp_path, "main", None, config=config, external_parent_indexes=parents,
+    )
+    assert after[filename]["pipeline_type"] == "pull-request"
+    if valid_parent_cel:
+        fixed = yaml.load(path.read_text())
+        assert fixed["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"] == 'event == "pull_request"'
+        assert after[filename]["errors"] == []
+    else:
+        assert any("cannot decompose push CEL" in error for error in after[filename]["errors"])
+
+
 def test_render_pr_reports_absent_annotations():
     """Validate mode should report on-label, on-target-branch, on-event as 'should not exist'."""
     push = _ruamel_load("valid-push.yaml")

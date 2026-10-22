@@ -71,8 +71,8 @@ def decompose_push_cel(cel_expr):
             event: str — the event clause text (e.g. ``event ==  "push"``)
             branch: str — the branch clause text
             negative_guards: list[str] — negative guard clause texts
-            path_conditions: str — the path condition clause text
-            path_conditions_tree: lark.Tree — the AST subtree for path conditions
+            path_conditions: str | None — the optional path condition clause text
+            path_conditions_tree: lark.Tree | None — the optional path conditions AST
 
     Raises:
         ValueError: If the CEL cannot be parsed or has unexpected structure.
@@ -90,6 +90,8 @@ def decompose_push_cel(cel_expr):
     cor = ast.children[0]
     if not isinstance(cor, Tree) or cor.data != "conditionalor":
         raise ValueError(f"expected conditionalor, got {cor.data}")
+    if len(cor.children) != 1:
+        raise ValueError("top-level OR expressions cannot be decomposed safely")
 
     cand = cor.children[0]
     clauses = flatten_and(cand)
@@ -120,9 +122,6 @@ def decompose_push_cel(cel_expr):
 
     if result["event"] is None:
         raise ValueError("CEL expression has no event clause")
-    if result["path_conditions"] is None:
-        raise ValueError("CEL expression has no path conditions")
-
     return result
 
 
@@ -187,7 +186,8 @@ def build_stable_pr_cel(path_conditions_text, negative_guards=None, labels=None,
     """Build a PR CEL expression with pathChanged conditions, optionally scoped to a branch.
 
     Args:
-        path_conditions_text: str — CEL text for path conditions (from push pipeline).
+        path_conditions_text: str — CEL text for path conditions (from push pipeline),
+            or an empty string when the push trigger has no path restriction.
         negative_guards: list[str] | None — negative guard CEL clauses.
         labels: list[str] | None — label names for an optional label trigger arm.
             When provided, the CEL has two arms joined by ||: labels OR paths.
@@ -203,7 +203,11 @@ def build_stable_pr_cel(path_conditions_text, negative_guards=None, labels=None,
         path_parts.append(f'target_branch == "{target_branch}"')
     if negative_guards:
         path_parts.extend(negative_guards)
-    path_parts.append(path_conditions_text)
+    if path_conditions_text:
+        path_parts.append(path_conditions_text)
+    if not path_parts:
+        # An unrestricted path arm already permits every PR, regardless of labels.
+        return 'event == "pull_request"'
     path_arm = "\n&& ".join(path_parts)
 
     if labels:

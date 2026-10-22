@@ -399,6 +399,7 @@ def to_stable_pr_cel(value, filename="", labels_str=""):
 
     The path conditions (pathChanged, files.all.exists) are extracted from the
     push CEL, with the .tekton filename updated to the PR filename.
+    Push triggers without path conditions remain unrestricted by paths.
 
     Args:
         value: The push pipeline's on-cel-expression string.
@@ -432,10 +433,12 @@ def to_stable_pr_cel(value, filename="", labels_str=""):
     labels = parse_label_list(labels_str) or None
 
     # Replace .tekton filename in path conditions
-    path_tree = copy.deepcopy(parts["path_conditions_tree"])
-    if filename:
-        replace_tekton_filename(path_tree, filename)
-    path_text = path_conditions_to_text(path_tree)
+    path_text = ""
+    if parts["path_conditions_tree"] is not None:
+        path_tree = copy.deepcopy(parts["path_conditions_tree"])
+        if filename:
+            replace_tekton_filename(path_tree, filename)
+        path_text = path_conditions_to_text(path_tree)
 
     # Build the CEL expression
     return build_stable_pr_cel(path_text, parts["negative_guards"], labels=labels)
