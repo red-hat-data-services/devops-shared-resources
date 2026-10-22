@@ -73,13 +73,15 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
     """Extract component prefix from a tekton pipeline.
 
     Prefers metadata.name over filename when data is provided. Accepts the
-    '-on-push'/'-on-pull-request'/'-on-schedule' convention as well as PR names
-    ending in '-pull-request', optionally followed by a number or
-    '{{pull_request_number}}', without '-on-'.
+    '-on-push'/'-on-pull-request'/'-on-schedule' convention as well as terminal
+    '-push'/'-schedule' suffixes and PR names ending in '-pull-request',
+    optionally followed by a number or '{{pull_request_number}}', without '-on-'.
 
     'odh-dashboard-v3-5-on-push' → 'odh-dashboard'
     'odh-dashboard-on-pull-request' → 'odh-dashboard'
     'odh-dashboard-pull-request-{{pull_request_number}}' → 'odh-dashboard'
+    'odh-dashboard-push' → 'odh-dashboard'
+    'odh-dashboard-schedule' → 'odh-dashboard'
     """
     if data:
         meta_name = data.get("metadata", {}).get("name", "")
@@ -87,7 +89,8 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
             prefix = re.sub(r"-on-(push|pull-request|schedule).*$", "", meta_name)
             if prefix == meta_name:
                 prefix = re.sub(
-                    r"-pull-request(?:-(?:\d+|\{\{\s*pull_request_number\s*\}\}))?$",
+                    r"-(?:push|schedule|pull-request"
+                    r"(?:-(?:\d+|\{\{\s*pull_request_number\s*\}\}))?)$",
                     "", meta_name,
                 )
             prefix = re.sub(r"-v\d+-\d+.*$", "", prefix)
@@ -99,11 +102,11 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
         prefix = name.split("-pull-request")[0].removesuffix("-on")
         m = re.match(r"(.+)-v\d+-\d+.*$", prefix)
         return m.group(1) if m else prefix
-    m = re.match(r"(.+)-v\d+-\d+.*-(push|on-push|scheduled|on-schedule)", name)
+    m = re.match(r"(.+)-v\d+-\d+.*-(push|on-push|schedule|scheduled|on-schedule)", name)
     if m:
         return m.group(1)
-    if name.endswith("-push") or name.endswith("-on-push"):
-        return re.sub(r"-(push|on-push)$", "", name)
+    if name.endswith(("-push", "-schedule")):
+        return re.sub(r"-(?:on-)?(?:push|schedule)$", "", name)
     return None
 
 

@@ -158,14 +158,31 @@ def test_component_prefix_from_pr_metadata_without_filename(event, suffix, versi
 
 
 @pytest.mark.parametrize("event", ["push", "pull-request", "schedule"])
-def test_component_prefix_prefers_standard_event_marker(event):
-    component = "odh-pull-request-handler"
+@pytest.mark.parametrize("component", [
+    "odh-pull-request-handler", "odh-push-handler", "odh-schedule-handler",
+])
+def test_component_prefix_prefers_standard_event_marker(event, component):
     data = {"metadata": {"name": f"{component}-on-{event}"}}
     assert extract_component_prefix("", data) == component
 
 
-@pytest.mark.parametrize("name", ["odh-pull-requester", "odh-pull-request-handler"])
-def test_component_prefix_does_not_strip_partial_pr_marker(name):
+@pytest.mark.parametrize("event", ["push", "schedule"])
+@pytest.mark.parametrize("on_prefix", ["", "on-"])
+@pytest.mark.parametrize("version", ["", "-v3-6", "-v3-6-ea-2"])
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_component_prefix_push_or_schedule(event, on_prefix, version, with_metadata):
+    component = f"odh-{event}-handler"
+    name = f"{component}{version}-{on_prefix}{event}"
+    data = {"metadata": {"name": name}} if with_metadata else None
+    filename = "" if with_metadata else f"{name}.yaml"
+    assert extract_component_prefix(filename, data) == component
+
+
+@pytest.mark.parametrize("name", [
+    "odh-pull-requester", "odh-pull-request-handler",
+    "odh-pusher", "odh-push-handler", "odh-scheduler", "odh-schedule-handler",
+])
+def test_component_prefix_does_not_strip_partial_event_marker(name):
     data = {"metadata": {"name": name}}
     assert extract_component_prefix("", data) is None
 
