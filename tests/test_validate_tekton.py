@@ -69,6 +69,18 @@ def test_classify_push_in_component_name_pr():
     assert classify_pipeline("push-notifications-pull-request.yaml", data) == "pull_request"
 
 
+@pytest.mark.parametrize("version", ["", "-v3-6", "-v3-6-ea-2"])
+def test_classify_push_cel_with_pr_marker_in_component_name(version):
+    from lib.tekton_config import load_config
+
+    name = f"odh-pull-request-handler{version}"
+    data = {"metadata": {"name": name, "annotations": {
+        "pipelinesascode.tekton.dev/on-cel-expression": 'event == "push"',
+    }}}
+    config = load_config(str(REPO_ROOT / "tekton-templates" / "kc-migration"))
+    assert classify_pipeline(f"{name}.yaml", data, config=config) == "push"
+
+
 def test_classify_unknown():
     data = {"metadata": {"annotations": {}, "name": "x"}}
     assert classify_pipeline("component.yaml", data) == "unknown"

@@ -24,6 +24,8 @@ Usage in config.yaml:
             - component_starts_with
 """
 
+import re
+
 from lib.tekton import extract_component_prefix, get_annotation
 
 
@@ -60,8 +62,11 @@ def is_push_pipeline_by_cel(name, data):
     on_event = get_annotation(data, "pipelinesascode.tekton.dev/on-event")
     if on_event and "pull_request" in on_event:
         return False
-    # Preserve push/schedule names whose component contains 'pull-request'.
-    if is_pr_pipeline(name, data) and not name.endswith(("-push", "-schedule")):
+    # Only an explicit terminal PR event marker overrides the CEL event.
+    if re.search(
+        r"-(?:on-)?pull-request(?:-(?:\d+|\{\{\s*pull_request_number\s*\}\}))?$",
+        name,
+    ):
         return False
     cel = get_annotation(data, "pipelinesascode.tekton.dev/on-cel-expression")
     return bool(cel and 'event == "push"' in cel)
