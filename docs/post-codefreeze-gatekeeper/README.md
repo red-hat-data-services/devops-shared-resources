@@ -8,7 +8,7 @@ A reusable GitHub Actions workflow that validates post-code-freeze policies on R
 
 After code freeze, only changes tied to approved release blockers should land on release branches. This workflow runs as a CI check on PRs and validates:
 
-- A Jira issue (`RHOAIENG-*` / `RHAIENG-*` / `AIPCC-*`) is referenced in the PR description
+- A Jira issue (`RHOAIENG-*` / `RHAIENG-*` / `RHAI-*` / `AIPCC-*`) is referenced in the PR description
 - The issue belongs to the correct Jira project
 - The issue has the correct `fixVersion` for the release
 - The issue's `Release Blocker` field is set to `Approved`
