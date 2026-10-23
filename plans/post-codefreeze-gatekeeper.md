@@ -15,7 +15,7 @@ Can you create a reusable post-codefreeze-gatekeeper github workflow with follow
     * For "rhoai-x.y-ea.n" jira version should be "x.y EAn RHOAI RELEASE"  
 * It should execute following checks  
   * A jira issue is attached in the PR description  
-  * The jira issue belongs to either RHOAIENG or RHAIENG jira project  
+  * The jira issue belongs to RHOAIENG, RHAIENG, RHAI, or AIPCC Jira projects
   * The jira issue has target version and fix version set as identified RHOAI-jira-version  
   * The value of custom jira field "Release Blocker" is set as "Approved"  
 * If any of the mentioned criteria doesn't meeting then fail with appropriate error message  

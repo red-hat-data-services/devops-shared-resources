@@ -14,7 +14,7 @@ This check runs on every PR targeting the `rhoai-3.5` branch and validates that 
 
 For each Jira issue referenced in the PR description, the gatekeeper verifies:
 
-- The issue belongs to the `RHOAIENG`, `RHAIENG`, or `AIPCC` project
+- The issue belongs to the `RHOAIENG`, `RHAIENG`, `RHAI`, or `AIPCC` project
 - `fixVersion` includes `3.5 GA RHOAI RELEASE`
 - `Release Blocker` is set to `Approved`
 

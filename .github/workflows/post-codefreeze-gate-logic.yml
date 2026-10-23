@@ -67,7 +67,7 @@ jobs:
         run: |
           # Remove all HTML comment lines before extracting issue keys
           FILTERED_BODY=$(echo "$PR_BODY" | grep -v '<!---')
-          KEYS=$(echo "$FILTERED_BODY" | grep -oE '(RHOAIENG|RHAIENG|AIPCC|INFERENG)-[0-9]+' | sort -u || true)
+          KEYS=$(echo "$FILTERED_BODY" | grep -oE '(RHOAIENG|RHAIENG|RHAI|AIPCC|INFERENG)-[0-9]+' | sort -u || true)
           if [ -z "$KEYS" ]; then
             echo "::warning::No Jira issue keys found in PR description"
             echo "keys=" >> "$GITHUB_OUTPUT"
@@ -108,8 +108,6 @@ jobs:
           body: |
             <!-- post-codefreeze-gatekeeper -->
             ## Post-Codefreeze Gatekeeper ${{ steps.validate.outputs.pass == 'true' && '— PASSED' || '— FAILED' }} _(evaluation)_
-
-            > **Advisory only** — this check does not block merging. Please review the results before merging.
 
             **Target branch:** `${{ github.event.pull_request.base.ref }}`
             **Required Jira version:** `${{ steps.branch-info.outputs.jira_version }}`
