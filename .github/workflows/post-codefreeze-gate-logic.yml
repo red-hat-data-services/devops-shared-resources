@@ -59,11 +59,27 @@ jobs:
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "::notice::Derived Jira version: $JIRA_VERSION"
 
+      - name: Fetch current PR description
+        if: steps.branch-info.outputs.skip != 'true'
+        id: current-pr
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          body=$(gh api "repos/${GH_REPOSITORY}/pulls/${PR_NUMBER}" --jq '.body // ""')
+          delimiter="PR_BODY_$(openssl rand -hex 16)"
+          {
+            echo "body<<${delimiter}"
+            printf '%s\n' "$body"
+            echo "$delimiter"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Extract Jira issues from PR description
         if: steps.branch-info.outputs.skip != 'true'
         id: extract-jira
         env:
-          PR_BODY: ${{ github.event.pull_request.body }}
+          PR_BODY: ${{ steps.current-pr.outputs.body }}
         run: |
           # Remove all HTML comment lines before extracting issue keys
           FILTERED_BODY=$(echo "$PR_BODY" | grep -v '<!---')
@@ -83,7 +99,7 @@ jobs:
         id: validate
         uses: ./shared-resources/.github/actions/validate-jira-issues
         with:
-          pr_body: ${{ github.event.pull_request.body }}
+          pr_body: ${{ steps.current-pr.outputs.body }}
           jira_version: ${{ steps.branch-info.outputs.jira_version }}
           jira_base_url: ${{ inputs.jira_base_url || 'https://redhat.atlassian.net' }}
           jira_user_email: ${{ secrets.JIRA_USER_EMAIL }}
@@ -118,7 +134,7 @@ jobs:
             ${{ steps.validate.outputs.details }}
 
             ---
-            <sub>After resolving issues, push a commit, re-edit the PR description, or add the <code>run-gatekeeper</code> label to re-trigger this check.</sub>
+            <sub>After resolving issues, rerun the <strong>Post-Codefreeze Gatekeeper</strong> workflow in GitHub Actions to revalidate the current PR description.</sub>
 
       - name: Fail if validation failed
         if: steps.branch-info.outputs.skip != 'true' && steps.validate.outputs.pass != 'true'
