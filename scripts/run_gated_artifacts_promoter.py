@@ -193,6 +193,8 @@ def run_promoter(
         if outcome.pr_url:
             result += f" ({outcome.pr_url})"
         report(f"[{index}/{entry_count}] Completed {name}: {result}")
+        if outcome.automerge_skipped:
+            report(f"::warning::{name}: {outcome.automerge_skipped}")
 
     state = build_state(pull_requests=state_prs)
 
@@ -245,6 +247,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{name}] {outcome.message}")
         if outcome.pr_url:
             print(outcome.pr_url)
+        if outcome.automerge_skipped:
+            print(f"AUTOMERGE_WARNING: {name}: {outcome.automerge_skipped}")
 
     if result.leader:
         action = "Updated" if result.leader.updated else "Created"

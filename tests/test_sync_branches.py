@@ -144,6 +144,7 @@ def test_run_sync_entry_creates_pr(mock_prepare, mock_pr_creator, mock_push, git
         created=True,
         updated=False,
         merged=False,
+        automerge_skipped=None,
     )
     mock_pr_creator.return_value = pr_instance
 
@@ -204,6 +205,7 @@ def test_run_sync_entry_creates_source_pr(mock_pr_creator, mock_collect, git_rep
         created=True,
         updated=False,
         merged=False,
+        automerge_skipped=None,
     )
     mock_pr_creator.return_value = pr_instance
 

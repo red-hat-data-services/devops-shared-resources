@@ -156,6 +156,89 @@ def test_run_promoter_dry_run(tmp_path: Path) -> None:
     ]
 
 
+def test_run_promoter_warns_and_continues_when_automerge_is_not_allowed(
+    tmp_path: Path,
+) -> None:
+    config = {
+        "defaults": {
+            "source-branch": "main",
+            "target-branch": "stable",
+            "pr-head": "source",
+        },
+        "git": [
+            {
+                "name": "modelexpress",
+                "automerge": "yes",
+                "repo-url": "https://github.com/org/modelexpress.git",
+            },
+            {
+                "name": "eval-hub-contrib",
+                "automerge": "yes",
+                "repo-url": "https://github.com/org/eval-hub-contrib.git",
+            },
+        ],
+    }
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    seen: list[str] = []
+
+    def fake_sync(entry, *, token, dry_run, verbose):
+        seen.append(entry["name"])
+        if entry["name"] == "modelexpress":
+            return SyncOutcome(
+                sync_type="pr",
+                message=(
+                    "Updated pull request #30; warning: "
+                    "Auto-merge is not allowed for org/modelexpress; "
+                    "pull request #30 was left open"
+                ),
+                pr_url="https://github.com/org/modelexpress/pull/30",
+                automerge_skipped=(
+                    "Auto-merge is not allowed for org/modelexpress; "
+                    "pull request #30 was left open"
+                ),
+            )
+        return SyncOutcome(
+            sync_type="pr",
+            message="Updated pull request #12",
+            pr_url="https://github.com/org/eval-hub-contrib/pull/12",
+        )
+
+    leader = MagicMock()
+    leader.create_or_update.return_value = LeaderPRResult(
+        trigger_id="gap-live",
+        repo="red-hat-data-services/gated-artifacts-promoter",
+        branch="gap-leader/gap-live",
+        state_path="GAP Leaders/2026-10-27_gap-live/state.json",
+        pr_url="https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/9",
+        pr_number=9,
+        updated=True,
+        dry_run=False,
+    )
+    progress: list[str] = []
+
+    result = run_promoter(
+        config_path=config_path,
+        trigger_id="gap-live",
+        dry_run=False,
+        sync_runner=fake_sync,
+        leader_manager=leader,
+        token="tok",
+        progress=progress.append,
+    )
+
+    assert seen == ["modelexpress", "eval-hub-contrib"]
+    assert [state_pr.repo for state_pr in result.state_prs] == [
+        "modelexpress",
+        "eval-hub-contrib",
+    ]
+    assert (
+        "::warning::modelexpress: Auto-merge is not allowed for org/modelexpress; "
+        "pull request #30 was left open"
+    ) in progress
+    assert progress[-1].startswith("[promoter] Completed trigger gap-live:")
+
+
 def test_run_promoter_collects_prs(tmp_path: Path) -> None:
     config = {
         "git": [

@@ -11,6 +11,22 @@ import requests
 from lib.git_utils import GitCommit, extract_repo_slug, format_commit_url, parse_github_repo
 
 MAX_COMMITS_IN_BODY = 100
+AUTOMERGE_NOT_ALLOWED = "auto merge is not allowed for this repository"
+
+
+class AutomergeNotAllowed(RuntimeError):
+    """The repository does not allow auto-merge.
+
+    The pull request can still be created or updated. Callers should record a
+    warning and continue instead of failing the sync.
+    """
+
+
+def _repository_disallows_automerge(errors: list[Any]) -> bool:
+    return any(
+        AUTOMERGE_NOT_ALLOWED in str(error.get("message") or "").lower()
+        for error in errors
+    )
 
 
 @dataclass(frozen=True)
@@ -23,6 +39,7 @@ class PRResult:
     created: bool
     updated: bool
     merged: bool = False
+    automerge_skipped: str | None = None
 
 
 class PRCreator:
@@ -149,13 +166,12 @@ class PRCreator:
             self.add_labels(repo_url, number=number, labels=labels)
         if reviewers:
             self.request_reviewers(repo_url, number=number, reviewers=reviewers)
-        merged = False
-        if automerge:
-            merged = self.enable_automerge(
-                repo_url,
-                number=number,
-                merge_when_ready=merge_when_ready,
-            )
+        merged, automerge_skipped = self._apply_automerge(
+            repo_url,
+            number=number,
+            enabled=automerge,
+            merge_when_ready=merge_when_ready,
+        )
 
         return PRResult(
             number=number,
@@ -164,6 +180,7 @@ class PRCreator:
             created=True,
             updated=False,
             merged=merged,
+            automerge_skipped=automerge_skipped,
         )
 
     def update_pull_request(
@@ -202,27 +219,22 @@ class PRCreator:
         number: int,
         merge_when_ready: bool = False,
     ) -> bool:
-        """Enable auto-merge, or merge now when repository rules already allow it."""
+        """Enable auto-merge, or merge now when repository rules already allow it.
+
+        A repository that disallows auto-merge raises AutomergeNotAllowed.
+        Callers leave the pull request open and continue.
+        """
         owner, repo = parse_github_repo(repo_url)
         pull = self._request("GET", f"/repos/{owner}/{repo}/pulls/{number}")
         head_sha = pull["head"]["sha"]
         node_id = pull["node_id"]
-        mutation = """
-        mutation($pullRequestId: ID!) {
-          enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: MERGE}) {
-            pullRequest { number }
-          }
-        }
-        """
-        response = self.session.post(
-            "https://api.github.com/graphql",
-            json={"query": mutation, "variables": {"pullRequestId": node_id}},
-        )
         context = f" for {owner}/{repo} pull request #{number}"
-        if response.status_code >= 400:
-            raise RuntimeError(f"Failed to enable automerge{context}: {response.text}")
-        payload = response.json()
-        errors = payload.get("errors") or []
+        errors = self._post_enable_automerge(node_id, context=context)
+        if _repository_disallows_automerge(errors):
+            raise AutomergeNotAllowed(
+                f"Auto-merge is not allowed for {owner}/{repo}; "
+                f"pull request #{number} was left open"
+            )
         if errors:
             retry_as_merge = merge_when_ready and any(
                 error.get("type") == "UNPROCESSABLE" for error in errors
@@ -257,6 +269,48 @@ class PRCreator:
                 f"Failed to enable automerge{context}: {json.dumps(errors)}"
             )
         return False
+
+    def _post_enable_automerge(self, node_id: str, *, context: str) -> list[Any]:
+        mutation = """
+        mutation($pullRequestId: ID!) {
+          enablePullRequestAutoMerge(input: {pullRequestId: $pullRequestId, mergeMethod: MERGE}) {
+            pullRequest { number }
+          }
+        }
+        """
+        response = self.session.post(
+            "https://api.github.com/graphql",
+            json={"query": mutation, "variables": {"pullRequestId": node_id}},
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"Failed to enable automerge{context}: {response.text}")
+        payload = response.json()
+        return list(payload.get("errors") or [])
+
+    def _apply_automerge(
+        self,
+        repo_url: str,
+        *,
+        number: int,
+        enabled: bool,
+        merge_when_ready: bool,
+    ) -> tuple[bool, str | None]:
+        """Return ``(merged, warning)``.
+
+        When the repository disallows auto-merge, ``warning`` explains that the
+        pull request was left open. Other failures still propagate.
+        """
+        if not enabled:
+            return False, None
+        try:
+            merged = self.enable_automerge(
+                repo_url,
+                number=number,
+                merge_when_ready=merge_when_ready,
+            )
+        except AutomergeNotAllowed as exc:
+            return False, str(exc)
+        return merged, None
 
     def create_or_update_tracking_pr(
         self,
@@ -299,13 +353,12 @@ class PRCreator:
                 self.add_labels(repo_url, number=number, labels=labels)
             if reviewers:
                 self.request_reviewers(repo_url, number=number, reviewers=reviewers)
-            merged = False
-            if automerge:
-                merged = self.enable_automerge(
-                    repo_url,
-                    number=number,
-                    merge_when_ready=merge_when_ready,
-                )
+            merged, automerge_skipped = self._apply_automerge(
+                repo_url,
+                number=number,
+                enabled=automerge,
+                merge_when_ready=merge_when_ready,
+            )
             return PRResult(
                 number=number,
                 url=existing["html_url"],
@@ -313,6 +366,7 @@ class PRCreator:
                 created=False,
                 updated=True,
                 merged=merged,
+                automerge_skipped=automerge_skipped,
             )
 
         try:
@@ -345,13 +399,12 @@ class PRCreator:
                 self.add_labels(repo_url, number=number, labels=labels)
             if reviewers:
                 self.request_reviewers(repo_url, number=number, reviewers=reviewers)
-            merged = False
-            if automerge:
-                merged = self.enable_automerge(
-                    repo_url,
-                    number=number,
-                    merge_when_ready=merge_when_ready,
-                )
+            merged, automerge_skipped = self._apply_automerge(
+                repo_url,
+                number=number,
+                enabled=automerge,
+                merge_when_ready=merge_when_ready,
+            )
             return PRResult(
                 number=number,
                 url=existing["html_url"],
@@ -359,6 +412,7 @@ class PRCreator:
                 created=False,
                 updated=True,
                 merged=merged,
+                automerge_skipped=automerge_skipped,
             )
 
 

@@ -50,6 +50,7 @@ class SyncOutcome:
     message: str
     pr_url: str | None = None
     branch: str | None = None
+    automerge_skipped: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -278,11 +279,15 @@ def _create_or_update_pr(
     message = f"{action} pull request #{pr_result.number}"
     if conflict_files:
         message += " (contains merge conflicts)"
+    automerge_skipped = pr_result.automerge_skipped
+    if automerge_skipped:
+        message += f"; warning: {automerge_skipped}"
     return SyncOutcome(
         sync_type=entry["sync_type"],
         message=message,
         pr_url=pr_result.url,
         branch=pr_result.branch,
+        automerge_skipped=automerge_skipped,
     )
 
 

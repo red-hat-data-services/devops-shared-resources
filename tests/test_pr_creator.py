@@ -5,7 +5,12 @@ from unittest.mock import MagicMock, call, patch
 import pytest
 
 from lib.git_utils import GitCommit
-from lib.pr_creator import PRCreator, format_default_pr_body, format_default_pr_title
+from lib.pr_creator import (
+    AutomergeNotAllowed,
+    PRCreator,
+    format_default_pr_body,
+    format_default_pr_title,
+)
 
 
 def test_format_default_pr_title_same_repo() -> None:
@@ -120,6 +125,81 @@ def test_enable_automerge_error_identifies_pull_request() -> None:
 
     assert "org/repo pull request #42" in str(exc_info.value)
     assert "Pull request is in unstable status" in str(exc_info.value)
+
+
+def _not_allowed_response() -> MagicMock:
+    response = MagicMock(status_code=200)
+    response.json.return_value = {
+        "errors": [
+            {
+                "type": "UNPROCESSABLE",
+                "message": "Auto merge is not allowed for this repository",
+            }
+        ]
+    }
+    return response
+
+
+def test_enable_automerge_not_allowed_does_not_change_repository_settings() -> None:
+    creator = PRCreator("token")
+    creator._request = MagicMock(
+        return_value={"node_id": "PR_node_id", "head": {"sha": "head_sha"}}
+    )
+    creator.session.post = MagicMock(return_value=_not_allowed_response())
+
+    with pytest.raises(AutomergeNotAllowed, match="pull request #42 was left open"):
+        creator.enable_automerge(
+            "https://github.com/org/repo.git",
+            number=42,
+            merge_when_ready=True,
+        )
+
+    creator._request.assert_called_once_with("GET", "/repos/org/repo/pulls/42")
+    creator.session.post.assert_called_once()
+
+
+def test_create_or_update_warns_when_repository_disallows_automerge() -> None:
+    creator = PRCreator("token")
+    with (
+        patch.object(creator, "find_open_pr_by_head", return_value=None),
+        patch.object(
+            creator,
+            "find_open_pr_by_label",
+            return_value={
+                "number": 30,
+                "html_url": "https://github.com/org/modelexpress/pull/30",
+                "head": {"ref": "main"},
+            },
+        ),
+        patch.object(creator, "update_pull_request"),
+        patch.object(creator, "add_labels"),
+        patch.object(
+            creator,
+            "enable_automerge",
+            side_effect=AutomergeNotAllowed(
+                "Auto-merge is not allowed for org/modelexpress; "
+                "pull request #30 was left open"
+            ),
+        ),
+    ):
+        result = creator.create_or_update_tracking_pr(
+            "https://github.com/org/modelexpress.git",
+            title="Sync",
+            body="body",
+            head_branch="main",
+            base_branch="stable",
+            tracking_label="gated-artifacts-promoter",
+            automerge=True,
+            merge_when_ready=True,
+        )
+
+    assert result.updated is True
+    assert result.merged is False
+    assert result.number == 30
+    assert result.automerge_skipped == (
+        "Auto-merge is not allowed for org/modelexpress; "
+        "pull request #30 was left open"
+    )
 
 
 def test_enable_automerge_queues_when_github_accepts_request() -> None:
