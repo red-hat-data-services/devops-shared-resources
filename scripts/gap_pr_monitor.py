@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
-"""GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054, RHAI-8079, RHAI-8261).
+"""GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054, RHAI-8079, RHAI-8261, RHAI-10942).
 
 Read leader state.json, evaluate each child PR's component builds and
 main-to-release feasibility checks, post the gated artifacts promoter commit
 status, and update pr-status. Good children are greened only after every
-sibling has concluded (RHAI-8261).
+sibling has concluded (RHAI-8261) — same as before when the child gate passes.
+All-success batches set ``overall-status=early-gate-triggered`` and comment
+``/early-gate`` on the Leader (RHAI-10942); child GitHub success posting is
+unchanged.
 
 State path (RHOAIENG-93564 / sync layout):
 GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json
@@ -63,6 +66,7 @@ from lib.pr_status_updater import (
     parse_pr_url,
 )
 from lib.state_file import (
+    OVERALL_STATUS_EARLY_GATE_TRIGGERED,
     OVERALL_STATUS_FAILURE,
     OVERALL_STATUS_SUCCESS,
     OVERALL_STATUSES,
@@ -76,13 +80,29 @@ SUCCESS_PR_STATUS = PR_STATUS_SUCCESS
 MERGE_FAILURE_PR_STATUS = PR_STATUS_MERGE_FAILURE
 BUILD_PENDING_PR_STATUS = PR_STATUS_BUILD_PENDING
 BUILD_FAILURE_PR_STATUS = PR_STATUS_BUILD_FAILURE
+# Allowed in state_file; treat as a passing terminal if already present.
+BUILD_SUCCESS_PR_STATUS = "build-success"
 # Child statuses that conclude a repository PR. build-pending and new stay open.
 STAGE1_TERMINAL_PR_STATUSES = frozenset(
-    {SUCCESS_PR_STATUS, MERGE_FAILURE_PR_STATUS, BUILD_FAILURE_PR_STATUS}
+    {
+        SUCCESS_PR_STATUS,
+        BUILD_SUCCESS_PR_STATUS,
+        MERGE_FAILURE_PR_STATUS,
+        BUILD_FAILURE_PR_STATUS,
+    }
 )
+# Child passed its repo gate (we still write/post ``success`` when we evaluate pass).
+CHILD_PASS_PR_STATUSES = frozenset({SUCCESS_PR_STATUS, BUILD_SUCCESS_PR_STATUS})
 # RHAI-8261: hold green on good children until every sibling has concluded.
 DEFERRED_CHILD_GREEN_DESCRIPTION = (
     "GAP: waiting for other component PRs to conclude (RHAI-8261)"
+)
+# PaC on-comment in gated-artifacts-promoter: ^/early-gate(-build)?$
+EARLY_GATE_COMMENT_BODY = "/early-gate"
+EARLY_GATE_COMMENT_RE = re.compile(r"^/early-gate(-build)?\s*$")
+# overall-status values that allow Leader green (final).
+FINAL_OVERALL_STATUSES = frozenset(
+    {OVERALL_STATUS_SUCCESS, OVERALL_STATUS_FAILURE}
 )
 TRIGGER_ID_RE = re.compile(r"^gap-[A-Za-z0-9._-]+$")
 # Parent directory for per-trigger Leader state files (sync / RHOAIENG-93564).
@@ -135,6 +155,7 @@ class MonitorResult:
     dry_run: bool
     overall_status: str | None = None
     leader_status_posted: bool = False
+    early_gate_comment_posted: bool = False
     published_sha: str | None = None
     build_failure_urls: list[str] = field(default_factory=list)
     pending_urls: list[str] = field(default_factory=list)
@@ -386,9 +407,13 @@ def compute_overall_status(payload: dict[str, Any]) -> str | None:
     Finals: ``success``, ``merge-failure``, and ``build-failure``.
     ``build-pending`` and ``new`` stay in progress.
 
-    - all ``success`` → ``success``
+    - all ``success`` / ``build-success`` → ``early-gate-triggered``
+      (RHAI-10942; child GitHub status stays the existing success path)
     - any ``merge-failure`` or ``build-failure`` → ``failure``
     - any non-terminal child → ``None`` (do not conclude yet)
+
+    Existing ``success`` / ``failure`` (written by a future EG monitor) are
+    preserved so this monitor never overwrites a final conclusion.
     """
     entries = payload.get("pull-requests") or []
     if not entries:
@@ -401,9 +426,14 @@ def compute_overall_status(payload: dict[str, Any]) -> str | None:
         if status not in STAGE1_TERMINAL_PR_STATUSES:
             return None
         statuses.append(status)
-    if any(status != SUCCESS_PR_STATUS for status in statuses):
+
+    existing = str(payload.get("overall-status") or "").strip()
+    if existing in FINAL_OVERALL_STATUSES:
+        return existing
+
+    if any(status not in CHILD_PASS_PR_STATUSES for status in statuses):
         return OVERALL_STATUS_FAILURE
-    return OVERALL_STATUS_SUCCESS
+    return OVERALL_STATUS_EARLY_GATE_TRIGGERED
 
 
 def apply_overall_status(payload: dict[str, Any], overall_status: str | None) -> None:
@@ -430,26 +460,38 @@ def should_defer_child_success_status(
     *,
     pr_status: str,
     batch_concluded: bool,
+    overall_status: str | None = None,
 ) -> bool:
-    """Defer green on a good child until the whole batch has concluded."""
-    return pr_status == SUCCESS_PR_STATUS and not batch_concluded
+    """Defer green on a good child until every sibling has concluded (RHAI-8261).
+
+    ``overall_status`` is accepted for call-site compatibility but does not
+    change child greening: when the child gate passes and the batch is done,
+    we still post GitHub ``success`` as before.
+    """
+    del overall_status
+    if pr_status not in CHILD_PASS_PR_STATUSES:
+        return False
+    return not batch_concluded
 
 
 def status_decision_for_post(
     decision: RepositoryGateDecision | PrDecision,
     *,
     batch_concluded: bool,
+    overall_status: str | None = None,
 ) -> RepositoryGateDecision | PrDecision:
     """Return the decision to POST; may downgrade success→pending (RHAI-8261).
 
     ``pr-status`` in state.json still records the evaluated outcome; only the
-    GitHub commit status is deferred so good children cannot auto-merge early.
+    GitHub commit status is deferred so good children cannot auto-merge before
+    siblings conclude.
     """
     if getattr(decision, "skip_status_post", False):
         return decision
     if not should_defer_child_success_status(
         pr_status=decision.pr_status,
         batch_concluded=batch_concluded,
+        overall_status=overall_status,
     ):
         return decision
     return replace(
@@ -457,6 +499,71 @@ def status_decision_for_post(
         cli_status="pending",
         description=DEFERRED_CHILD_GREEN_DESCRIPTION,
     )
+
+
+def early_gate_comment_already_present(
+    leader_pr_url: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> bool:
+    """True when the Leader already has an Early Gate trigger comment."""
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    endpoint = f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments"
+    try:
+        raw = run(["api", endpoint, "--paginate"])
+    except GhCommandError:
+        return False
+    text = (raw or "").strip()
+    if not text:
+        return False
+    try:
+        comments = json.loads(text)
+    except json.JSONDecodeError:
+        return False
+    if not isinstance(comments, list):
+        return False
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        body = str(comment.get("body") or "").strip()
+        if EARLY_GATE_COMMENT_RE.match(body):
+            return True
+    return False
+
+
+def post_early_gate_trigger_comment(
+    leader_pr_url: str,
+    *,
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> bool:
+    """Comment ``/early-gate`` on the Leader once (RHAI-10942).
+
+    Returns True when a comment was posted (or would be, in dry-run).
+    Idempotent: skips if a matching comment already exists.
+    """
+    run = gh_runner or _run_gh
+    if early_gate_comment_already_present(leader_pr_url, gh_runner=run):
+        return False
+    if dry_run:
+        print(
+            f"[dry-run] would comment {EARLY_GATE_COMMENT_BODY!r} on {leader_pr_url}"
+        )
+        return True
+    ref = parse_pr_url(leader_pr_url)
+    run(
+        [
+            "pr",
+            "comment",
+            str(ref.number),
+            "-R",
+            f"{ref.owner}/{ref.repo}",
+            "--body",
+            EARLY_GATE_COMMENT_BODY,
+        ]
+    )
+    return True
 
 
 def _run_gh(args: Sequence[str]) -> str:
@@ -658,7 +765,7 @@ def run_stage1_monitor(
 
     apply_pr_statuses(payload, status_updates)
 
-    # RHOAIENG-97052: conclude only when every component PR is Stage-1 final.
+    # RHOAIENG-97052 / RHAI-10942: conclude only when every child is final.
     overall_status = compute_overall_status(payload)
     apply_overall_status(payload, overall_status)
 
@@ -988,11 +1095,12 @@ def run_monitor_publish_and_signal(
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     git_runner: Callable[..., str] | None = None,
 ) -> MonitorResult:
-    """Coordinator: monitor → publish state → Leader green on published SHA.
+    """Coordinator: monitor → publish state → EG comment and/or Leader green.
 
-    Ordering (RHOAIENG-97052 / RHAI-8079):
-      evaluate children → save state → commit/push → post Leader green when
-      overall-status is success or failure (never while children are pending).
+    Ordering (RHOAIENG-97052 / RHAI-8079 / RHAI-10942):
+      evaluate children → save state → commit/push →
+      if ``early-gate-triggered``: comment ``/early-gate`` on the Leader once;
+      if ``success`` or ``failure``: post Leader green on the published SHA.
     """
     result = run_monitor(
         state_path,
@@ -1021,12 +1129,30 @@ def run_monitor_publish_and_signal(
 
     leader_url = (leader_pr_url or "").strip() or None
     leader_status_posted = False
+    early_gate_comment_posted = False
     updated = list(result.updated_urls)
     skipped = list(result.skipped_urls)
-    concluded = result.overall_status in (
-        OVERALL_STATUS_SUCCESS,
-        OVERALL_STATUS_FAILURE,
-    )
+    concluded = result.overall_status in FINAL_OVERALL_STATUSES
+    early_gate = result.overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED
+
+    if early_gate and leader_url:
+        try:
+            early_gate_comment_posted = post_early_gate_trigger_comment(
+                leader_url,
+                dry_run=dry_run,
+                gh_runner=gh_runner,
+            )
+        except (GhCommandError, ValueError, RuntimeError) as exc:
+            raise GapPrMonitorError(
+                f"Failed to post Early Gate trigger comment on {leader_url}: {exc}"
+            ) from exc
+    elif early_gate and not leader_url:
+        print(
+            f"WARNING: overall-status={result.overall_status} but no Leader PR URL "
+            f"was provided (--leader-pr-url / {ENV_LEADER_PR_URL}); "
+            "skipped Early Gate trigger comment.",
+            file=sys.stderr,
+        )
 
     if concluded and leader_url:
         factory = updater_factory or PRStatusUpdater
@@ -1067,6 +1193,7 @@ def run_monitor_publish_and_signal(
         dry_run=result.dry_run,
         overall_status=result.overall_status,
         leader_status_posted=leader_status_posted,
+        early_gate_comment_posted=early_gate_comment_posted,
         published_sha=published.sha,
         build_failure_urls=result.build_failure_urls,
         pending_urls=result.pending_urls,
@@ -1146,6 +1273,8 @@ def run_scheduled_monitors(
             )
             if result.published_sha:
                 print(f"{prefix}published-sha: {result.published_sha}")
+            if result.early_gate_comment_posted:
+                print(f"{prefix}Posted Early Gate trigger comment (/early-gate)")
             if result.leader_status_posted:
                 print(f"{prefix}Posted Leader conclusion status (auto-merge signal)")
         except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
@@ -1513,16 +1642,22 @@ def _publish_gate_decision(
     build_app_id: int | None,
     retry_unknown: bool,
     batch_concluded: bool,
+    overall_status: str | None,
 ) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
     """Publish a decision, or re-evaluate once when the head has moved.
 
     A second move is left for the next poll. The stale decision is not posted
-    to the untested commit. Success greens are deferred until the batch has
-    concluded (RHAI-8261); ``pr_status`` on the returned decision stays evaluated.
+    to the untested commit. Success greens are deferred until the batch has a
+    final overall-status (RHAI-8261 / RHAI-10942); ``pr_status`` on the returned
+    decision stays evaluated.
     """
     if decision.skip_status_post:
         return decision, None
-    to_post = status_decision_for_post(decision, batch_concluded=batch_concluded)
+    to_post = status_decision_for_post(
+        decision,
+        batch_concluded=batch_concluded,
+        overall_status=overall_status,
+    )
     assert isinstance(to_post, RepositoryGateDecision)
     result = _post_gate_status(updater, to_post, description)
     if not result.deferred:
@@ -1537,7 +1672,11 @@ def _publish_gate_decision(
     )
     if fresh.skip_status_post:
         return fresh, None
-    to_post = status_decision_for_post(fresh, batch_concluded=batch_concluded)
+    to_post = status_decision_for_post(
+        fresh,
+        batch_concluded=batch_concluded,
+        overall_status=overall_status,
+    )
     assert isinstance(to_post, RepositoryGateDecision)
     result = _post_gate_status(updater, to_post, description)
     if result.deferred:
@@ -1587,6 +1726,7 @@ def _publish_decisions(
                 build_app_id=build_app_id,
                 retry_unknown=retry_unknown,
                 batch_concluded=batch_concluded,
+                overall_status=None,
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))
@@ -1702,9 +1842,10 @@ def build_parser() -> argparse.ArgumentParser:
             "Leader PR URL, or "
             f"{LATEST_LEADER_PR_SENTINEL} to discover the newest open Leader "
             f"labeled {DEFAULT_LEADER_LABEL!r}. With --publish-state, after "
-            "the state commit is pushed and overall-status is success or "
-            f"failure, post a green {DEFAULT_CHECK_NAME!r} status on the "
-            "published SHA (RHOAIENG-97052 / RHAI-8079). Also accepted via "
+            "the state commit is pushed: comment /early-gate when "
+            "overall-status is early-gate-triggered (RHAI-10942); post a green "
+            f"{DEFAULT_CHECK_NAME!r} status when overall-status is success or "
+            "failure (RHOAIENG-97052 / RHAI-8079). Also accepted via "
             f"{ENV_LEADER_PR_URL}."
         ),
     )
@@ -1712,9 +1853,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--publish-state",
         action="store_true",
         help=(
-            "RHOAIENG-97052 / RHAI-8079: commit and push state.json from Python, "
-            "then post Leader green against that published commit SHA when "
-            "overall-status is set (never before; never while children pending)."
+            "RHOAIENG-97052 / RHAI-8079 / RHAI-10942: commit and push state.json, "
+            "then comment /early-gate when overall-status is early-gate-triggered, "
+            "or post Leader green when overall-status is success or failure "
+            "(never while children are pending)."
         ),
     )
     parser.add_argument(
@@ -1865,6 +2007,8 @@ def main(argv: list[str] | None = None) -> int:
     if result.published_sha:
         print(f"{prefix}published-sha: {result.published_sha}")
         append_github_output("published_sha", result.published_sha)
+    if result.early_gate_comment_posted:
+        print(f"{prefix}Posted Early Gate trigger comment (/early-gate)")
     if result.leader_status_posted:
         print(f"{prefix}Posted Leader conclusion status (auto-merge signal)")
     for url in result.updated_urls:
