@@ -15,6 +15,8 @@ from lib.pr_status_updater import (
 from lib.gap_pr_gates import RepositoryGateDecision
 from scripts.gap_pr_monitor import (
     DEFERRED_CHILD_GREEN_DESCRIPTION,
+    DEFERRED_EARLY_GATE_CHILD_GREEN_DESCRIPTION,
+    EARLY_GATE_COMMENT_BODY,
     GapPrMonitorError,
     MonitorResult,
     OpenLeaderPr,
@@ -28,6 +30,7 @@ from scripts.gap_pr_monitor import (
     children_batch_concluded,
     classify_pr,
     compute_overall_status,
+    early_gate_comment_already_present,
     extract_pr_urls,
     extract_trigger_id_from_labels,
     fetch_pr_merge_info,
@@ -35,6 +38,7 @@ from scripts.gap_pr_monitor import (
     list_open_leader_prs,
     load_state,
     main,
+    post_early_gate_trigger_comment,
     post_leader_conclusion,
     publish_state,
     resolve_inputs_for_cli,
@@ -759,8 +763,8 @@ def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
     ]
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["pull-requests"][0]["pr-status"] == "success"
-    assert saved["overall-status"] == "success"
-    assert result.overall_status == "success"
+    assert saved["overall-status"] == "early-gate-triggered"
+    assert result.overall_status == "early-gate-triggered"
 
 
 def test_compute_overall_status_in_progress_and_terminal() -> None:
@@ -798,7 +802,7 @@ def test_compute_overall_status_in_progress_and_terminal() -> None:
                 ]
             }
         )
-        == "success"
+        == "early-gate-triggered"
     )
     assert (
         compute_overall_status(
@@ -2204,12 +2208,13 @@ def test_run_stage1_monitor_no_longer_posts_leader_directly(
         updater_factory=factory,
         gh_runner=fake_gh,
     )
-    assert result.overall_status == "success"
+    assert result.overall_status == "early-gate-triggered"
     assert result.leader_status_posted is False
-    # Only the child PR status is posted; Leader green is coordinator-only.
+    # Child green deferred for Early Gate; Leader green is coordinator-only.
     assert [u for u, _s, _k in holder["u"].posts] == [
         "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     ]
+    assert holder["u"].posts[0][1] == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -2228,25 +2233,30 @@ def test_children_batch_concluded_helpers() -> None:
 
 
 @pytest.mark.parametrize(
-    ("pr_status", "batch_concluded", "expected"),
+    ("pr_status", "batch_concluded", "overall_status", "expected"),
     [
-        ("success", False, True),
-        ("success", True, False),
-        ("merge-failure", False, False),
-        ("build-failure", False, False),
-        ("build-pending", False, False),
-        ("new", False, False),
+        ("success", False, None, True),
+        ("success", True, None, True),  # RHAI-10942: wait for final overall
+        ("success", True, "early-gate-triggered", True),
+        ("success", True, "success", False),
+        ("success", True, "failure", False),
+        ("merge-failure", False, None, False),
+        ("build-failure", False, None, False),
+        ("build-pending", False, None, False),
+        ("new", False, None, False),
     ],
 )
 def test_should_defer_child_success_status(
     pr_status: str,
     batch_concluded: bool,
+    overall_status: str | None,
     expected: bool,
 ) -> None:
     assert (
         should_defer_child_success_status(
             pr_status=pr_status,
             batch_concluded=batch_concluded,
+            overall_status=overall_status,
         )
         is expected
     )
@@ -2279,9 +2289,28 @@ def test_status_decision_for_post_keeps_success_when_batch_done() -> None:
         reason="ok",
         head_sha="a" * 40,
     )
-    posted = status_decision_for_post(decision, batch_concluded=True)
+    posted = status_decision_for_post(
+        decision, batch_concluded=True, overall_status="success"
+    )
     assert posted is decision
     assert posted.cli_status == "success"
+
+
+def test_status_decision_for_post_defers_while_early_gate_triggered() -> None:
+    decision = RepositoryGateDecision(
+        url="https://github.com/org/a/pull/1",
+        pr_status="success",
+        cli_status="success",
+        description="ok",
+        reason="ok",
+        head_sha="a" * 40,
+    )
+    posted = status_decision_for_post(
+        decision, batch_concluded=True, overall_status="early-gate-triggered"
+    )
+    assert isinstance(posted, RepositoryGateDecision)
+    assert posted.cli_status == "pending"
+    assert posted.description == DEFERRED_EARLY_GATE_CHILD_GREEN_DESCRIPTION
 
 
 def test_status_decision_for_post_keeps_failure_while_batch_open() -> None:
@@ -2456,6 +2485,7 @@ def test_run_monitor_greens_all_children_when_all_succeed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """All-success → early-gate-triggered; child greens stay deferred (RHAI-10942)."""
     a = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     b = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
     c = "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67"
@@ -2491,12 +2521,12 @@ def test_run_monitor_greens_all_children_when_all_succeed(
         return holder["u"]
 
     result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
-    assert result.overall_status == "success"
+    assert result.overall_status == "early-gate-triggered"
     assert set(result.success_urls) == {a, b, c}
     posts = {(u, s) for u, s, _ in holder["u"].posts}
-    assert posts == {(a, "success"), (b, "success"), (c, "success")}
+    assert posts == {(a, "pending"), (b, "pending"), (c, "pending")}
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "success"
+    assert saved["overall-status"] == "early-gate-triggered"
     assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
 
 
@@ -2553,7 +2583,7 @@ def test_run_monitor_single_success_child_still_greens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A one-child batch that succeeds is already concluded — green immediately."""
+    """One-child all-success → early-gate-triggered; child green deferred."""
     only = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     path = tmp_path / "state.json"
     save_state(
@@ -2580,8 +2610,8 @@ def test_run_monitor_single_success_child_still_greens(
         return holder["u"]
 
     result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
-    assert result.overall_status == "success"
-    assert holder["u"].posts[0][:2] == (only, "success")
+    assert result.overall_status == "early-gate-triggered"
+    assert holder["u"].posts[0][:2] == (only, "pending")
 
 
 def test_coordinator_defers_child_green_until_batch_then_greens_leader(
@@ -2719,4 +2749,313 @@ def test_coordinator_greens_good_children_and_leader_on_mixed_failure(
     assert (leader, "completed") in posts
     leader_kw = next(kw for u, s, kw in all_posts if u == leader and s == "completed")
     assert leader_kw.get("description") == "GAP: overall failure"
+
+
+# ---------------------------------------------------------------------------
+# RHAI-10942: early-gate-triggered + /early-gate comment
+# ---------------------------------------------------------------------------
+
+
+def test_compute_overall_preserves_existing_final_success() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "overall-status": "success",
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "success",
+                        "builds": [],
+                    }
+                ],
+            }
+        )
+        == "success"
+    )
+
+
+def test_compute_overall_preserves_existing_final_failure() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "overall-status": "failure",
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "merge-failure",
+                        "builds": [],
+                    },
+                ],
+            }
+        )
+        == "failure"
+    )
+
+
+def test_apply_overall_status_accepts_early_gate_triggered() -> None:
+    payload: dict[str, Any] = {"pull-requests": []}
+    apply_overall_status(payload, "early-gate-triggered")
+    assert payload["overall-status"] == "early-gate-triggered"
+
+
+def test_early_gate_comment_already_present_detects_variants() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+    comments = json.dumps(
+        [
+            {"body": "unrelated"},
+            {"body": "/early-gate-build\n"},
+        ]
+    )
+
+    def gh(args):
+        assert "comments" in " ".join(args)
+        return comments
+
+    assert early_gate_comment_already_present(leader, gh_runner=gh) is True
+
+
+def test_early_gate_comment_already_present_false_when_missing() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+
+    def gh(args):
+        return json.dumps([{"body": "hello"}])
+
+    assert early_gate_comment_already_present(leader, gh_runner=gh) is False
+
+
+def test_post_early_gate_trigger_comment_idempotent() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+    calls: list[list[str]] = []
+
+    def gh(args):
+        calls.append(list(args))
+        if args[0] == "api":
+            return json.dumps([{"body": "/early-gate"}])
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    assert post_early_gate_trigger_comment(leader, gh_runner=gh) is False
+    assert all(c[0] == "api" for c in calls)
+
+
+def test_post_early_gate_trigger_comment_posts_once() -> None:
+    leader = "https://github.com/org/gap/pull/9"
+    calls: list[list[str]] = []
+
+    def gh(args):
+        calls.append(list(args))
+        if args[0] == "api":
+            return "[]"
+        if args[0] == "pr" and args[1] == "comment":
+            return ""
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    assert post_early_gate_trigger_comment(leader, gh_runner=gh) is True
+    comment_calls = [c for c in calls if c[:2] == ["pr", "comment"]]
+    assert len(comment_calls) == 1
+    assert EARLY_GATE_COMMENT_BODY in comment_calls[0]
+
+
+def test_coordinator_all_success_comments_early_gate_no_leader_green(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": child,
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+    comments: list[str] = []
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    _fake_child_monitor(monkeypatch, statuses={child: "success"}, overall="early-gate-triggered")
+
+    def gh(args):
+        if args[0] == "api":
+            return "[]"
+        if args[:2] == ["pr", "comment"]:
+            comments.append(args[args.index("--body") + 1])
+            return ""
+        return ""
+
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+        gh_runner=gh,
+    )
+    assert result.overall_status == "early-gate-triggered"
+    assert result.early_gate_comment_posted is True
+    assert result.leader_status_posted is False
+    assert comments == [EARLY_GATE_COMMENT_BODY]
+    # No Leader green updater constructed on the early-gate path.
+    assert "u" not in holder
+
+
+def test_coordinator_early_gate_skips_duplicate_comment(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": child,
+                    "pr-status": "success",
+                    "builds": [],
+                }
+            ],
+            "overall-status": "early-gate-triggered",
+        },
+    )
+    comment_posts = 0
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        return FakeUpdater(check_name=check_name, dry_run=dry_run)
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    _fake_child_monitor(
+        monkeypatch, statuses={child: "success"}, overall="early-gate-triggered"
+    )
+
+    def gh(args):
+        nonlocal comment_posts
+        if args[0] == "api":
+            return json.dumps([{"body": "/early-gate"}])
+        if args[:2] == ["pr", "comment"]:
+            comment_posts += 1
+            return ""
+        return ""
+
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=True,
+        updater_factory=factory,
+        gh_runner=gh,
+    )
+    assert result.early_gate_comment_posted is False
+    assert result.leader_status_posted is False
+    assert comment_posts == 0
+
+
+def test_coordinator_preserves_success_and_greens_leader(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Future EG monitor wrote success — this monitor still greens Leader."""
+    path = tmp_path / "state.json"
+    child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": child,
+                    "pr-status": "success",
+                    "builds": [],
+                }
+            ],
+            "overall-status": "success",
+        },
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    _fake_child_monitor(monkeypatch, statuses={child: "success"}, overall="success")
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=factory,
+        gh_runner=lambda *_: "",
+    )
+    assert result.overall_status == "success"
+    assert result.early_gate_comment_posted is False
+    assert result.leader_status_posted is True
+    assert (leader, "completed") in [(u, s) for u, s, _ in holder["u"].posts]
+
+
+def test_run_monitor_greens_children_when_overall_already_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    only = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": only,
+                    "pr-status": "success",
+                    "builds": [],
+                }
+            ],
+            "overall-status": "success",
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._decide_url",
+        lambda url, **kwargs: _gate(only, "success", "success"),
+    )
+    holder: dict[str, FakeUpdater] = {}
+
+    def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
+        holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
+        return holder["u"]
+
+    result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
+    assert result.overall_status == "success"
+    assert holder["u"].posts[0][:2] == (only, "success")
 

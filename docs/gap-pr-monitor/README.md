@@ -27,22 +27,27 @@ check name.
 | Any expected component build completed without success | `build-failure` | `failure` |
 | A required build or feasibility check is queued, running, or missing | `build-pending` | `pending` |
 | Good child, but a sibling is still pending | `success` | `pending` (deferred; RHAI-8261) |
-| No component build is triggered, and feasibility succeeded | `success` | `success` (after all siblings conclude) |
-| All expected builds and feasibility jobs succeeded | `success` | `success` (after all siblings conclude) |
+| All children success, Early Gate not final yet | `success` | `pending` (deferred; RHAI-10942) |
+| No component build is triggered, and feasibility succeeded | `success` | `success` (after final overall) |
+| All expected builds and feasibility jobs succeeded | `success` | `success` (after final overall) |
 | Already merged | `success` | skip post |
 
 A failed repository gate posts a failing promoter status on that PR immediately.
 A **successful** child does **not** get a green `gated artifacts promoter` check
-until **every** child in the Leader state has a terminal `pr-status` (RHAI-8261).
-Until then the good child stays `pending` on GitHub so it cannot auto-merge early;
-`pr-status` in `state.json` still records `success`. Merging the leader PR to keep
-run history does not mark a failed repository PR successful.
-`builds[].image` is left unchanged; image URIs are not required for the gate.
+until **every** child has a terminal `pr-status` (RHAI-8261) **and**
+`overall-status` is a final `success` or `failure` (RHAI-10942). While overall
+is `early-gate-triggered`, good children stay `pending` on GitHub so they cannot
+auto-merge before Early Gate finishes; `pr-status` in `state.json` still records
+`success`. Merging the leader PR to keep run history does not mark a failed
+repository PR successful. `builds[].image` is left unchanged; image URIs are not
+required for the gate.
 
-When every child has a final gate status, the monitor also sets `overall-status`
-and (optionally) posts a green `gated artifacts promoter` status on the
-**Leader PR itself** so auto-merge can preserve run history on `main`
-(RHOAIENG-97052 / RHAI-8079). Pending children never conclude the Leader.
+When every child has a final gate status, the monitor sets `overall-status`.
+All-success batches become `early-gate-triggered` and the monitor comments
+`/early-gate` on the **Leader** once (RHAI-10942). Final `success` / `failure`
+(and Leader green for auto-merge) are written later by the Early Gate monitor,
+or immediately as `failure` when any child failed (RHOAIENG-97052 / RHAI-8079).
+Pending children never conclude the Leader.
 
 ## How merge conflicts are detected
 
@@ -59,33 +64,38 @@ gh pr view <number> -R <owner>/<repo> --json state,mergeable,mergeStateStatus,ur
 
 If `mergeable` is `UNKNOWN` / null (GitHub still computing), the script waits briefly and re-queries once.
 
-## Overall status (RHOAIENG-97052)
+## Overall status (RHOAIENG-97052 / RHAI-10942)
 
 The monitor **writes** `overall-status` into `state.json` only when **every**
 component PR has a final gate status (`success`, `merge-failure`, or
 `build-failure`). `build-pending` and `new` stay in progress.
 
-| Children | `overall-status` written | Leader auto-merge signal | Good-child green |
-|----------|--------------------------|---------------------------|------------------|
-| Any still `new` or `build-pending` | omitted | no | no (stay pending) |
-| All final, any `merge-failure` or `build-failure` | `failure` | yes — green on Leader (history) | yes — only `success` children |
-| All `success` | `success` | yes — green on Leader | yes — all children |
+| Children | `overall-status` written | Leader action | Good-child green |
+|----------|--------------------------|---------------|------------------|
+| Any still `new` or `build-pending` | omitted | none | no (stay pending) |
+| All final, any `merge-failure` or `build-failure` | `failure` | green Leader (history, RHAI-8079) | yes — only `success` children |
+| All `success` | `early-gate-triggered` | comment `/early-gate` once (RHAI-10942) | no — wait for EG / final overall |
+| Existing final `success` / `failure` (EG monitor) | preserved | green Leader | yes |
 
-Once every child has concluded, the Leader is greened for **success or failure**
-so GitHub auto-merge can land that run’s history on `main` (RHAI-8079). The same
-moment greens only the **good** children (RHAI-8261); failed children stay red.
+All-success does **not** set `overall-status=success` in this monitor. That final
+value (and Leader green for a successful run) belongs to the Early Gate results
+monitor (future scope). This monitor only hands off via `early-gate-triggered`
+and the `/early-gate` comment. Existing `success` / `failure` in state are never
+overwritten.
 
 With `--publish-state`, ordering is: evaluate children → write `state.json` →
-commit/push → then (when `overall-status` is set and a Leader PR URL is provided
-via `GAP_LEADER_PR_URL` / `--leader-pr-url`) post
-`gated artifacts promoter` = **success** on the **published** Leader head SHA
-so auto-merge cannot race ahead of the state commit.
+commit/push → then, when a Leader PR URL is provided
+(`GAP_LEADER_PR_URL` / `--leader-pr-url`):
+
+- `early-gate-triggered` → comment `/early-gate` on that Leader (idempotent)
+- `success` or `failure` → post `gated artifacts promoter` = **success** on the
+  **published** Leader head SHA (RHAI-8079)
 
 If another workflow run updated the same Leader branch, publish fetches the
 remote tip, retries `git push` with `pull --rebase` between attempts (up to
 three), instead of failing the job on a non-fast-forward push.
 
-Example after all children succeed:
+Example after all children succeed (Early Gate not finished yet):
 
 ```json
 {
@@ -97,7 +107,7 @@ Example after all children succeed:
       "builds": []
     }
   ],
-  "overall-status": "success"
+  "overall-status": "early-gate-triggered"
 }
 ```
 

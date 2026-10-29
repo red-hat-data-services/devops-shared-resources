@@ -131,6 +131,23 @@ def test_validate_state_accepts_overall_status() -> None:
     assert "overall-status" in payload
 
 
+def test_validate_state_accepts_early_gate_triggered() -> None:
+    payload = validate_state(
+        {
+            "overall-status": "early-gate-triggered",
+            "pull-requests": [
+                {
+                    "repo": "kserve",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/1",
+                    "pr-status": "success",
+                    "builds": [],
+                }
+            ],
+        }
+    )
+    assert payload["overall-status"] == "early-gate-triggered"
+
+
 def test_validate_state_rejects_bad_overall_status() -> None:
     with pytest.raises(StateFileError, match="overall-status"):
         validate_state(
