@@ -52,12 +52,15 @@ def is_push_pipeline(name, data):
 
 @pipeline_matcher
 def is_push_pipeline_by_cel(name, data):
-    """Match push pipelines by CEL expression containing event == 'push'.
+    """Match non-scheduled push pipelines by CEL containing event == 'push'.
 
     Used for konflux-central release branches where push pipelines use
     on-cel-expression instead of on-event annotations, and metadata.name
-    does not end with '-on-push'.
+    does not end with '-on-push'. Scheduled builds also use push events,
+    but must not be selected as normal push parents.
     """
+    if is_scheduled_pipeline(name, data):
+        return False
     # Incorrect CEL must not hide an explicitly identified PR pipeline.
     on_event = get_annotation(data, "pipelinesascode.tekton.dev/on-event")
     if on_event and "pull_request" in on_event:

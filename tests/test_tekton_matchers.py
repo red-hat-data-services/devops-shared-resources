@@ -77,8 +77,23 @@ class TestIsPushPipelineByCel:
         })
         assert not is_push_pipeline_by_cel(name, data)
 
+    @pytest.mark.parametrize("name", [
+        "odh-operator-v3-6-on-schedule",
+        "odh-operator-v3-6-ea-2-on-schedule",
+        "odh-pull-request-handler-on-schedule",
+    ])
+    def test_rejects_scheduled_push_cel(self, name):
+        data = _make_data(name, {
+            "pipelinesascode.tekton.dev/on-cel-expression": (
+                'event == "push" && target_branch == "rhoai-3.6"'
+                ' && "build/schedule/operator-tekton-trigger.txt".pathChanged()'
+            ),
+        })
+        assert is_scheduled_pipeline(name, data)
+        assert not is_push_pipeline_by_cel(name, data)
+
     @pytest.mark.parametrize("suffix", [
-        "", "-v3-6", "-v3-6-ea-2", "-on-push", "-push", "-on-schedule", "-schedule",
+        "", "-v3-6", "-v3-6-ea-2", "-on-push", "-push", "-schedule",
     ])
     def test_preserves_push_cel_in_component_with_pr_marker(self, suffix):
         name = f"odh-pull-request-handler{suffix}"
