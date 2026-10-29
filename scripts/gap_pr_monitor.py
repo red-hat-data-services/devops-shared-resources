@@ -44,7 +44,7 @@ if str(REPO_ROOT) not in sys.path:
 from lib.gap_check_selection import (
     FeasibilityRun,
     default_build_producer,
-    fetch_changed_files,
+    fetch_file_collections,
     fetch_feasibility_run,
     fetch_tekton_documents,
 )
@@ -1390,7 +1390,20 @@ def fetch_repository_pull_request(
         labels=_label_names(data.get("labels")),
         changed_files=(),
         committer_at=committer_at,
+        source_branch=str(data.get("headRefName") or "") or None,
+        base_sha=str(data.get("baseRefOid") or "") or None,
+        title=data.get("title"),
+        target_url=f"https://github.com/{pr.owner}/{pr.repo}",
+        source_url=_source_repository_url(data),
+
     )
+
+
+def _source_repository_url(data: dict) -> str | None:
+    repository = data.get("headRepository") or {}
+    owner = data.get("headRepositoryOwner") or {}
+    name, login = repository.get("name"), owner.get("login")
+    return f"https://github.com/{login}/{name}" if name and login else None
 
 
 def _load_pr_view(
@@ -1406,7 +1419,7 @@ def _load_pr_view(
             "-R",
             pr.slug,
             "--json",
-            "state,mergeable,mergeStateStatus,baseRefName,headRefOid,labels,url",
+            "state,mergeable,mergeStateStatus,baseRefName,baseRefOid,headRefName,headRefOid,labels,url,title,headRepository,headRepositoryOwner",
         ]
     )
     try:
@@ -1566,11 +1579,13 @@ def _decide_url(
         )
     else:
         try:
+            file_collections = fetch_file_collections(
+                pull_request.owner, pull_request.repo, pull_request.number, runner
+            )
             pull_request = replace(
                 pull_request,
-                changed_files=fetch_changed_files(
-                    pull_request.owner, pull_request.repo, pull_request.number, runner
-                ),
+                changed_files=file_collections["all"],
+                file_collections=file_collections,
             )
         except CheckQueryError as exc:
             tekton_error = str(exc)

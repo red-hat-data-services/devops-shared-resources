@@ -26,6 +26,8 @@ from lib.github_cli import GhCommandError
 from lib.pr_status_updater import PRStatusUpdater, PullRequestRef, StatusUpdateResult
 from scripts.gap_pr_monitor import run_monitor
 
+pytestmark = pytest.mark.usefixtures("pac_cel_binary")
+
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
 COMMITTER = datetime(2026, 10, 6, 10, 0, tzinfo=timezone.utc)
@@ -104,6 +106,16 @@ def _context(**overrides: Any) -> PullRequestContext:
     )
     base.update(overrides)
     return PullRequestContext(**base)
+
+
+def test_fetch_preserves_cel_metadata() -> None:
+    from scripts.gap_pr_monitor import fetch_repository_pull_request
+    pr = fetch_repository_pull_request(URL, gh_runner=_GitHub())
+    assert pr.source_branch == "feature/build"
+    assert pr.base_sha == OTHER_SHA
+    assert pr.title == "Build update"
+    assert pr.source_url == "https://github.com/fork-owner/eval-hub"
+    assert pr.target_url == "https://github.com/red-hat-data-services/eval-hub"
 
 
 def test_component_label_is_not_used_as_the_check_name() -> None:
@@ -447,7 +459,12 @@ class _GitHub:
                     "mergeable": self.mergeable,
                     "mergeStateStatus": self.merge_state,
                     "baseRefName": "stable",
+                    "baseRefOid": OTHER_SHA,
+                    "headRefName": "feature/build",
                     "headRefOid": self.head_sha,
+                    "title": "Build update",
+                    "headRepository": {"name": "eval-hub"},
+                    "headRepositoryOwner": {"login": "fork-owner"},
                     "labels": [],
                     "commits": self._listed_commits(),
                     "url": URL,

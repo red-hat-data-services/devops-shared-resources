@@ -31,6 +31,32 @@ def run(cmd: list[str], *, cwd: Path) -> subprocess.CompletedProcess[str]:
     return result
 
 
+@pytest.fixture(scope="session")
+def pac_cel_binary(tmp_path_factory):
+    """Build the actual Go helper; never substitute a mocked CEL engine."""
+    import os
+    import shutil
+
+    if not shutil.which("go"):
+        pytest.skip("Go is required for PaC CEL integration tests")
+    root = Path(__file__).resolve().parents[1]
+    binary = tmp_path_factory.mktemp("pac-cel") / "pac-cel-evaluate"
+    subprocess.run(
+        ["go", "build", "-o", str(binary), "."],
+        cwd=root / "tools" / "pac-cel", check=True,
+        env={**os.environ, "GOTOOLCHAIN": "local"},
+    )
+    previous = os.environ.get("PAC_CEL_EVALUATOR")
+    os.environ["PAC_CEL_EVALUATOR"] = str(binary)
+    try:
+        yield binary
+    finally:
+        if previous is None:
+            os.environ.pop("PAC_CEL_EVALUATOR", None)
+        else:
+            os.environ["PAC_CEL_EVALUATOR"] = previous
+
+
 @pytest.fixture
 def git_repo_factory(tmp_path: Path):
     def _create_repo(name: str, *, default_branch: str = "main") -> Path:

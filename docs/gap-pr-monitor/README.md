@@ -49,6 +49,38 @@ All-success batches become `early-gate-triggered` and the monitor comments
 or immediately as `failure` when any child failed (RHOAIENG-97052 / RHAI-8079).
 Pending children never conclude the Leader.
 
+## CEL trigger evaluator setup
+
+Build the Go helper before running the monitor (Go 1.27 or newer):
+
+```bash
+mkdir -p bin
+(cd tools/pac-cel && go build -o ../../bin/pac-cel-evaluate .)
+```
+
+The monitor looks for `bin/pac-cel-evaluate` relative to this checkout.
+Set `PAC_CEL_EVALUATOR=/absolute/path/to/pac-cel-evaluate` to use a separately
+built binary, including when installing the Python package elsewhere. The binary
+must be built for the runtime's OS/architecture. No build or download occurs at
+monitor runtime; Go is needed only to build the helper.
+
+The helper batches each PR's distinct `on-cel-expression` annotations in one
+JSON request. It uses pinned CEL-Go and `gobwas/glob` versions, not a Python
+approximation. See [the helper documentation](../../tools/pac-cel/README.md)
+for the protocol, upstream baseline, and compatibility limits.
+
+Evaluation uses current PR facts: source/target branches and repository URLs,
+title, and GitHub's PR file collections (`all`, `added`, `deleted`,
+`modified`, `renamed`). Renames use the new path, as PaC does.
+SHAs are retained as context, not invented top-level CEL variables.
+
+This is **PR-state selection, not webhook replay**. The monitor does not invent
+`body`, `headers`, `event_type`, or Repository custom parameters. Expressions
+requiring unavailable facts, invalid/non-boolean expressions, and helper failures
+retain the pipeline's expected check and produce a warning; they never establish
+that no build is required. A possibly truncated GitHub file listing is a query
+error rather than a no-build signal.
+
 ## How merge conflicts are detected
 
 The monitor does **not** run `git merge` locally. It asks GitHub via the `gh` CLI:

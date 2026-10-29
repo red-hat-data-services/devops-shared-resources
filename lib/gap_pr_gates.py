@@ -57,6 +57,12 @@ class RepositoryPullRequest:
     labels: frozenset[str]
     changed_files: tuple[str, ...]
     committer_at: datetime
+    source_branch: str | None = None
+    base_sha: str | None = None
+    title: str | None = None
+    source_url: str | None = None
+    target_url: str | None = None
+    file_collections: dict[str, tuple[str, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -169,6 +175,12 @@ def _evaluate_builds(
                 head_sha=pull_request.head_sha,
                 labels=pull_request.labels,
                 changed_files=pull_request.changed_files,
+                source_branch=pull_request.source_branch,
+                base_sha=pull_request.base_sha,
+                title=pull_request.title,
+                source_url=pull_request.source_url,
+                target_url=pull_request.target_url,
+                file_collections=pull_request.file_collections,
             ),
             app_slug=app_slug,
             app_id=app_id,
