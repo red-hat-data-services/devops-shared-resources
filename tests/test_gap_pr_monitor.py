@@ -40,6 +40,7 @@ from scripts.gap_pr_monitor import (
     main,
     post_early_gate_trigger_comment,
     post_leader_conclusion,
+    pr_status_for_overall,
     publish_state,
     resolve_inputs_for_cli,
     resolve_leader_pr_url_input,
@@ -762,7 +763,7 @@ def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
         "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     ]
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["pull-requests"][0]["pr-status"] == "success"
+    assert saved["pull-requests"][0]["pr-status"] == "build-success"
     assert saved["overall-status"] == "early-gate-triggered"
     assert result.overall_status == "early-gate-triggered"
 
@@ -2311,6 +2312,7 @@ def test_status_decision_for_post_defers_while_early_gate_triggered() -> None:
     assert isinstance(posted, RepositoryGateDecision)
     assert posted.cli_status == "pending"
     assert posted.description == DEFERRED_EARLY_GATE_CHILD_GREEN_DESCRIPTION
+    assert "build-success" in posted.description
 
 
 def test_status_decision_for_post_keeps_failure_while_batch_open() -> None:
@@ -2527,7 +2529,7 @@ def test_run_monitor_greens_all_children_when_all_succeed(
     assert posts == {(a, "pending"), (b, "pending"), (c, "pending")}
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["overall-status"] == "early-gate-triggered"
-    assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
+    assert all(e["pr-status"] == "build-success" for e in saved["pull-requests"])
 
 
 def test_run_monitor_posts_failure_immediately_while_sibling_pending(
@@ -2804,6 +2806,42 @@ def test_apply_overall_status_accepts_early_gate_triggered() -> None:
     payload: dict[str, Any] = {"pull-requests": []}
     apply_overall_status(payload, "early-gate-triggered")
     assert payload["overall-status"] == "early-gate-triggered"
+
+
+def test_pr_status_for_overall_maps_success_to_build_success() -> None:
+    assert (
+        pr_status_for_overall("success", overall_status="early-gate-triggered")
+        == "build-success"
+    )
+    assert pr_status_for_overall("success", overall_status="success") == "success"
+    assert (
+        pr_status_for_overall("build-failure", overall_status="early-gate-triggered")
+        == "build-failure"
+    )
+
+
+def test_compute_overall_accepts_build_success_children() -> None:
+    assert (
+        compute_overall_status(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "a",
+                        "pr-url": "https://github.com/o/a/pull/1",
+                        "pr-status": "build-success",
+                        "builds": [],
+                    },
+                    {
+                        "repo": "b",
+                        "pr-url": "https://github.com/o/b/pull/2",
+                        "pr-status": "build-success",
+                        "builds": [],
+                    },
+                ]
+            }
+        )
+        == "early-gate-triggered"
+    )
 
 
 def test_early_gate_comment_already_present_detects_variants() -> None:

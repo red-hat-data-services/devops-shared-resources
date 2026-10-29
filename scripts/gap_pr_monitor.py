@@ -78,17 +78,26 @@ SUCCESS_PR_STATUS = PR_STATUS_SUCCESS
 MERGE_FAILURE_PR_STATUS = PR_STATUS_MERGE_FAILURE
 BUILD_PENDING_PR_STATUS = PR_STATUS_BUILD_PENDING
 BUILD_FAILURE_PR_STATUS = PR_STATUS_BUILD_FAILURE
+# Allowed in state_file.PR_STATUSES; build done, Early Gate not final yet (RHAI-10942).
+BUILD_SUCCESS_PR_STATUS = "build-success"
 # Child statuses that conclude a repository PR. build-pending and new stay open.
 STAGE1_TERMINAL_PR_STATUSES = frozenset(
-    {SUCCESS_PR_STATUS, MERGE_FAILURE_PR_STATUS, BUILD_FAILURE_PR_STATUS}
+    {
+        SUCCESS_PR_STATUS,
+        BUILD_SUCCESS_PR_STATUS,
+        MERGE_FAILURE_PR_STATUS,
+        BUILD_FAILURE_PR_STATUS,
+    }
 )
+# Child passed its repo gate (final success or build-done awaiting EG).
+CHILD_PASS_PR_STATUSES = frozenset({SUCCESS_PR_STATUS, BUILD_SUCCESS_PR_STATUS})
 # RHAI-8261: hold green on good children until every sibling has concluded.
 DEFERRED_CHILD_GREEN_DESCRIPTION = (
     "GAP: waiting for other component PRs to conclude (RHAI-8261)"
 )
 # RHAI-10942: hold green while Early Gate owns the final overall conclusion.
 DEFERRED_EARLY_GATE_CHILD_GREEN_DESCRIPTION = (
-    "GAP: waiting for Early Gate (RHAI-10942)"
+    "GAP: build-success; waiting for Early Gate (RHAI-10942)"
 )
 # PaC on-comment in gated-artifacts-promoter: ^/early-gate(-build)?$
 EARLY_GATE_COMMENT_BODY = "/early-gate"
@@ -400,7 +409,8 @@ def compute_overall_status(payload: dict[str, Any]) -> str | None:
     Finals: ``success``, ``merge-failure``, and ``build-failure``.
     ``build-pending`` and ``new`` stay in progress.
 
-    - all ``success`` → ``early-gate-triggered`` (RHAI-10942; EG owns final)
+    - all ``success`` / ``build-success`` → ``early-gate-triggered``
+      (RHAI-10942; EG owns final ``success``)
     - any ``merge-failure`` or ``build-failure`` → ``failure``
     - any non-terminal child → ``None`` (do not conclude yet)
 
@@ -423,9 +433,28 @@ def compute_overall_status(payload: dict[str, Any]) -> str | None:
     if existing in FINAL_OVERALL_STATUSES:
         return existing
 
-    if any(status != SUCCESS_PR_STATUS for status in statuses):
+    if any(status not in CHILD_PASS_PR_STATUSES for status in statuses):
         return OVERALL_STATUS_FAILURE
     return OVERALL_STATUS_EARLY_GATE_TRIGGERED
+
+
+def pr_status_for_overall(
+    pr_status: str,
+    *,
+    overall_status: str | None,
+) -> str:
+    """Map evaluated child status for state.json under the current overall.
+
+    When handing off to Early Gate, record ``build-success`` (build done) instead
+    of final ``success``. Final ``success`` is reserved for after EG (or an
+    already-final overall).
+    """
+    if (
+        pr_status == SUCCESS_PR_STATUS
+        and overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED
+    ):
+        return BUILD_SUCCESS_PR_STATUS
+    return pr_status
 
 
 def apply_overall_status(payload: dict[str, Any], overall_status: str | None) -> None:
@@ -460,7 +489,7 @@ def should_defer_child_success_status(
     RHAI-10942: also wait while overall is ``early-gate-triggered`` (or unset
     on an all-success batch); only ``success`` / ``failure`` allow child green.
     """
-    if pr_status != SUCCESS_PR_STATUS:
+    if pr_status not in CHILD_PASS_PR_STATUSES:
         return False
     if not batch_concluded:
         return True
@@ -712,6 +741,12 @@ def run_stage1_monitor(
         status_updates[decision.url] = decision.pr_status
     apply_pr_statuses(payload, status_updates)
     provisional_overall = compute_overall_status(payload)
+    # Record build-success (not final success) while handing off to Early Gate.
+    for decision in decisions:
+        status_updates[decision.url] = pr_status_for_overall(
+            decision.pr_status, overall_status=provisional_overall
+        )
+    apply_pr_statuses(payload, status_updates)
 
     for decision in decisions:
         if decision.pr_status == MERGE_FAILURE_PR_STATUS:
@@ -1714,6 +1749,11 @@ def _publish_decisions(
         status_updates[decision.url] = decision.pr_status
     apply_pr_statuses(payload, status_updates)
     provisional_overall = compute_overall_status(payload)
+    for decision in decisions:
+        status_updates[decision.url] = pr_status_for_overall(
+            decision.pr_status, overall_status=provisional_overall
+        )
+    apply_pr_statuses(payload, status_updates)
 
     for original in decisions:
         url = original.url
@@ -1744,7 +1784,9 @@ def _publish_decisions(
             skipped.append(url)
             continue
 
-        status_updates[url] = decision.pr_status
+        status_updates[url] = pr_status_for_overall(
+            decision.pr_status, overall_status=provisional_overall
+        )
         reports.extend(decision.reports)
         if decision.pr_status == MERGE_FAILURE_PR_STATUS:
             merge_failures.append(url)
