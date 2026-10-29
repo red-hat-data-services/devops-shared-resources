@@ -677,6 +677,66 @@ def test_render_pr_parent_ref_without_parent_data_resolves_empty():
         "_parent should not fall back to the PR pipeline's own label value"
 
 
+@pytest.mark.parametrize("source", ["working-tree", "git-ref"])
+@pytest.mark.parametrize("scheduled_first", [False, True])
+def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, source, scheduled_first):
+    """Push and scheduled builds sharing a component must not collide in the parent index."""
+    import json
+    from subprocess import CompletedProcess
+    from lib.tekton_config import load_config
+
+    config = load_config(str(REPO_ROOT / "tekton-templates" / "kc-migration"))
+    files = {}
+    for suffix, path in [
+        ("push", "src/**"),
+        ("scheduled", "build/schedule/operator-tekton-trigger.txt"),
+    ]:
+        event = "on-push" if suffix == "push" else "on-schedule"
+        files[f"pipelineruns/rhods-operator/.tekton/odh-operator-v3-6-{suffix}.yaml"] = {
+            "apiVersion": "tekton.dev/v1",
+            "kind": "PipelineRun",
+            "metadata": {
+                "name": f"odh-operator-v3-6-{event}",
+                "annotations": {
+                    "pipelinesascode.tekton.dev/on-cel-expression": (
+                        'event == "push" && target_branch == "rhoai-3.6"'
+                        f' && "{path}".pathChanged()'
+                    ),
+                },
+            },
+        }
+
+    if source == "working-tree":
+        for filepath, data in reversed(list(files.items())) if scheduled_first else files.items():
+            target = tmp_path / filepath
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(json.dumps(data))
+        _, parents, errors, _ = _vt._load_pipelines(tmp_path, None, config, layout="nested")
+        assert not errors
+    else:
+        paths = list(files)
+        if scheduled_first:
+            paths.reverse()
+
+        def fake_git(*args, **kwargs):
+            if args[0] == "ls-tree":
+                return CompletedProcess(args, 0, "\n".join(paths), "")
+            assert args[0] == "show"
+            return CompletedProcess(args, 0, json.dumps(files[args[1].split(":", 1)[1]]), "")
+
+        monkeypatch.setattr(_vt, "git", fake_git)
+        parents = _vt._load_parent_pipelines_from_ref("origin/rhoai-3.6", tmp_path, config, layout="nested")
+
+    assert set(parents["push"]) == {"odh-operator"}
+    parent = parents["push"]["odh-operator"]
+    assert parent["metadata"]["name"] == "odh-operator-v3-6-on-push"
+    from lib.tekton_filters import to_stable_pr_cel
+    assert to_stable_pr_cel(
+        parent["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"],
+        "odh-operator-pull-request.yaml",
+    ) == 'event == "pull_request"\n&& "src/**".pathChanged()'
+
+
 def test_validate_pr_without_push_pipeline_reports_error():
     """validate_tekton_dir should report an error when a PR pipeline has no matching push pipeline."""
     import tempfile, shutil
