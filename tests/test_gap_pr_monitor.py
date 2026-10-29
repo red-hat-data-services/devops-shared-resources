@@ -15,8 +15,7 @@ from lib.pr_status_updater import (
 from lib.gap_pr_gates import RepositoryGateDecision
 from scripts.gap_pr_monitor import (
     DEFERRED_CHILD_GREEN_DESCRIPTION,
-    DEFERRED_EARLY_GATE_CHILD_GREEN_DESCRIPTION,
-    EARLY_GATE_COMMENT_BODY,
+        EARLY_GATE_COMMENT_BODY,
     GapPrMonitorError,
     MonitorResult,
     OpenLeaderPr,
@@ -40,7 +39,6 @@ from scripts.gap_pr_monitor import (
     main,
     post_early_gate_trigger_comment,
     post_leader_conclusion,
-    pr_status_for_overall,
     publish_state,
     resolve_inputs_for_cli,
     resolve_leader_pr_url_input,
@@ -763,7 +761,7 @@ def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
         "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     ]
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["pull-requests"][0]["pr-status"] == "build-success"
+    assert saved["pull-requests"][0]["pr-status"] == "success"
     assert saved["overall-status"] == "early-gate-triggered"
     assert result.overall_status == "early-gate-triggered"
 
@@ -2211,11 +2209,11 @@ def test_run_stage1_monitor_no_longer_posts_leader_directly(
     )
     assert result.overall_status == "early-gate-triggered"
     assert result.leader_status_posted is False
-    # Child green deferred for Early Gate; Leader green is coordinator-only.
+    # Child green after batch conclude (RHAI-8261); Leader green is coordinator-only.
     assert [u for u, _s, _k in holder["u"].posts] == [
         "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     ]
-    assert holder["u"].posts[0][1] == "pending"
+    assert holder["u"].posts[0][1] == "completed" or holder["u"].posts[0][1] == "success"
 
 
 # ---------------------------------------------------------------------------
@@ -2237,8 +2235,8 @@ def test_children_batch_concluded_helpers() -> None:
     ("pr_status", "batch_concluded", "overall_status", "expected"),
     [
         ("success", False, None, True),
-        ("success", True, None, True),  # RHAI-10942: wait for final overall
-        ("success", True, "early-gate-triggered", True),
+        ("success", True, None, False),
+        ("success", True, "early-gate-triggered", False),
         ("success", True, "success", False),
         ("success", True, "failure", False),
         ("merge-failure", False, None, False),
@@ -2296,23 +2294,6 @@ def test_status_decision_for_post_keeps_success_when_batch_done() -> None:
     assert posted is decision
     assert posted.cli_status == "success"
 
-
-def test_status_decision_for_post_defers_while_early_gate_triggered() -> None:
-    decision = RepositoryGateDecision(
-        url="https://github.com/org/a/pull/1",
-        pr_status="success",
-        cli_status="success",
-        description="ok",
-        reason="ok",
-        head_sha="a" * 40,
-    )
-    posted = status_decision_for_post(
-        decision, batch_concluded=True, overall_status="early-gate-triggered"
-    )
-    assert isinstance(posted, RepositoryGateDecision)
-    assert posted.cli_status == "pending"
-    assert posted.description == DEFERRED_EARLY_GATE_CHILD_GREEN_DESCRIPTION
-    assert "build-success" in posted.description
 
 
 def test_status_decision_for_post_keeps_failure_while_batch_open() -> None:
@@ -2487,7 +2468,7 @@ def test_run_monitor_greens_all_children_when_all_succeed(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """All-success → early-gate-triggered; child greens stay deferred (RHAI-10942)."""
+    """All-success → early-gate-triggered; children still greened (RHAI-8261)."""
     a = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     b = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
     c = "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67"
@@ -2526,10 +2507,10 @@ def test_run_monitor_greens_all_children_when_all_succeed(
     assert result.overall_status == "early-gate-triggered"
     assert set(result.success_urls) == {a, b, c}
     posts = {(u, s) for u, s, _ in holder["u"].posts}
-    assert posts == {(a, "pending"), (b, "pending"), (c, "pending")}
+    assert posts == {(a, "success"), (b, "success"), (c, "success")}
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["overall-status"] == "early-gate-triggered"
-    assert all(e["pr-status"] == "build-success" for e in saved["pull-requests"])
+    assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
 
 
 def test_run_monitor_posts_failure_immediately_while_sibling_pending(
@@ -2585,7 +2566,7 @@ def test_run_monitor_single_success_child_still_greens(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One-child all-success → early-gate-triggered; child green deferred."""
+    """One-child all-success → early-gate-triggered; child still greened."""
     only = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     path = tmp_path / "state.json"
     save_state(
@@ -2613,7 +2594,7 @@ def test_run_monitor_single_success_child_still_greens(
 
     result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
     assert result.overall_status == "early-gate-triggered"
-    assert holder["u"].posts[0][:2] == (only, "pending")
+    assert holder["u"].posts[0][:2] == (only, "success")
 
 
 def test_coordinator_defers_child_green_until_batch_then_greens_leader(
@@ -2807,17 +2788,6 @@ def test_apply_overall_status_accepts_early_gate_triggered() -> None:
     apply_overall_status(payload, "early-gate-triggered")
     assert payload["overall-status"] == "early-gate-triggered"
 
-
-def test_pr_status_for_overall_maps_success_to_build_success() -> None:
-    assert (
-        pr_status_for_overall("success", overall_status="early-gate-triggered")
-        == "build-success"
-    )
-    assert pr_status_for_overall("success", overall_status="success") == "success"
-    assert (
-        pr_status_for_overall("build-failure", overall_status="early-gate-triggered")
-        == "build-failure"
-    )
 
 
 def test_compute_overall_accepts_build_success_children() -> None:
