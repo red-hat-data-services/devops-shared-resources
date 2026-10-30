@@ -22,8 +22,11 @@ or the failed variant (`Early Gate failed` / `FAILED`).
 5. Publish `state.json` and green the Leader (`gated artifacts promoter`) so
    auto-merge can proceed (same as RHAI-8079).
 
-Progress comments (`eg-operator-build-status`, queue notices, `/early-gate`)
-are ignored. Final `success` / `failure` are never overwritten.
+Only comments from trusted reporters (default `rhods-ci-bot`) with the
+`early-gate-build-complete` marker are used. Progress comments and casual
+discussion are ignored. The workflow wake-up is only a signal — the script
+always reconciles full comment history and takes the latest trusted terminal
+report. Final `success` / `failure` are never overwritten.
 
 ## Script
 

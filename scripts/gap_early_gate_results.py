@@ -7,13 +7,15 @@ After Stage-1 sets ``overall-status=early-gate-triggered`` and comments
 
 This script:
 
-1. Reads Leader PR comments (or a single comment body from Actions).
-2. Parses the latest terminal Early Gate outcome.
-3. When state is ``early-gate-triggered``, writes ``success`` / ``failure``.
-4. Optionally publishes ``state.json`` and greens the Leader (RHAI-8079).
+1. Lists Leader PR comments (paginated) and selects the latest **trusted**
+   terminal Early Gate report.
+2. When state is ``early-gate-triggered``, writes ``success`` / ``failure``.
+3. Optionally publishes ``state.json`` and greens the Leader (RHAI-8079).
 
 Progress comments (``eg-operator-build-status``, queue notices, ``/early-gate``
-triggers) are ignored. Final ``success`` / ``failure`` are never overwritten.
+triggers) and untrusted authors are ignored. Final ``success`` / ``failure``
+are never overwritten. A triggering Actions comment is only a wake-up signal;
+the script always reconciles current comment history.
 """
 
 from __future__ import annotations
@@ -63,7 +65,11 @@ _run_gh = gpm._run_gh
 # HTML marker used by rhods-ci-bot terminal EG reports (may include digest lines).
 EARLY_GATE_BUILD_COMPLETE_MARKER = "early-gate-build-complete"
 
-# Visible headlines / Status row (screenshot contract).
+# Default Early Gate reporting identity (override via GAP_EG_TRUSTED_AUTHORS).
+DEFAULT_TRUSTED_EG_AUTHORS = frozenset({"rhods-ci-bot"})
+ENV_TRUSTED_AUTHORS = "GAP_EG_TRUSTED_AUTHORS"
+
+# Visible headlines / Status row (screenshot contract) — only with the marker.
 _PASSED_PATTERNS = (
     re.compile(r"\*\*Early Gate passed\*\*", re.IGNORECASE),
     re.compile(r"Early Gate passed", re.IGNORECASE),
@@ -111,45 +117,66 @@ class EarlyGateResultsResult:
     reason: str = ""
 
 
+def trusted_early_gate_authors(
+    raw: str | None = None,
+) -> frozenset[str]:
+    """Return logins allowed to publish terminal Early Gate results."""
+    text = raw if raw is not None else os.environ.get(ENV_TRUSTED_AUTHORS, "")
+    text = (text or "").strip()
+    if not text:
+        return DEFAULT_TRUSTED_EG_AUTHORS
+    authors = {part.strip() for part in text.split(",") if part.strip()}
+    return frozenset(authors) if authors else DEFAULT_TRUSTED_EG_AUTHORS
+
+
+def comment_author_login(comment: dict[str, Any]) -> str | None:
+    """Extract the GitHub login from a comment API object."""
+    author = comment.get("user") or comment.get("author") or {}
+    if isinstance(author, dict):
+        login = author.get("login")
+        return str(login) if login else None
+    if isinstance(author, str) and author.strip():
+        return author.strip()
+    return None
+
+
+def is_trusted_early_gate_author(
+    login: str | None,
+    *,
+    trusted: frozenset[str] | None = None,
+) -> bool:
+    """True when ``login`` is an allowed Early Gate reporter."""
+    if not login:
+        return False
+    allowed = trusted if trusted is not None else trusted_early_gate_authors()
+    return login in allowed
+
+
 def comment_looks_like_early_gate_complete(body: str) -> bool:
     """True when a comment body is a candidate terminal EG report.
 
-    Used by the Actions job filter / early-exit path. Prefer the HTML marker;
-    also accept the visible Early Gate passed/failed headline from screenshots.
+    Used by the Actions job filter / early-exit path. Prefer the HTML marker.
     """
     text = body or ""
-    if EARLY_GATE_BUILD_COMPLETE_MARKER in text:
-        return True
-    if re.search(r"Early Gate passed", text, re.IGNORECASE):
-        return True
-    if re.search(r"Early Gate failed", text, re.IGNORECASE):
-        return True
-    return False
+    return EARLY_GATE_BUILD_COMPLETE_MARKER in text
 
 
 def parse_early_gate_outcome_from_body(body: str) -> str | None:
-    """Return ``success`` / ``failure`` from a terminal EG comment, else None.
+    """Return ``success`` / ``failure`` from a structured EG comment, else None.
 
-    Requires the build-complete marker when present in mixed noise, but also
-    accepts bodies that only show the screenshot headline + Status row (some
-    older comments used a bare ``<!-- early-gate-build-complete -->``).
+    Requires the ``early-gate-build-complete`` marker so casual discussion that
+    merely mentions \"Early Gate passed\" cannot conclude the Leader.
     """
     text = body or ""
     if not text.strip():
         return None
 
-    # Never treat pure progress comments as terminal.
     stripped_lower = text.lower()
     if EARLY_GATE_BUILD_COMPLETE_MARKER not in stripped_lower:
-        # Allow headline-only screenshot style without marker (rare).
-        if not (
-            re.search(r"Early Gate passed", text, re.IGNORECASE)
-            or re.search(r"Early Gate failed", text, re.IGNORECASE)
-        ):
-            return None
-        # Reject if this is only a progress marker comment.
-        if any(m in stripped_lower for m in _PROGRESS_MARKERS):
-            return None
+        return None
+    if any(m in stripped_lower for m in _PROGRESS_MARKERS):
+        # Marker should not appear on progress comments; belt-and-suspenders.
+        return None
 
     passed = any(p.search(text) for p in _PASSED_PATTERNS)
     failed = any(p.search(text) for p in _FAILED_PATTERNS)
@@ -173,12 +200,22 @@ def _comment_sort_key(comment: dict[str, Any]) -> tuple[str, int]:
 
 def select_latest_early_gate_outcome(
     comments: Sequence[dict[str, Any]],
+    *,
+    trusted_authors: frozenset[str] | None = None,
 ) -> EarlyGateCommentOutcome | None:
-    """Pick the latest comment that parses to a definite EG overall status."""
+    """Pick the latest trusted comment that parses to a definite EG overall."""
+    allowed = (
+        trusted_authors
+        if trusted_authors is not None
+        else trusted_early_gate_authors()
+    )
     best: EarlyGateCommentOutcome | None = None
     best_key: tuple[str, int] = ("", -1)
     for comment in comments:
         if not isinstance(comment, dict):
+            continue
+        login = comment_author_login(comment)
+        if not is_trusted_early_gate_author(login, trusted=allowed):
             continue
         body = str(comment.get("body") or "")
         outcome = parse_early_gate_outcome_from_body(body)
@@ -187,12 +224,6 @@ def select_latest_early_gate_outcome(
         key = _comment_sort_key(comment)
         if key >= best_key:
             best_key = key
-            author = comment.get("user") or comment.get("author") or {}
-            login = None
-            if isinstance(author, dict):
-                login = author.get("login")
-            elif isinstance(author, str):
-                login = author
             cid = comment.get("id")
             try:
                 cid_int = int(cid) if cid is not None else None
@@ -201,11 +232,32 @@ def select_latest_early_gate_outcome(
             best = EarlyGateCommentOutcome(
                 overall_status=outcome,
                 comment_id=cid_int,
-                created_at=str(comment.get("created_at") or comment.get("createdAt") or "")
+                created_at=str(
+                    comment.get("created_at") or comment.get("createdAt") or ""
+                )
                 or None,
-                author=str(login) if login else None,
+                author=login,
             )
     return best
+
+
+def _flatten_gh_paginate_slurp(data: Any) -> list[dict[str, Any]]:
+    """Flatten ``gh api --paginate --slurp`` JSON into comment objects."""
+    comments: list[dict[str, Any]] = []
+    if isinstance(data, list):
+        if not data:
+            return []
+        # --slurp: list of page arrays, or a single page array of objects.
+        if all(isinstance(page, list) for page in data):
+            for page in data:
+                for item in page:
+                    if isinstance(item, dict):
+                        comments.append(item)
+            return comments
+        return [c for c in data if isinstance(c, dict)]
+    raise GapPrMonitorError(
+        f"Unexpected comments payload type: {type(data).__name__}"
+    )
 
 
 def list_leader_pr_comments(
@@ -213,11 +265,11 @@ def list_leader_pr_comments(
     *,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> list[dict[str, Any]]:
-    """List issue comments on the Leader PR (paginated)."""
+    """List issue comments on the Leader PR (all pages via --paginate --slurp)."""
     run = gh_runner or _run_gh
     ref = parse_pr_url(leader_pr_url)
     endpoint = f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments"
-    raw = run(["api", endpoint, "--paginate"])
+    raw = run(["api", endpoint, "--paginate", "--slurp"])
     text = (raw or "").strip()
     if not text:
         return []
@@ -227,11 +279,7 @@ def list_leader_pr_comments(
         raise GapPrMonitorError(
             f"Invalid JSON listing comments for {leader_pr_url}: {exc}"
         ) from exc
-    if isinstance(data, list):
-        return [c for c in data if isinstance(c, dict)]
-    raise GapPrMonitorError(
-        f"Unexpected comments payload type for {leader_pr_url}: {type(data).__name__}"
-    )
+    return _flatten_gh_paginate_slurp(data)
 
 
 def fetch_leader_labels(
@@ -303,9 +351,12 @@ def decide_overall_from_comments(
     *,
     current_overall: str | None,
     comments: Sequence[dict[str, Any]],
-    comment_body: str | None = None,
+    trusted_authors: frozenset[str] | None = None,
 ) -> tuple[str | None, str]:
-    """Decide the next overall-status from EG comments and current state.
+    """Decide the next overall-status from current EG comment history.
+
+    Always selects the latest trusted terminal report. A workflow wake-up
+    comment body is intentionally not applied on its own (stale retries).
 
     Returns ``(new_overall_or_None, reason)``.
     ``None`` means do not change state.
@@ -321,18 +372,17 @@ def decide_overall_from_comments(
             "waiting for Stage-1 Early Gate handoff",
         )
 
-    if comment_body is not None and str(comment_body).strip():
-        outcome = parse_early_gate_outcome_from_body(str(comment_body))
-        if outcome is None:
-            return None, "trigger comment is not a terminal Early Gate passed/failed report"
-        return outcome, "applied from triggering comment body"
-
-    selected = select_latest_early_gate_outcome(comments)
+    selected = select_latest_early_gate_outcome(
+        comments, trusted_authors=trusted_authors
+    )
     if selected is None:
-        return None, "no terminal Early Gate passed/failed comment found"
+        return None, "no trusted terminal Early Gate passed/failed comment found"
     return (
         selected.overall_status,
-        f"applied from latest Early Gate comment id={selected.comment_id}",
+        (
+            f"applied from latest Early Gate comment id={selected.comment_id} "
+            f"author={selected.author}"
+        ),
     )
 
 
@@ -343,12 +393,12 @@ def run_early_gate_results(
     state_file: str | None = None,
     trigger_id: str | None = None,
     labels: Sequence[str] | None = None,
-    comment_body: str | None = None,
     publish: bool = False,
     check_name: str = DEFAULT_CHECK_NAME,
     dry_run: bool = False,
     remote: str = "origin",
     head_ref: str | None = None,
+    trusted_authors: frozenset[str] | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     git_runner: Callable[..., str] | None = None,
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
@@ -378,14 +428,12 @@ def run_early_gate_results(
     payload = load_state(state_path)
     previous = str(payload.get("overall-status") or "").strip() or None
 
-    comments: list[dict[str, Any]] = []
-    if comment_body is None or not str(comment_body).strip():
-        comments = list_leader_pr_comments(leader_url, gh_runner=gh_runner)
-
+    # Always reconcile full comment history (wake-up event may be stale).
+    comments = list_leader_pr_comments(leader_url, gh_runner=gh_runner)
     new_overall, reason = decide_overall_from_comments(
         current_overall=previous,
         comments=comments,
-        comment_body=comment_body,
+        trusted_authors=trusted_authors,
     )
 
     if new_overall is None:
@@ -498,14 +546,6 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"Comma-separated Leader labels (or set {ENV_PR_LABELS}).",
     )
     parser.add_argument(
-        "--comment-body",
-        default="",
-        help=(
-            "Optional single comment body (issue_comment event). "
-            "When empty, all Leader comments are listed."
-        ),
-    )
-    parser.add_argument(
         "--publish-state",
         action="store_true",
         help="Commit/push state.json and green the Leader on success|failure.",
@@ -530,6 +570,14 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Leader head branch (optional; fetched from PR when publishing).",
     )
+    parser.add_argument(
+        "--trusted-authors",
+        default="",
+        help=(
+            "Comma-separated GitHub logins allowed to publish EG results "
+            f"(default rhods-ci-bot; or set {ENV_TRUSTED_AUTHORS})."
+        ),
+    )
     return parser
 
 
@@ -546,10 +594,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if not leader_pr_url:
         parser.error(f"--leader-pr-url or {ENV_LEADER_PR_URL} is required")
 
-    comment_body = (args.comment_body or "").strip() or None
-    # Prefer env from Actions when not passed on CLI.
-    if comment_body is None:
-        comment_body = (os.environ.get("GAP_EG_COMMENT_BODY") or "").strip() or None
+    trusted = trusted_early_gate_authors(args.trusted_authors or None)
 
     try:
         result = run_early_gate_results(
@@ -558,12 +603,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             state_file=state_file,
             trigger_id=trigger_id,
             labels=labels,
-            comment_body=comment_body,
             publish=bool(args.publish_state),
             check_name=args.check_name,
             dry_run=bool(args.dry_run),
             remote=args.remote,
             head_ref=(args.head_ref or "").strip() or None,
+            trusted_authors=trusted,
         )
     except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
