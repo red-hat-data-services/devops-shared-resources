@@ -79,9 +79,12 @@ component PR has a final gate status (`success`, `merge-failure`, or
 
 All-success does **not** set `overall-status=success` in this monitor. That final
 value (and Leader green for a successful run) belongs to the Early Gate results
-monitor (future scope). This monitor only hands off via `early-gate-triggered`
-and the `/early-gate` comment. Existing `success` / `failure` in state are never
-overwritten.
+monitor (`scripts/gap_early_gate_results.py`, workflow
+`gap-early-gate-results.yml`). It watches Leader comments for the terminal
+`early-gate-build-complete` / Early Gate passed|failed report, then writes
+`success` or `failure` and greens the Leader. This Stage-1 monitor only hands
+off via `early-gate-triggered` and the `/early-gate` comment. Existing
+`success` / `failure` in state are never overwritten.
 
 With `--publish-state`, ordering is: evaluate children → write `state.json` →
 commit/push → then, when a Leader PR URL is provided
