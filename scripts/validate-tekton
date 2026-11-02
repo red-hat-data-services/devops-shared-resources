@@ -246,6 +246,11 @@ def validate_tekton_dir(
     layout: str = "flat",
     pipeline_dir: Path | None = None,
 ) -> dict:
+    """Validate files against templates, including missing/drifted generated children.
+
+    Generated-child configurations plan expected files without writes and report
+    orphan children as warnings. Other configurations retain ordinary validation.
+    """
     if config is None:
         config = load_config(DEFAULT_CONFIG_DIR)
 

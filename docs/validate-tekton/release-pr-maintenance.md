@@ -38,7 +38,11 @@ generate:
     - [metadata, annotations, pipelinesascode.tekton.dev/on-cel-expression]
 ```
 
-generate requires a parent and string filename/name. It opts the run into
+generate requires a mapping, a parent, and nonempty string filename/name.
+Unknown keys and malformed optional values are rejected, including non-boolean
+git_pipeline_ref and invalid metadata/annotation/spec-field lists or key paths.
+An explicitly empty or null generate value is invalid; omit it to disable generation.
+It opts the run into
 generated-child reconciliation: parents and unknown files are read-only,
 only generated child templates are maintained. Do not combine it with
 unrelated templates that you expect this run to fix. parent_ref is unsupported;

@@ -22,12 +22,14 @@ PAC = "pipelinesascode.tekton.dev/"
 
 
 def write(path, data):
+    """Write one YAML fixture while preserving ordinary mapping/list structure."""
     with path.open("w") as stream:
         YAML().dump(data, stream)
 
 
 @pytest.fixture
 def setup(tmp_path):
+    """Build an isolated release checkout and generated-child template policy."""
     root = tmp_path / "repo"
     directory = root / "pipelineruns/widget/.tekton"
     directory.mkdir(parents=True)
@@ -66,14 +68,17 @@ spec:
 
 
 def validate(root, config, branch="rhoai-3.6"):
+    """Validate the fixture through the public validator without writing files."""
     return vt.validate_tekton_dir(root, branch, None, config=load_config(str(config)), layout="nested")
 
 
 def fix(root, config, branch="rhoai-3.6", dry=False):
+    """Run the public validator's generated-child fix or dry-run path."""
     return vt.fix_tekton_dir(root, branch, None, dry, config=load_config(str(config)), layout="nested")
 
 
 def test_create_check_idempotence_push_unchanged(setup):
+    """Create a missing child, validate it, and prove idempotence and read-only parents."""
     root, directory, config, push, path = setup
     before = path.read_bytes()
     assert any(r["errors"] for r in validate(root, config).values())
@@ -92,6 +97,7 @@ def test_create_check_idempotence_push_unchanged(setup):
 
 
 def test_existing_alias_filename_comment_stale_param_and_orphan(setup):
+    """Reconcile an alias match while retaining its filename/comment and orphan files."""
     root, directory, config, push, _ = setup
     old = copy.deepcopy(push)
     old["metadata"]["name"] = "short-on-pull-request-123"
@@ -112,6 +118,7 @@ def test_existing_alias_filename_comment_stale_param_and_orphan(setup):
 
 @pytest.mark.parametrize("mutation", ["duplicate", "bad-ref", "bad-spec", "collision", "bad-cel", "symlink"])
 def test_failures_write_nothing(setup, mutation):
+    """Reject unsafe or ambiguous input before any PipelineRun is changed."""
     root, directory, config, push, path = setup
     if mutation == "duplicate":
         write(directory / "duplicate.yaml", push)
@@ -134,6 +141,7 @@ def test_failures_write_nothing(setup, mutation):
 
 @pytest.mark.parametrize("branch", ["rhoai-3.6", "rhoai-3.6-ea.2"])
 def test_release_cel_preserves_all_paths_guards(branch):
+    """Convert GA/EA triggers without losing path filters or negative guards."""
     expression = f'event == "push" && target_branch == "{branch}" && "a".pathChanged() && "b".pathChanged() && !("skip".pathChanged()) && ".tekton/old.yaml".pathChanged()'
     result = to_release_pr_cel(expression, branch, "new.yaml")
     assert f'target_branch == "{branch}"' in result
@@ -143,11 +151,13 @@ def test_release_cel_preserves_all_paths_guards(branch):
 
 @pytest.mark.parametrize("expression", ['event == "push" || target_branch == "rhoai-3.6"', 'event == "push" && target_branch.matches(".*")'])
 def test_unsupported_cel(expression):
+    """Reject CEL structures that cannot be converted safely."""
     with pytest.raises(ValidationError):
         to_release_pr_cel(expression, "rhoai-3.6", "x.yaml")
 
 
 def test_public_cli_fix_then_validate_and_drift(setup):
+    """Exercise real CLI creation, independent validation, and stale-param detection."""
     root, directory, config, _, _ = setup
     subprocess.run(["git", "init", "-q", str(root)], check=True)
     command = [sys.executable, str(ROOT / "scripts/validate-tekton"), "--path", str(root),
@@ -168,11 +178,13 @@ def test_public_cli_fix_then_validate_and_drift(setup):
 
 @pytest.mark.parametrize("old_path", ['".tekton/old.yml"', "'.tekton/old.yaml'"])
 def test_release_cel_yaml_extensions_and_quotes(old_path):
+    """Rewrite both YAML extensions and quote styles in PipelineRun path literals."""
     result = to_release_pr_cel(f'event == "push" && target_branch == "rhoai-3.6" && {old_path}.pathChanged()', "rhoai-3.6", "new.yml")
     assert ".tekton/new.yml" in result and "old." not in result
 
 
 def test_pipeline_directory_scope(setup):
+    """Keep invalid files outside the selected repository from affecting its run."""
     root, directory, config, push, _ = setup
     other = root / "pipelineruns/other/.tekton"
     other.mkdir(parents=True)
@@ -188,6 +200,7 @@ def test_pipeline_directory_scope(setup):
 
 
 def test_generate_requires_parent_and_filename(setup):
+    """Require a valid parent relationship and a generated filename pattern."""
     _, _, config, _, _ = setup
     data = YAML(typ="safe").load((config / "config.yaml").read_text())
     del data["templates"][1]["parent"]
@@ -198,4 +211,49 @@ def test_generate_requires_parent_and_filename(setup):
     del data["templates"][1]["generate"]["filename"]
     write(config / "config.yaml", data)
     with pytest.raises(ValueError, match="generate requires filename"):
+        load_config(str(config))
+
+
+@pytest.mark.parametrize("policy", [True, False, None, "enabled", [], ["filename", "name"]])
+def test_generate_rejects_nonmapping_values(setup, policy):
+    """Reject non-mappings, including falsey values, before policy conversion."""
+    _, _, config, _, _ = setup
+    data = YAML(typ="safe").load((config / "config.yaml").read_text())
+    data["templates"][1]["generate"] = policy
+    write(config / "config.yaml", data)
+    with pytest.raises(ValueError, match="generate must be a mapping"):
+        load_config(str(config))
+
+
+@pytest.mark.parametrize("overrides, message", [
+    ({"allowed_spec_field": ["params"]}, "unknown keys"),
+    ({"filename": ""}, "requires filename"),
+    ({"name": "  "}, "requires name"),
+    ({"inherit_metadata": "labels"}, "list of nonempty strings"),
+    ({"preserve_annotations": [123]}, "list of nonempty strings"),
+    ({"allowed_spec_fields": None}, "list of nonempty strings"),
+    ({"git_pipeline_ref": "false"}, "must be a boolean"),
+    ({"required_parent_fields": "metadata.name"}, "string key paths"),
+    ({"required_parent_fields": [[]]}, "string key paths"),
+    ({"required_parent_fields": [["metadata", 123]]}, "string key paths"),
+])
+def test_generate_rejects_unknown_keys_and_wrong_types(setup, overrides, message):
+    """Misspelled or malformed guard settings must not silently weaken policy."""
+    _, directory, config, _, _ = setup
+    data = YAML(typ="safe").load((config / "config.yaml").read_text())
+    data["templates"][1]["generate"].update(overrides)
+    write(config / "config.yaml", data)
+    before = {path.name: path.read_bytes() for path in directory.iterdir()}
+    with pytest.raises(ValueError, match=message):
+        fix(setup[0], config)
+    assert before == {path.name: path.read_bytes() for path in directory.iterdir()}
+
+
+def test_generate_rejects_empty_mapping(setup):
+    """An explicitly empty generation policy is invalid rather than disabled."""
+    _, _, config, _, _ = setup
+    data = YAML(typ="safe").load((config / "config.yaml").read_text())
+    data["templates"][1]["generate"] = {}
+    write(config / "config.yaml", data)
+    with pytest.raises(ValueError, match="requires filename"):
         load_config(str(config))

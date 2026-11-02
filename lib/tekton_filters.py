@@ -467,6 +467,7 @@ def to_release_pr_cel(value, branch, filename):
     from lib.cel import flatten_and
 
     def rewrite_filename(node):
+        """Rewrite quoted PipelineRun YAML paths in the CEL AST in place."""
         if not isinstance(node, Tree):
             return
         if node.data == "literal":
