@@ -457,6 +457,57 @@ def to_pr_cel(value):
     return v.replace('event == "push"', 'event == "pull_request"')
 
 
+@jinja_filter
+def to_release_pr_cel(value, branch, filename):
+    """Convert exact-release push CEL to PR CEL, retaining every other clause."""
+    import json
+    import celpy
+    from celpy.celparser import tree_dump
+    from lark import Token, Tree
+    from lib.cel import flatten_and
+
+    def rewrite_filename(node):
+        if not isinstance(node, Tree):
+            return
+        if node.data == "literal":
+            for index, token in enumerate(node.children):
+                text = str(token)
+                if (isinstance(token, Token) and len(text) > 2
+                        and text[0] in ('\"', "'") and text[-1] == text[0]
+                        and text[1:-1].startswith(".tekton/")
+                        and text[1:-1].endswith((".yaml", ".yml"))):
+                    node.children[index] = Token(token.type, json.dumps(f".tekton/{filename}"))
+        for child in node.children:
+            rewrite_filename(child)
+
+    if not re.fullmatch(r"rhoai-\d+\.\d+(?:-ea\.\d+)?", branch):
+        raise ValidationError("expected a rhoai-x.y[-ea.z] release branch")
+    try:
+        ast = celpy.Environment().compile(str(value))
+        cor = ast.children[0]
+        if cor.data != "conditionalor" or len(cor.children) != 1:
+            raise ValueError("unsupported top-level OR in push CEL")
+        clauses = []
+        events = branches = 0
+        for clause in flatten_and(cor.children[0]):
+            wrapped = Tree("expr", [Tree("conditionalor", [Tree("conditionaland", [clause])])])
+            text = tree_dump(wrapped).strip()
+            if re.fullmatch(r'event\s*==\s*[\"\']push[\"\']', text):
+                events += 1
+            elif re.fullmatch(r'target_branch\s*==\s*[\"\']' + re.escape(branch) + r'[\"\']', text):
+                branches += 1
+            else:
+                if re.search(r'\b(event|target_branch)\b', text):
+                    raise ValueError("unsupported event/branch predicate in push CEL")
+                rewrite_filename(wrapped)
+                clauses.append(tree_dump(wrapped))
+        if events != 1 or branches != 1:
+            raise ValueError("push CEL must select exactly this release and the push event")
+    except Exception as exc:
+        raise ValidationError(f"cannot convert release push CEL: {exc}") from exc
+    return '\n&& '.join(['event == "pull_request"', f'target_branch == {json.dumps(branch)}'] + [f'({c})' for c in clauses])
+
+
 # =============================================================================
 # Internal — filter wrapping and registration
 # =============================================================================

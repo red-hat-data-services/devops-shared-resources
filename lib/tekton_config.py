@@ -44,6 +44,7 @@ class TemplateConfig:
     file: str
     match_fns: list[str]
     parent: ParentConfig | None = None
+    generate: dict | None = None
 
 
 @dataclass
@@ -89,6 +90,12 @@ def _validate_config(config: PipelineConfig):
         if not template_path.exists():
             raise ValueError(f"template '{tmpl.name}': file not found: {template_path}")
 
+        if tmpl.generate:
+            if not tmpl.parent:
+                raise ValueError(f"template '{tmpl.name}': generate requires a parent")
+            for key in ("filename", "name"):
+                if not isinstance(tmpl.generate.get(key), str):
+                    raise ValueError(f"template '{tmpl.name}': generate requires {key}")
         if tmpl.parent:
             if tmpl.parent.template not in template_names:
                 raise ValueError(
@@ -148,6 +155,7 @@ def load_config(config_dir: str, config_file: str | None = None) -> PipelineConf
             file=str(entry["file"]),
             match_fns=_normalize_match_fn(entry["match_fn"]),
             parent=parent,
+            generate=dict(entry["generate"]) if entry.get("generate") else None,
         ))
 
     aliases = dict(raw.get("component_aliases", {})) if raw.get("component_aliases") else None

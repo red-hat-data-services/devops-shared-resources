@@ -22,6 +22,7 @@ _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
 from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
 from lib.tekton_config import load_config
+from lib.tekton_children import plan_children
 from lib.tekton_filters import DELETE_FILE_PREFIX
 from lib.tekton_matchers import make_parent_matchers
 
@@ -100,6 +101,10 @@ def _load_pipelines(
     yaml_errors = {}
     skipped_ns = 0
     for filepath in _glob_tekton_files(tekton_dir, layout, pipeline_dir):
+        if config and any(t.generate for t in config.templates):
+            if filepath.is_symlink() or not filepath.resolve().is_relative_to(tekton_dir.resolve()):
+                yaml_errors[filepath] = "symlink or escaped PipelineRun path"
+                continue
         try:
             with open(filepath) as f:
                 data = ruamel.load(f)
@@ -260,6 +265,25 @@ def validate_tekton_dir(
             tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
         )
 
+    if any(t.generate for t in config.templates):
+        results = {str(p): {"errors": [message], "warnings": []} for p, message in yaml_errors.items()}
+        if results:
+            return results
+        if external_parent_indexes is not None:
+            raise ValueError("generated children require working-tree parents, not parent_ref")
+        try:
+            expected, orphans = plan_children(pipelines, config, branch, cli_vars)
+        except ValueError as exc:
+            return {"generation": {"errors": [str(exc)], "warnings": []}}
+        for path, data in expected.items():
+            results[str(path)] = {
+                "errors": [] if pipelines.get(path) == data else ["generated child missing or differs from parent/template"],
+                "warnings": [],
+            }
+        for path in orphans:
+            results[str(path)] = {"errors": [], "warnings": ["orphan child: no matching parent; left unchanged"]}
+        return results
+
     # Use external parent indexes if provided (cross-branch parenting)
     if external_parent_indexes is not None:
         parent_indexes = external_parent_indexes
@@ -388,9 +412,28 @@ def fix_tekton_dir(
     ruamel.preserve_quotes = True
     ruamel.width = 4096
 
-    pipelines, parent_indexes, _, _ = _load_pipelines(
+    pipelines, parent_indexes, yaml_errors, _ = _load_pipelines(
         tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
     )
+
+    if any(t.generate for t in config.templates):
+        if yaml_errors or external_parent_indexes is not None:
+            return [], {str(path): data for path, data in pipelines.items()}
+        try:
+            expected, _ = plan_children(pipelines, config, branch, cli_vars)
+        except ValueError as exc:
+            warn(str(exc))
+            return [], {str(path): data for path, data in pipelines.items()}
+        fixed = []
+        for path, data in expected.items():
+            if pipelines.get(path) != data:
+                if not dry_run:
+                    with open(path, "w") as stream:
+                        ruamel.dump(data, stream)
+                info(f"  {path}: {'would generate' if dry_run else 'generated'} via template")
+                fixed.append(str(path))
+            pipelines[path] = data
+        return fixed, {str(path): data for path, data in pipelines.items()}
 
     # Use external parent indexes if provided (cross-branch parenting)
     if external_parent_indexes is not None:
