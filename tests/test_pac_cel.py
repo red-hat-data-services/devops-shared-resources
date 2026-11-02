@@ -2,13 +2,15 @@
 from __future__ import annotations
 
 import subprocess
+from dataclasses import replace
 from unittest.mock import patch
 
 import pytest
 
 from lib.pac_cel import TriggerParseError, evaluate_expressions
 from lib.gap_check_selection import (
-    PullRequestContext, cel_matches, fetch_file_collections, select_build_checks,
+    PullRequestContext, cel_matches, fetch_file_collections, pipeline_is_expected,
+    select_build_checks,
 )
 
 
@@ -57,6 +59,92 @@ def test_real_evaluation_and_missing_facts(pac_cel_binary):
             cel_matches(expression, context())
     with pytest.raises(TriggerParseError):
         cel_matches('"not boolean"', context())
+
+
+# Trigger expressions captured from GAP Leader #64's child PRs. Keep these
+# self-contained: regression tests must not depend on GitHub or /tmp evidence.
+_RELEASE_PUSH = (
+    'event == "push" && '
+    'target_branch.matches("^rhoai-[A-Za-z0-9_][A-Za-z0-9_.-]{0,40}$") && '
+    '!(target_branch in ["rhoai-3.5", "rhoai-3.6-ea.1", "rhoai-3.6-ea.2"])'
+)
+_DISABLED_DASHBOARD_PUSH = """false && event == "push"
+&& target_branch == "main"
+&& ( "dashboard-operator/test/e2e/**".pathChanged()
+      || "dashboard-operator/api/**".pathChanged()
+      || "dashboard-operator/go.mod".pathChanged()
+      || "dashboard-operator/go.sum".pathChanged()
+      || "dashboard-operator/Dockerfile.e2e".pathChanged()
+      || "dashboard-operator/Dockerfile.e2e.dockerignore".pathChanged()
+      || ".tekton/odh-dashboard-operator-e2e-push.yaml".pathChanged() )
+"""
+
+
+@pytest.mark.parametrize("base_ref", ["stable", "rhoai-3.7", "v1.2.3"])
+@pytest.mark.parametrize("name, expression, expected", [
+    pytest.param(
+        "odh-llm-d-kv-pvc-evictor-on-tag",
+        'event == "push" && target_branch.startsWith("v")', False,
+        id="kv-cache-tag",
+    ),
+    pytest.param(
+        "odh-mcp-lifecycle-module-operator-on-release-push",
+        _RELEASE_PUSH, False, id="mcp-release-push",
+    ),
+    pytest.param(
+        "odh-mcp-lifecycle-module-operator-e2e-on-release-push",
+        _RELEASE_PUSH, False, id="mcp-e2e-release-push",
+    ),
+    pytest.param(
+        "odh-dashboard-operator-e2e-on-push",
+        _DISABLED_DASHBOARD_PUSH, False, id="disabled-dashboard-push",
+    ),
+    pytest.param(
+        "mixed-on-push",
+        '(event == "push" && target_branch.startsWith("v")) || event == "pull_request"',
+        True, id="mixed-push-pr",
+    ),
+    pytest.param(
+        "mixed-on-tag",
+        'event == "pull_request" || (event == "push" && target_branch.startsWith("v"))',
+        True, id="mixed-pr-push",
+    ),
+])
+def test_real_push_tag_triggers_during_pr_evaluation(
+    pac_cel_binary, caplog, base_ref, name, expression, expected,
+):
+    import yaml
+
+    pr = replace(context(), base_ref=base_ref)
+    pipeline = {
+        "kind": "PipelineRun",
+        "metadata": {
+            "name": name,
+            "labels": {"appstudio.openshift.io/component": "test-component"},
+            "annotations": {"pipelinesascode.tekton.dev/on-cel-expression": expression},
+        },
+    }
+    assert cel_matches(expression, pr) is expected
+    assert pipeline_is_expected(pipeline, pr) is expected
+    checks = select_build_checks([yaml.safe_dump(pipeline)], pr, app_slug="konflux")
+    assert [check.name_suffix for check in checks] == ([name] if expected else [])
+    # A false result must come from CEL, not a conservative parse-error fallback.
+    assert "retaining expected check" not in caplog.text
+
+
+def test_unavailable_webhook_facts_retain_pr_build(pac_cel_binary, caplog):
+    expression = 'body.repository.full_name == "some/repo"'
+    with pytest.raises(TriggerParseError):
+        cel_matches(expression, context())
+    pipeline = {
+        "kind": "PipelineRun",
+        "metadata": {
+            "name": "unknown-webhook-pr",
+            "annotations": {"pipelinesascode.tekton.dev/on-cel-expression": expression},
+        },
+    }
+    assert pipeline_is_expected(pipeline, context()) is True
+    assert "retaining expected check" in caplog.text
 
 
 def test_batch_once(pac_cel_binary):

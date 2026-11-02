@@ -14,6 +14,11 @@ func TestEvaluate(t *testing.T) {
 		wantError  bool
 	}{
 		{expression: `event == "pull_request" && source_branch.startsWith("feature/")`, want: true},
+		{expression: `event == "push" && target_branch.startsWith("v")`},
+		{expression: `event == "push" && target_branch.matches("^rhoai-[A-Za-z0-9_][A-Za-z0-9_.-]{0,40}$") && !(target_branch in ["rhoai-3.5", "rhoai-3.6-ea.1", "rhoai-3.6-ea.2"])`},
+		{expression: `false && event == "push" && "dashboard-operator/**".pathChanged()`},
+		{expression: `(event == "push" && target_branch.startsWith("v")) || event == "pull_request"`, want: true},
+		{expression: `event == "pull_request" || (event == "push" && target_branch.startsWith("v"))`, want: true},
 		{expression: `target_branch != "main"`, want: true},
 		{expression: `files.all.exists(p, p.endsWith(".go"))`, want: true},
 		{expression: `files.all.filter(p, p.endsWith(".go")).size() == 1`, want: true},
