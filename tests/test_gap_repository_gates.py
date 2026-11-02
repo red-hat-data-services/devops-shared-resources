@@ -12,6 +12,7 @@ from lib.gap_check_selection import (
     FEASIBILITY_SETUP_JOB,
     FeasibilityRun,
     PullRequestContext,
+    TriggerParseError,
     WorkflowJob,
     cel_matches,
     fetch_feasibility_run,
@@ -486,6 +487,9 @@ class _GitHub:
                 }
             )
         endpoint = args[1]
+        if "component_repo_map.json" in endpoint:
+            mapping = {"eval-hub": {"odh-eval-hub": "rhoai/eval", "odh-core-bff": "rhoai/bff"}}
+            return json.dumps({"encoding": "base64", "content": base64.b64encode(json.dumps(mapping).encode()).decode()})
         if "check-runs" in endpoint:
             if self.fail_checks:
                 raise GhCommandError(["gh", *args], 1, "check API unavailable")
@@ -1405,3 +1409,94 @@ def test_current_head_is_published_and_an_unchanged_status_is_skipped(tmp_path: 
     assert second.skipped_urls == [URL]
     assert second.updated_urls == []
     assert len(posts) == 1
+
+
+@pytest.mark.parametrize("status, conclusion", [("completed", "failure"), ("queued", None), ("missing", None)])
+def test_unmapped_build_does_not_fail_or_block_gap(tmp_path, caplog, status, conclusion):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    github.tekton["unrelated.yaml"] = SECOND_PIPELINE.replace("odh-core-bff", "unmapped-component")
+    github.check_runs.append(_build_check("unmapped-component-on-pull-request-20", conclusion, status=status))
+    if status == "missing":
+        github.check_runs.pop()
+    result, _ = _run(_state(tmp_path), github)
+    assert result.success_urls == [URL]
+    assert result.build_failure_urls == []
+    assert "Ignoring Konflux build" in caplog.text
+
+
+def test_mapped_build_failure_still_blocks_gap(tmp_path):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    github.check_runs = [run for run in github.check_runs if run["app"]["slug"] != "konflux-internal-p02"]
+    github.check_runs.append(_build_check("odh-eval-hub-on-pull-request-65317", "failure"))
+    result, _ = _run(_state(tmp_path), github)
+    assert result.build_failure_urls == [URL]
+
+
+def test_component_from_other_repository_is_ignored(tmp_path):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    def runner(args):
+        if "component_repo_map.json" in args[-1]:
+            mapping = {"eval-hub": {}, "other": {"odh-eval-hub": "rhoai/eval"}}
+            return json.dumps({"encoding": "base64", "content": base64.b64encode(json.dumps(mapping).encode()).decode()})
+        return github(args)
+    github.check_runs.append(_build_check("odh-eval-hub-on-pull-request-65317", "failure", run_id=999))
+    result, _ = _run(_state(tmp_path), runner)
+    assert result.success_urls == [URL]
+
+
+def test_mapping_is_fetched_once_for_multiple_children(tmp_path):
+    path = _state(tmp_path)
+    data = _saved(path)
+    data["pull-requests"].append({**data["pull-requests"][0], "pr-url": URL.replace("/20", "/21")})
+    path.write_text(json.dumps(data))
+    github = _GitHub()
+    calls = []
+    def runner(args):
+        if "component_repo_map.json" in args[-1]:
+            calls.append(args)
+        return github(args)
+    _run(path, runner)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("response", ["not json", "{}", None])
+def test_mapping_failure_leaves_state_and_statuses_untouched(tmp_path, response):
+    from scripts.gap_pr_monitor import GapPrMonitorError
+    path = _state(tmp_path)
+    before = path.read_bytes()
+    def runner(args):
+        if response is None:
+            raise GhCommandError(["gh", *args], 1, "unavailable")
+        return response
+    def factory(**kwargs):
+        pytest.fail("must not create a status updater when mapping retrieval fails")
+    with pytest.raises(GapPrMonitorError, match="component repository mapping"):
+        run_monitor(path, gh_runner=runner, updater_factory=factory, now=NOW)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("label", ["", "    appstudio.openshift.io/component: null", '    appstudio.openshift.io/component: ""', '    appstudio.openshift.io/component: "   "', "    appstudio.openshift.io/component: 123"])
+@pytest.mark.parametrize("allowed", [None, frozenset(), frozenset({"odh-core-bff"})])
+def test_selected_pipeline_requires_component_label(label, allowed):
+    document = SECOND_PIPELINE.replace("    appstudio.openshift.io/component: odh-core-bff", label)
+    with pytest.raises(TriggerParseError, match="nonempty appstudio.openshift.io/component label"):
+        select_build_checks([document], _context(), app_slug="konflux-internal-p02", allowed_components=allowed)
+
+
+def test_missing_component_label_cannot_pass_gap(tmp_path):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    github.tekton["unlabeled.yaml"] = SECOND_PIPELINE.replace("    appstudio.openshift.io/component: odh-core-bff", "")
+    result, _ = _run(_state(tmp_path), github)
+    assert result.pending_urls == [URL]
+    assert result.success_urls == []
+    assert result.overall_status is None
+    assert any("nonempty appstudio.openshift.io/component label" in report for report in result.reports)
+
+
+def test_unselected_pipeline_does_not_require_component_label():
+    document = LABEL_PIPELINE.replace("    appstudio.openshift.io/component: manual-component", "")
+    assert select_build_checks([document], _context(), app_slug="konflux-internal-p02", allowed_components=frozenset()) == []

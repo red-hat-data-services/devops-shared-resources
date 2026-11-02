@@ -59,7 +59,6 @@ from scripts.gap_pr_monitor import (
 )
 
 
-
 @pytest.fixture(autouse=True)
 def history_merge_boundary(monkeypatch):
     # Coordinator tests already fake GitHub statuses and publication. Keep the
@@ -69,6 +68,12 @@ def history_merge_boundary(monkeypatch):
     operation = Mock()
     monkeypatch.setattr("scripts.gap_pr_monitor.prepare_leader_history_merge", operation)
     return operation
+
+
+@pytest.fixture(autouse=True)
+def component_mapping(monkeypatch):
+    # These tests stub repository decisions; mapping behavior is tested separately.
+    monkeypatch.setattr("scripts.gap_pr_monitor.fetch_component_repo_map", lambda runner: {})
 
 
 def _fake_child_monitor(

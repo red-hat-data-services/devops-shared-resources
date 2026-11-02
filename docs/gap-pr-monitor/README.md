@@ -8,6 +8,22 @@ Stage 2 requires two gates before a repository PR can pass:
 - every component build selected from that repository's `.tekton` PipelineRuns
 - every job in the main-to-release feasibility workflow
 
+Component builds are restricted to the repository-scoped allowlist in
+[component_repo_map.json](https://github.com/red-hat-data-services/konflux-central/blob/main/config/component_repo_map.json).
+The monitor fetches one validated snapshot from `main` per Leader evaluation,
+including any head-change recheck. A fetch or validation error stops evaluation
+before state or commit statuses are updated.
+
+Only components listed under the child PR's exact repository name are gated;
+a missing repository entry means no allowed components (repository aliases are
+not inferred). PipelineRun component labels match exact mapping keys or numeric
+release variants such as `odh-eval-hub-v3-6` for `odh-eval-hub`. Every selected
+PipelineRun must have a nonempty `appstudio.openshift.io/component` label;
+a missing or invalid label is a configuration error, not an ignored build.
+Component names are never inferred from PipelineRun names. Unmapped builds are logged and ignored,
+including failed, pending, or missing checks. Mapped builds still have to pass;
+feasibility and merge-conflict checks are unaffected.
+
 Both gates use the same check-run retrieval and conclusion rules. A query
 error, or any completed conclusion other than `success`, does not pass.
 Unresolved feasibility checks fail six hours after the head commit's committer

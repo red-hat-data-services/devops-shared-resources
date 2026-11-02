@@ -42,6 +42,8 @@ def test_helper_failure_retains_expected_check(caplog):
 kind: PipelineRun
 metadata:
   name: component-pr
+  labels:
+    appstudio.openshift.io/component: component
   annotations:
     pipelinesascode.tekton.dev/on-cel-expression: 'false'
 """
@@ -152,6 +154,8 @@ def test_batch_once(pac_cel_binary):
         f"""kind: PipelineRun
 metadata:
   name: component-{index}
+  labels:
+    appstudio.openshift.io/component: component-{index}
   annotations:
     pipelinesascode.tekton.dev/on-cel-expression: '{expression}'
 """ for index, expression in enumerate(["true", "false", "true"])

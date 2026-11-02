@@ -95,6 +95,7 @@ def decide_repository_pr(
     now: datetime,
     build_app_slug: str,
     build_app_id: int | None = None,
+    allowed_components: frozenset[str] | None = None,
 ) -> RepositoryGateDecision:
     """Decide the repository PR from mergeability, builds, and feasibility."""
     if pull_request.state == "MERGED":
@@ -134,6 +135,7 @@ def decide_repository_pr(
         deadline=deadline,
         app_slug=build_app_slug,
         app_id=build_app_id,
+        allowed_components=allowed_components,
     )
     feasibility_gate = _evaluate_feasibility(
         feasibility,
@@ -156,6 +158,7 @@ def _evaluate_builds(
     deadline: datetime,
     app_slug: str,
     app_id: int | None,
+    allowed_components: frozenset[str] | None,
 ) -> GateResult:
     if check_query_error or tekton_error:
         return evaluate_checks(
@@ -184,6 +187,7 @@ def _evaluate_builds(
             ),
             app_slug=app_slug,
             app_id=app_id,
+            allowed_components=allowed_components,
         )
     except TriggerParseError as exc:
         return evaluate_checks(

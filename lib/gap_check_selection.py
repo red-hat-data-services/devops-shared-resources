@@ -27,6 +27,7 @@ from lib.github_check_runs import (
 )
 from lib.github_cli import GhCommandError
 from lib.github_diff import fetch_comparison_files
+from lib.gap_component_map import component_is_allowed
 
 PAC_PREFIX = "pipelinesascode.tekton.dev/"
 COMPONENT_LABEL = "appstudio.openshift.io/component"
@@ -150,12 +151,16 @@ def select_build_checks(
     *,
     app_slug: str,
     app_id: int | None = None,
+    allowed_components: frozenset[str] | None = None,
 ) -> list[ExpectedCheck]:
     """Return one expected check per PipelineRun this pull request will run.
 
     A repository with several components produces several checks. Pipelines
-    that the trigger configuration will not run are omitted. That omission is
-    the only no-build signal; a missing GitHub check is not.
+    that the trigger configuration will not run or the repository allowlist
+    excludes are omitted. A missing GitHub check is never a no-build signal.
+    None preserves unfiltered selection for callers without an allowlist;
+    the GAP monitor always supplies a repository-scoped set. Every selected
+    PipelineRun must declare a nonempty component label; names are not inferred.
     """
     checks: list[ExpectedCheck] = []
     pipelines = load_pipelineruns(documents)
@@ -182,7 +187,18 @@ def select_build_checks(
         # name still comes from metadata.name.
         pipeline_name = resolved_pipeline_name(raw_name, context.number)
         labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
-        component = str(labels.get(COMPONENT_LABEL) or pipeline_name).strip() or pipeline_name
+        component = labels.get(COMPONENT_LABEL)
+        if not isinstance(component, str) or not component.strip():
+            raise TriggerParseError(
+                f"PipelineRun {pipeline_name} is missing a nonempty {COMPONENT_LABEL} label"
+            )
+        component = component.strip()
+        if allowed_components is not None and not component_is_allowed(component, allowed_components):
+            logging.getLogger(__name__).warning(
+                "Ignoring Konflux build %s (component %s): not mapped for this repository",
+                pipeline_name, component,
+            )
+            continue
         checks.append(
             ExpectedCheck(
                 key=component,

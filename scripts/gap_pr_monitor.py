@@ -53,6 +53,7 @@ from lib.gap_check_selection import (
     fetch_feasibility_run,
     fetch_tekton_documents,
 )
+from lib.gap_component_map import fetch_component_repo_map, repository_components
 from lib.gap_pr_gates import (
     PR_STATUS_BUILD_FAILURE,
     PR_STATUS_BUILD_PENDING,
@@ -1618,6 +1619,10 @@ def run_monitor(
             build_app_id = env_app_id
     moment = now or datetime.now().astimezone()
     runner = gh_runner or _run_gh
+    try:
+        component_repo_map = fetch_component_repo_map(runner)
+    except (GhCommandError, CheckQueryError) as exc:
+        raise GapPrMonitorError(f"Could not load component repository mapping: {exc}") from exc
     factory = updater_factory or PRStatusUpdater
     updater = factory(check_name=check_name, dry_run=dry_run)
 
@@ -1633,6 +1638,7 @@ def run_monitor(
                     build_app_slug=build_app_slug,
                     build_app_id=build_app_id,
                     retry_unknown=gh_runner is None,
+                    component_repo_map=component_repo_map,
                 )
             )
         except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
@@ -1654,6 +1660,7 @@ def run_monitor(
         build_app_slug=build_app_slug,
         build_app_id=build_app_id,
         retry_unknown=gh_runner is None,
+        component_repo_map=component_repo_map,
     )
 
 
@@ -1665,6 +1672,7 @@ def _decide_url(
     build_app_slug: str,
     build_app_id: int | None,
     retry_unknown: bool,
+    component_repo_map: dict[str, frozenset[str]],
 ) -> RepositoryGateDecision:
     pull_request = fetch_repository_pull_request(
         url, gh_runner=runner, retry_unknown=retry_unknown
@@ -1737,6 +1745,7 @@ def _decide_url(
         now=now,
         build_app_slug=build_app_slug,
         build_app_id=build_app_id,
+        allowed_components=repository_components(component_repo_map, pull_request.repo),
     )
 
 
@@ -1767,6 +1776,7 @@ def _publish_gate_decision(
     build_app_slug: str,
     build_app_id: int | None,
     retry_unknown: bool,
+    component_repo_map: dict[str, frozenset[str]],
     batch_concluded: bool,
     overall_status: str | None,
 ) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
@@ -1795,6 +1805,7 @@ def _publish_gate_decision(
         build_app_slug=build_app_slug,
         build_app_id=build_app_id,
         retry_unknown=retry_unknown,
+        component_repo_map=component_repo_map,
     )
     if fresh.skip_status_post:
         return fresh, None
@@ -1825,6 +1836,7 @@ def _publish_decisions(
     build_app_slug: str,
     build_app_id: int | None,
     retry_unknown: bool,
+    component_repo_map: dict[str, frozenset[str]],
 ) -> MonitorResult:
     status_updates: dict[str, str] = {}
     updated: list[str] = []
@@ -1852,6 +1864,7 @@ def _publish_decisions(
                 build_app_slug=build_app_slug,
                 build_app_id=build_app_id,
                 retry_unknown=retry_unknown,
+                component_repo_map=component_repo_map,
                 batch_concluded=batch_concluded,
                 overall_status=overall_status,
             )
