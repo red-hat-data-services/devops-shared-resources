@@ -78,7 +78,8 @@ def _validate_generate(policy, template_name):
     """Reject malformed generation policy instead of silently disabling guards.
 
     Optional sequence settings require lists of strings; required parent fields
-    are nonempty key paths. Reject unknown keys to catch misspelled safety rules.
+    are nonempty key paths. Reject unknown keys to catch misspelled safety rules,
+    and reserve metadata.name for the configured child identity.
     """
     prefix = f"template '{template_name}': generate"
     if not isinstance(policy, Mapping):
@@ -98,6 +99,8 @@ def _validate_generate(policy, template_name):
             value = policy[key]
             if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
                 raise ValueError(f"{prefix}.{key} must be a list of nonempty strings")
+    if "name" in policy.get("inherit_metadata", []):
+        raise ValueError(f"{prefix}.inherit_metadata must not include 'name'; use generate.name for child identity")
     if "git_pipeline_ref" in policy and not isinstance(policy["git_pipeline_ref"], bool):
         raise ValueError(f"{prefix}.git_pipeline_ref must be a boolean")
     if "required_parent_fields" in policy:

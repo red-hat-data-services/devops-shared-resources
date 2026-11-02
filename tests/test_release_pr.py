@@ -230,6 +230,8 @@ def test_generate_rejects_nonmapping_values(setup, policy):
     ({"filename": ""}, "requires filename"),
     ({"name": "  "}, "requires name"),
     ({"inherit_metadata": "labels"}, "list of nonempty strings"),
+    ({"inherit_metadata": ["name"]}, "inherit_metadata must not include 'name'"),
+    ({"inherit_metadata": ["labels", "name", "namespace"]}, "inherit_metadata must not include 'name'"),
     ({"preserve_annotations": [123]}, "list of nonempty strings"),
     ({"allowed_spec_fields": None}, "list of nonempty strings"),
     ({"git_pipeline_ref": "false"}, "must be a boolean"),
@@ -247,6 +249,25 @@ def test_generate_rejects_unknown_keys_and_wrong_types(setup, overrides, message
     with pytest.raises(ValueError, match=message):
         fix(setup[0], config)
     assert before == {path.name: path.read_bytes() for path in directory.iterdir()}
+
+
+def test_generate_allows_other_metadata_without_changing_child_name(setup):
+    """Inherit release labels/namespace without replacing the configured child name."""
+    root, directory, config, push, path = setup
+    push["metadata"]["namespace"] = "release-tenant"
+    write(path, push)
+    data = YAML(typ="safe").load((config / "config.yaml").read_text())
+    policy = data["templates"][1]["generate"]
+    policy["inherit_metadata"] = ["labels", "namespace"]
+    # 'name' is reserved only for inherited metadata, not these string lists.
+    policy["preserve_annotations"] = ["name"]
+    policy["allowed_spec_fields"].append("name")
+    write(config / "config.yaml", data)
+    assert fix(root, config)[0]
+    child = YAML(typ="safe").load((directory / "widget-pull-request.yaml").read_text())
+    assert child["metadata"]["name"] == "widget-on-pull-request"
+    assert child["metadata"]["labels"] == push["metadata"]["labels"]
+    assert child["metadata"]["namespace"] == "release-tenant"
 
 
 def test_generate_rejects_empty_mapping(setup):
