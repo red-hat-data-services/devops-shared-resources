@@ -1579,8 +1579,11 @@ def _decide_url(
         )
     else:
         try:
+            if not pull_request.base_sha:
+                raise CheckQueryError("PR snapshot has no pinned base SHA")
             file_collections = fetch_file_collections(
-                pull_request.owner, pull_request.repo, pull_request.number, runner
+                pull_request.owner, pull_request.repo, pull_request.number, runner,
+                base_sha=pull_request.base_sha, head_sha=pull_request.head_sha,
             )
             pull_request = replace(
                 pull_request,

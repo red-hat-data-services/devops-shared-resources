@@ -26,6 +26,7 @@ from lib.github_check_runs import (
     github_api_json,
 )
 from lib.github_cli import GhCommandError
+from lib.github_diff import fetch_comparison_files
 
 PAC_PREFIX = "pipelinesascode.tekton.dev/"
 COMPONENT_LABEL = "appstudio.openshift.io/component"
@@ -279,8 +280,11 @@ def fetch_changed_files(owner: str, repo: str, number: int, runner: GhRunner) ->
 
 def fetch_file_collections(
     owner: str, repo: str, number: int, runner: GhRunner,
+    *, base_sha: str | None = None, head_sha: str | None = None,
 ) -> dict[str, tuple[str, ...]]:
-    """Retain GitHub statuses using the same collections as PaC's provider."""
+    """Collect file statuses; pinned snapshots never use the live PR endpoint."""
+    if base_sha is not None or head_sha is not None:
+        return fetch_comparison_files(owner, repo, base_sha, head_sha, runner)
     endpoint = f"repos/{owner}/{repo}/pulls/{number}/files"
     try:
         payload = collect_github_pages(runner, endpoint, None, 100)

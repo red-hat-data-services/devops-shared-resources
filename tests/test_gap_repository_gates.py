@@ -425,6 +425,21 @@ class _Updater:
         )
 
 
+def test_missing_base_sha_is_unresolved_not_live_pr_files(tmp_path):
+    github = _GitHub()
+    def runner(args):
+        raw = github(args)
+        if args[0] == "pr":
+            data = json.loads(raw)
+            data.pop("baseRefOid", None)
+            return json.dumps(data)
+        return raw
+    result, _ = _run(_state(tmp_path), runner)
+    assert result.pending_urls == [URL]
+    assert result.success_urls == []
+    assert any("no pinned base SHA" in report for report in result.reports)
+
+
 class _GitHub:
     def __init__(self) -> None:
         self.files = ["README.md"]
@@ -488,8 +503,15 @@ class _GitHub:
                     },
                 }
             )
+        if "/compare/" in endpoint:
+            assert f"{OTHER_SHA}...{self.head_sha}" in endpoint
+            return json.dumps({
+                "base_commit": {"sha": OTHER_SHA},
+                "merge_base_commit": {"sha": OTHER_SHA},
+                "files": [{"filename": name, "status": "modified"} for name in self.files],
+            })
         if "/pulls/" in endpoint and "/files" in endpoint:
-            return json.dumps([{"filename": name} for name in self.files])
+            raise AssertionError("pinned monitor must not query live PR files")
         if "contents/.tekton/" in endpoint:
             name = endpoint.split("contents/.tekton/", 1)[1].split("?", 1)[0]
             text = self.tekton[name]
