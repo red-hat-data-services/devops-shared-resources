@@ -24,7 +24,7 @@ from lib.gap_pr_gates import decide_repository_pr, RepositoryPullRequest
 from lib.github_check_runs import CheckRun, evaluate_checks, revision_deadline
 from lib.github_cli import GhCommandError
 from lib.pr_status_updater import PRStatusUpdater, PullRequestRef, StatusUpdateResult
-from scripts.gap_pr_monitor import run_monitor
+from scripts.gap_pr_monitor import WAITING_FOR_EARLY_GATE_DESCRIPTION, run_monitor
 
 pytestmark = pytest.mark.usefixtures("pac_cel_binary")
 
@@ -694,10 +694,13 @@ def test_all_current_checks_pass_and_preserve_image_uri(tmp_path: Path) -> None:
     path = _state(tmp_path)
     result, updater = _run(path, github)
     assert result.success_urls == [URL]
-    assert updater.posts[0][1] == "success"
+    assert result.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
     assert updater.posts[0][2]["head_sha"] == SHA
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
     saved = _saved(path)
     assert saved["pull-requests"][0]["pr-status"] == "success"
+    assert saved["overall-status"] == "early-gate-triggered"
     assert saved["pull-requests"][0]["builds"] == [
         {"component": "existing", "image": "quay.io/example/existing:1"}
     ]
@@ -714,7 +717,9 @@ def test_bare_feasibility_job_names_pass(tmp_path: Path) -> None:
     path = _state(tmp_path, builds=[])
     result, updater = _run(path, github)
     assert result.success_urls == [URL]
-    assert updater.posts[0][1] == "success"
+    assert result.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
 
 
 def test_mixed_component_results_fail_the_repository(tmp_path: Path) -> None:
@@ -769,7 +774,9 @@ def test_unfinished_build_stays_pending_past_the_revision_deadline(tmp_path: Pat
     passed, updater = _run(path, github, now=COMMITTER + timedelta(hours=7))
     assert passed.success_urls == [URL]
     assert passed.build_failure_urls == []
-    assert updater.posts[0][1] == "success"
+    assert passed.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
     assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
 
 
@@ -893,7 +900,9 @@ def test_undiscovered_feasibility_workflow_stays_unresolved_until_jobs_are_known
     ]
     passed, updater = _run(path, github)
     assert passed.success_urls == [URL]
-    assert updater.posts[0][1] == "success"
+    assert passed.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
     assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
 
 
@@ -995,7 +1004,10 @@ def test_no_build_change_still_requires_feasibility(tmp_path: Path) -> None:
     path = _state(tmp_path, builds=[])
     result, updater = _run(path, github)
     assert result.success_urls == [URL]
-    assert "no component builds expected" in updater.posts[0][2]["description"]
+    assert result.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
+    assert any("no component builds expected" in line for line in result.reports)
 
     github.jobs[1] = _job("main-release-feasibility (rhoai-2.25)", "failure")
     github.check_runs = [*_feasibility_success_payloads()]
@@ -1373,11 +1385,13 @@ def test_current_head_is_published_and_an_unchanged_status_is_skipped(tmp_path: 
         build_app_id=906404,
     )
     assert first.success_urls == [URL]
+    assert first.overall_status == "early-gate-triggered"
     assert first.updated_urls == [URL]
     assert len(posts) == 1
     posted = " ".join(posts[0])
     assert f"statuses/{SHA}" in posted
-    assert "state=success" in posted
+    assert "state=pending" in posted
+    assert "waiting for Early Gate" in posted
 
     second = run_monitor(
         path,
