@@ -249,7 +249,8 @@ def validate_tekton_dir(
     """Validate files against templates, including missing/drifted generated children.
 
     Generated-child configurations plan expected files without writes and report
-    orphan children as warnings. Other configurations retain ordinary validation.
+    orphan children as warnings. Ordinary templates are validated too, even when
+    generation mode keeps their files read-only.
     """
     if config is None:
         config = load_config(DEFAULT_CONFIG_DIR)
@@ -270,32 +271,37 @@ def validate_tekton_dir(
             tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
         )
 
-    if any(t.generate for t in config.templates):
-        results = {str(p): {"errors": [message], "warnings": []} for p, message in yaml_errors.items()}
-        if results:
-            return results
+    generation_mode = any(t.generate for t in config.templates)
+    results = {}
+
+    def result_key(path):
+        """Keep full paths in mixed generation runs to avoid basename collisions."""
+        return str(path) if generation_mode else path.name
+
+    if generation_mode:
         if external_parent_indexes is not None:
             raise ValueError("generated children require working-tree parents, not parent_ref")
-        try:
-            expected, orphans = plan_children(pipelines, config, branch, cli_vars)
-        except ValueError as exc:
-            return {"generation": {"errors": [str(exc)], "warnings": []}}
-        for path, data in expected.items():
-            results[str(path)] = {
-                "errors": [] if pipelines.get(path) == data else ["generated child missing or differs from parent/template"],
-                "warnings": [],
-            }
-        for path in orphans:
-            results[str(path)] = {"errors": [], "warnings": ["orphan child: no matching parent; left unchanged"]}
-        return results
+        if not yaml_errors:
+            try:
+                expected, orphans = plan_children(pipelines, config, branch, cli_vars)
+            except ValueError as exc:
+                results["generation"] = {"errors": [str(exc)], "warnings": []}
+            else:
+                for path, data in expected.items():
+                    results[str(path)] = {
+                        "errors": [] if pipelines.get(path) == data else ["generated child missing or differs from parent/template"],
+                        "warnings": [],
+                    }
+                for path in orphans:
+                    results[str(path)] = {"errors": [], "warnings": ["orphan child: no matching parent; left unchanged"]}
+        # Continue with ordinary template validation; generation only controls writes.
 
     # Use external parent indexes if provided (cross-branch parenting)
     if external_parent_indexes is not None:
         parent_indexes = external_parent_indexes
 
-    results = {}
     for filepath, msg in sorted(yaml_errors.items()):
-        results[filepath.name] = {"errors": [msg], "warnings": []}
+        results[result_key(filepath)] = {"errors": [msg], "warnings": []}
 
     for filepath, data in sorted(pipelines.items()):
         pipeline_type = classify_pipeline(filepath.name, data, config=config)
@@ -303,6 +309,9 @@ def validate_tekton_dir(
         if not tmpl_config:
             log(f"  {filepath.name}: unknown pipeline type '{pipeline_type}', skipping")
             continue
+
+        if tmpl_config.generate:
+            continue  # Already reconciled above, including orphan handling.
 
         template_path = str(Path(config.config_dir) / tmpl_config.file)
 
@@ -327,7 +336,7 @@ def validate_tekton_dir(
                 )
                 delete_signals = [e for e in check_errors if e.startswith(DELETE_FILE_PREFIX)]
                 if delete_signals:
-                    results[filepath.name] = {
+                    results[result_key(filepath)] = {
                         "errors": [e.removeprefix(DELETE_FILE_PREFIX) for e in delete_signals],
                         "warnings": [],
                         "pipeline_type": pipeline_type,
@@ -344,7 +353,7 @@ def validate_tekton_dir(
             )
             delete_signals = [e for e in check_errors if e.startswith(DELETE_FILE_PREFIX)]
             if delete_signals:
-                results[filepath.name] = {
+                results[result_key(filepath)] = {
                     "errors": [e.removeprefix(DELETE_FILE_PREFIX) for e in delete_signals],
                     "warnings": [],
                     "pipeline_type": pipeline_type,
@@ -361,7 +370,7 @@ def validate_tekton_dir(
             )
             if parent_data is None:
                 prefix = extract_component_prefix(filepath.name, data)
-                results[filepath.name] = {
+                results[result_key(filepath)] = {
                     "errors": [f"no matching {tmpl_config.parent.template} pipeline found (expected prefix '{prefix}')"],
                     "warnings": [],
                     "pipeline_type": pipeline_type,
@@ -379,7 +388,7 @@ def validate_tekton_dir(
             cli_vars=cli_vars, inherit_params=inherit, overlay_path=overlay,
         )
 
-        results[filepath.name] = {
+        results[result_key(filepath)] = {
             "errors": errors,
             "warnings": warnings,
             "pipeline_type": pipeline_type,

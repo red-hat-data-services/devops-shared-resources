@@ -44,8 +44,10 @@ git_pipeline_ref and invalid metadata/annotation/spec-field lists or key paths.
 An explicitly empty or null generate value is invalid; omit it to disable generation.
 It opts the run into
 generated-child reconciliation: parents and unknown files are read-only,
-only generated child templates are maintained. Do not combine it with
-unrelated templates that you expect this run to fix. parent_ref is unsupported;
+only generated child templates are maintained. Ordinary templates are still
+validated, and their errors fail the run even after generated children are fixed.
+Do not combine it with unrelated templates that you expect this run to fix.
+parent_ref is unsupported;
 parents come from the working tree. Existing matching child filenames survive.
 Missing files use the filename pattern with {component} substituted.
 

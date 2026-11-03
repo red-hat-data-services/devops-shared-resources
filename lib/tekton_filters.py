@@ -466,18 +466,45 @@ def to_release_pr_cel(value, branch, filename):
     from lark import Token, Tree
     from lib.cel import flatten_and
 
+    def unwrap(node):
+        """Remove expression wrappers without crossing operators or calls."""
+        wrappers = {"expr", "conditionalor", "conditionaland", "relation",
+                    "addition", "multiplication", "unary", "member", "primary", "paren_expr"}
+        while isinstance(node, Tree) and node.data in wrappers and len(node.children) == 1:
+            node = node.children[0]
+        return node
+
+    def selector_equality(node):
+        """Recognize a direct event/branch equality, not text inside literals."""
+        from ast import literal_eval
+        node = unwrap(node)
+        if not isinstance(node, Tree) or node.data != "relation" or len(node.children) != 2:
+            return None
+        left, right = node.children
+        if not isinstance(left, Tree) or left.data != "relation_eq":
+            return None
+        left, right = unwrap(left.children[0]), unwrap(right)
+        if (isinstance(left, Tree) and left.data == "ident"
+                and str(left.children[0]) in {"event", "target_branch"}
+                and isinstance(right, Tree) and right.data == "literal"):
+            return str(left.children[0]), literal_eval(str(right.children[0]))
+        return None
+
     def rewrite_filename(node):
-        """Rewrite quoted PipelineRun YAML paths in the CEL AST in place."""
+        """Rewrite only literal YAML receivers of zero-argument pathChanged calls."""
         if not isinstance(node, Tree):
             return
-        if node.data == "literal":
-            for index, token in enumerate(node.children):
+        if (node.data == "member_dot_arg" and len(node.children) == 2
+                and str(node.children[1]) == "pathChanged"):
+            receiver = unwrap(node.children[0])
+            if isinstance(receiver, Tree) and receiver.data == "literal":
+                token = receiver.children[0]
                 text = str(token)
                 if (isinstance(token, Token) and len(text) > 2
                         and text[0] in ('\"', "'") and text[-1] == text[0]
                         and text[1:-1].startswith(".tekton/")
                         and text[1:-1].endswith((".yaml", ".yml"))):
-                    node.children[index] = Token(token.type, json.dumps(f".tekton/{filename}"))
+                    receiver.children[0] = Token(token.type, json.dumps(f".tekton/{filename}"))
         for child in node.children:
             rewrite_filename(child)
 
@@ -492,13 +519,14 @@ def to_release_pr_cel(value, branch, filename):
         events = branches = 0
         for clause in flatten_and(cor.children[0]):
             wrapped = Tree("expr", [Tree("conditionalor", [Tree("conditionaland", [clause])])])
-            text = tree_dump(wrapped).strip()
-            if re.fullmatch(r'event\s*==\s*[\"\']push[\"\']', text):
+            selector = selector_equality(clause)
+            if selector == ("event", "push"):
                 events += 1
-            elif re.fullmatch(r'target_branch\s*==\s*[\"\']' + re.escape(branch) + r'[\"\']', text):
+            elif selector == ("target_branch", branch):
                 branches += 1
             else:
-                if re.search(r'\b(event|target_branch)\b', text):
+                if any(str(node.children[0]) in {"event", "target_branch"}
+                       for node in wrapped.find_data("ident")):
                     raise ValueError("unsupported event/branch predicate in push CEL")
                 rewrite_filename(wrapped)
                 clauses.append(tree_dump(wrapped))

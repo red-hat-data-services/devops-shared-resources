@@ -270,6 +270,98 @@ def test_generate_allows_other_metadata_without_changing_child_name(setup):
     assert child["metadata"]["namespace"] == "release-tenant"
 
 
+@pytest.mark.parametrize("clause, expected", [
+    ('".tekton/target_branch.yaml".pathChanged()', '".tekton/new.yaml".pathChanged()'),
+    ('".tekton/event.yml".pathChanged()', '".tekton/new.yaml".pathChanged()'),
+    ('has_path == ".tekton/old.yaml"', 'has_path == ".tekton/old.yaml"'),
+    ('".tekton/old.yaml".matches(".*")', '".tekton/old.yaml".matches(".*")'),
+    ('kind == "event"', 'kind == "event"'),
+    ('kind == "target_branch"', 'kind == "target_branch"'),
+    ('!(".tekton/old.yaml".pathChanged())', '.tekton/new.yaml'),
+])
+def test_release_cel_only_rewrites_pathchanged_receivers(clause, expected):
+    """Leave non-path literals intact and never mistake string contents for selectors."""
+    result = to_release_pr_cel(
+        f'event == "push" && target_branch == "rhoai-3.6" && {clause}',
+        "rhoai-3.6", "new.yaml")
+    assert expected in " ".join(result.split())
+
+
+@pytest.mark.parametrize("clause", [
+    'event != "push"', 'event == "pull_request"',
+    'target_branch == "rhoai-3.5"',
+    '(target_branch == "rhoai-3.6" || allowed)',
+    'event.startsWith("push")', '"push" == event',
+])
+def test_release_cel_rejects_complex_or_conflicting_selectors(clause):
+    """Continue to reject selector references outside the supported exact equalities."""
+    with pytest.raises(ValidationError):
+        to_release_pr_cel(
+            f'event == "push" && target_branch == "rhoai-3.6" && {clause}',
+            "rhoai-3.6", "new.yaml")
+
+
+@pytest.mark.parametrize("state", ["matching", "missing", "orphan", "planning-error"])
+def test_mixed_generation_always_validates_ordinary_templates(setup, state):
+    """Combine ordinary errors with child reconciliation, including failed planning."""
+    root, directory, config, push, parent_path = setup
+    (config / "push.yaml.j2").write_text("metadata:\n  namespace: required-namespace\n")
+    before = parent_path.read_bytes()
+    if state != "missing":
+        fixed, post_fix = fix(root, config)
+        assert fixed and parent_path.read_bytes() == before
+        in_memory = vt.validate_tekton_dir(
+            root, "rhoai-3.6", None, config=load_config(str(config)), pipelines_data=post_fix)
+        assert in_memory[str(parent_path)]["errors"] == ["metadata.namespace: missing"]
+    if state == "orphan":
+        orphan = copy.deepcopy(push)
+        orphan["metadata"]["name"] = "orphan-on-pull-request"
+        write(directory / "orphan-pull-request.yaml", orphan)
+    elif state == "planning-error":
+        push["metadata"]["annotations"][PAC + "on-cel-expression"] = 'event == "push" && target_branch == "rhoai-3.5"'
+        write(parent_path, push)
+    results = validate(root, config)
+    assert results[str(parent_path)]["errors"] == ["metadata.namespace: missing"]
+    if state == "missing":
+        assert results[str(directory / "widget-pull-request.yaml")]["errors"]
+    elif state == "orphan":
+        assert results[str(directory / "orphan-pull-request.yaml")]["warnings"]
+    elif state == "planning-error":
+        assert results["generation"]["errors"]
+    else:
+        assert not results[str(directory / "widget-pull-request.yaml")]["errors"]
+
+
+def test_mixed_generation_ordinary_results_keep_directory_identity(setup):
+    """Ordinary files with the same basename must not overwrite each other's errors."""
+    root, directory, config, push, parent_path = setup
+    (config / "push.yaml.j2").write_text("metadata:\n  namespace: required-namespace\n")
+    other = root / "pipelineruns/other/.tekton" / parent_path.name
+    other.parent.mkdir(parents=True)
+    push["metadata"]["namespace"] = "required-namespace"
+    write(other, push)
+    fix(root, config)
+    results = validate(root, config)
+    assert results[str(parent_path)]["errors"] == ["metadata.namespace: missing"]
+    assert not results[str(other)]["errors"]
+
+
+def test_mixed_generation_cli_reports_ordinary_errors_without_fixing_parents(setup):
+    """Real --fix and subsequent validation both fail on read-only ordinary errors."""
+    root, directory, config, _, parent_path = setup
+    (config / "push.yaml.j2").write_text("metadata:\n  namespace: required-namespace\n")
+    before = parent_path.read_bytes()
+    subprocess.run(["git", "init", "-q", str(root)], check=True)
+    command = [sys.executable, str(ROOT / "scripts/validate-tekton"), "--path", str(root),
+               "--config-dir", str(config), "--branch", "rhoai-3.6", "--no-checkout", "--json"]
+    for flags in (["--fix"], []):
+        result = subprocess.run(command + flags, capture_output=True, text=True)
+        assert result.returncode == 1, result.stderr
+        assert json.loads(result.stdout)["files"][str(parent_path)]["errors"] == ["metadata.namespace: missing"]
+        assert parent_path.read_bytes() == before
+    assert (directory / "widget-pull-request.yaml").exists()
+
+
 def test_generate_rejects_empty_mapping(setup):
     """An explicitly empty generation policy is invalid rather than disabled."""
     _, _, config, _, _ = setup
