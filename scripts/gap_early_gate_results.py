@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GAP Early Gate results monitor (Leader comment → overall-status).
+"""GAP Early Gate results monitor (Leader comment → overall-status + children).
 
 After Stage-1 sets ``overall-status=early-gate-triggered`` and comments
 ``/early-gate``, Early Gate posts a terminal comment on the **Leader** PR
@@ -10,7 +10,10 @@ This script:
 1. Lists Leader PR comments (paginated) and selects the latest **trusted**
    terminal Early Gate report.
 2. When state is ``early-gate-triggered``, writes ``success`` / ``failure``.
-3. Optionally publishes ``state.json`` and greens the Leader (RHAI-8079).
+3. Optionally publishes ``state.json``, greens the Leader (RHAI-8079), and
+   posts ``gated artifacts promoter`` on **build-passing** child PRs:
+   ``success`` when EG passed (auto-merge signal), ``failure`` when EG failed
+   (short note; children that already failed their build gate are left alone).
 
 Progress comments (``eg-operator-build-status``, queue notices, ``/early-gate``
 triggers) and untrusted authors are ignored. Final ``success`` / ``failure``
@@ -44,6 +47,7 @@ from lib.state_file import (
 from scripts import gap_pr_monitor as gpm  # noqa: E402
 
 DEFAULT_CHECK_NAME = gpm.DEFAULT_CHECK_NAME
+CHILD_PASS_PR_STATUSES = gpm.CHILD_PASS_PR_STATUSES
 ENV_LEADER_PR_URL = gpm.ENV_LEADER_PR_URL
 ENV_PR_LABELS = gpm.ENV_PR_LABELS
 ENV_STATE_FILE = gpm.ENV_STATE_FILE
@@ -61,6 +65,14 @@ save_state = gpm.save_state
 split_labels_csv = gpm.split_labels_csv
 verify_leader_head = gpm.verify_leader_head
 _run_gh = gpm._run_gh
+
+# Child check descriptions after combined Leader Early Gate (Miro / Stage-2.5+).
+CHILD_EG_SUCCESS_DESCRIPTION = (
+    "GAP: Early Gate passed — cleared for auto-merge"
+)
+CHILD_EG_FAILURE_DESCRIPTION = (
+    "GAP: Early Gate failed — auto-merge held (combined Leader EG build)"
+)
 
 # HTML marker used by rhods-ci-bot terminal EG reports (may include digest lines).
 EARLY_GATE_BUILD_COMPLETE_MARKER = "early-gate-build-complete"
@@ -115,6 +127,8 @@ class EarlyGateResultsResult:
     published_sha: str | None
     dry_run: bool
     reason: str = ""
+    child_urls_posted: tuple[str, ...] = ()
+    child_check_state: str | None = None
 
 
 def trusted_early_gate_authors(
@@ -386,6 +400,83 @@ def decide_overall_from_comments(
     )
 
 
+def child_pass_pr_urls(payload: dict[str, Any]) -> list[str]:
+    """Return pr-urls whose ``pr-status`` is a build/gate pass (EG may conclude them).
+
+    Children that already failed their Stage-1 gate are omitted so EG-results
+    does not overwrite their failing ``gated artifacts promoter`` check.
+    """
+    urls: list[str] = []
+    for index, entry in enumerate(payload.get("pull-requests") or []):
+        if not isinstance(entry, dict):
+            raise GapPrMonitorError(f"pull-requests[{index}] must be an object.")
+        status = str(entry.get("pr-status") or "").strip()
+        if status not in CHILD_PASS_PR_STATUSES:
+            continue
+        url = str(entry.get("pr-url") or "").strip()
+        if not url:
+            raise GapPrMonitorError(
+                f"pull-requests[{index}] is missing a non-empty 'pr-url'."
+            )
+        urls.append(url)
+    return urls
+
+
+def child_check_for_overall(overall_status: str) -> tuple[str, str]:
+    """Map final overall-status to child commit-status state + description."""
+    if overall_status == OVERALL_STATUS_SUCCESS:
+        return "success", CHILD_EG_SUCCESS_DESCRIPTION
+    if overall_status == OVERALL_STATUS_FAILURE:
+        return "failure", CHILD_EG_FAILURE_DESCRIPTION
+    raise GapPrMonitorError(
+        f"Cannot post child Early Gate checks for overall-status={overall_status!r}"
+    )
+
+
+def post_child_statuses_for_early_gate(
+    payload: dict[str, Any],
+    *,
+    overall_status: str,
+    updater: PRStatusUpdater,
+    continue_on_error: bool = True,
+) -> tuple[str, ...]:
+    """Post EG outcome onto build-passing children; leave build-failures untouched.
+
+    Returns the tuple of child PR URLs that received a status post (not skipped).
+    """
+    urls = child_pass_pr_urls(payload)
+    if not urls:
+        return ()
+    cli_status, description = child_check_for_overall(overall_status)
+    posted: list[str] = []
+    errors: list[tuple[str, str]] = []
+    for url in urls:
+        try:
+            result = updater.post_status_for_pr(
+                url,
+                cli_status,
+                description=description,
+            )
+        except (ValueError, RuntimeError, GhCommandError) as exc:
+            errors.append((url, str(exc)))
+            if not continue_on_error:
+                raise GapPrMonitorError(
+                    f"Failed to post Early Gate child status for {url}: {exc}"
+                ) from exc
+            continue
+        if not result.skipped:
+            posted.append(url)
+    if errors and not posted:
+        lines = [f"  - {u}: {e}" for u, e in errors]
+        raise GapPrMonitorError(
+            "Failed to post Early Gate status on child PRs:\n" + "\n".join(lines)
+        )
+    if errors:
+        for url, err in errors:
+            print(f"WARNING: child EG status failed for {url}: {err}", file=sys.stderr)
+    return tuple(posted)
+
+
 def run_early_gate_results(
     *,
     repo_root: Path,
@@ -403,7 +494,7 @@ def run_early_gate_results(
     git_runner: Callable[..., str] | None = None,
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
 ) -> EarlyGateResultsResult:
-    """Apply EG comment outcome to state and optionally publish + green Leader."""
+    """Apply EG comment outcome to state and optionally publish + green checks."""
     root = repo_root.expanduser().resolve()
     leader_url = (leader_pr_url or "").strip()
     if not leader_url:
@@ -448,10 +539,17 @@ def run_early_gate_results(
             reason=reason,
         )
 
+    child_targets = child_pass_pr_urls(payload)
+    child_check_state, child_desc = child_check_for_overall(new_overall)
+
     if dry_run:
         print(
             f"[dry-run] would set overall-status={new_overall!r} on {state_path} "
             f"({reason})"
+        )
+        print(
+            f"[dry-run] would post child check state={child_check_state!r} "
+            f"({child_desc}) on {len(child_targets)} build-passing PR(s)"
         )
         return EarlyGateResultsResult(
             state_path=state_path,
@@ -462,6 +560,8 @@ def run_early_gate_results(
             published_sha=None,
             dry_run=True,
             reason=reason,
+            child_urls_posted=tuple(child_targets),
+            child_check_state=child_check_state,
         )
 
     apply_overall_status(payload, new_overall)
@@ -501,6 +601,13 @@ def run_early_gate_results(
         overall_status=new_overall,
         updater=updater,
     )
+    # Reload after publish so child list matches committed state.
+    payload = load_state(state_path)
+    child_posted = post_child_statuses_for_early_gate(
+        payload,
+        overall_status=new_overall,
+        updater=updater,
+    )
     return EarlyGateResultsResult(
         state_path=state_path,
         previous_overall=previous,
@@ -510,6 +617,8 @@ def run_early_gate_results(
         published_sha=published.sha,
         dry_run=False,
         reason=reason,
+        child_urls_posted=child_posted,
+        child_check_state=child_check_state,
     )
 
 
@@ -517,7 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
             "Apply Early Gate Leader comment results to overall-status "
-            "and optionally publish + green the Leader."
+            "and optionally publish + green the Leader and build-passing children."
         )
     )
     parser.add_argument(
@@ -548,12 +657,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--publish-state",
         action="store_true",
-        help="Commit/push state.json and green the Leader on success|failure.",
+        help=(
+            "Commit/push state.json, green the Leader, and post success/failure "
+            "on build-passing child PRs on EG success|failure."
+        ),
     )
     parser.add_argument(
         "--check-name",
         default=DEFAULT_CHECK_NAME,
-        help="GitHub commit status context for Leader green.",
+        help="GitHub commit status context for Leader and child checks.",
     )
     parser.add_argument(
         "--dry-run",
@@ -620,6 +732,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"applied: {result.applied}")
     print(f"leader_status_posted: {result.leader_status_posted}")
     print(f"published_sha: {result.published_sha}")
+    print(f"child_check_state: {result.child_check_state}")
+    print(f"child_urls_posted: {list(result.child_urls_posted)}")
     print(f"dry_run: {result.dry_run}")
     print(f"reason: {result.reason}")
     return 0

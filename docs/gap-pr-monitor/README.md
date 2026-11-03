@@ -27,27 +27,30 @@ check name.
 | Any expected component build completed without success | `build-failure` | `failure` |
 | A required build or feasibility check is queued, running, or missing | `build-pending` | `pending` |
 | Good child, but a sibling is still pending | `success` | `pending` (deferred; RHAI-8261) |
-| No component build is triggered, and feasibility succeeded | `success` | `success` (after all siblings conclude) |
-| All expected builds and feasibility jobs succeeded | `success` | `success` (after all siblings conclude) |
+| All children build/gate success (EG not done) | `success` | `pending` (waiting for Early Gate) |
+| All children build/gate success + EG passed | `success` | `success` (posted by EG-results) |
+| Build-OK child + EG failed | `success` | `failure` (posted by EG-results; note held) |
+| Mixed batch: good child + sibling build/merge failure | `success` | `success` after batch concludes (no EG) |
 | Already merged | `success` | skip post |
 
 A failed repository gate posts a failing promoter status on that PR immediately.
 A **successful** child does **not** get a green `gated artifacts promoter` check
-until **every** child in the Leader state has a terminal `pr-status` (RHAI-8261).
-Until then the good child stays `pending` on GitHub so it cannot auto-merge early;
-`pr-status` in `state.json` still records `success`. When the batch has concluded,
-children are greened with GitHub ``success`` as before. Separately, an all-success
-batch sets ``overall-status=early-gate-triggered`` and comments ``/early-gate`` on
-the Leader (RHAI-10942). Merging the leader PR to keep run history does not mark a
+while siblings are still open (RHAI-8261), and — when the whole batch is
+all-success — stays `pending` until the **combined Leader Early Gate** finishes
+(`gap_early_gate_results` posts child `success` or `failure`). `pr-status` in
+`state.json` still records the Stage-1 build/gate outcome. An all-success batch
+sets ``overall-status=early-gate-triggered`` and comments ``/early-gate`` on the
+Leader (RHAI-10942). Merging the leader PR to keep run history does not mark a
 failed repository PR successful. `builds[].image` is left unchanged; image URIs are
 not required for the gate.
 
 When every child has a final gate status, the monitor sets `overall-status`.
 All-success batches become `early-gate-triggered` and the monitor comments
-`/early-gate` on the **Leader** once (RHAI-10942). Final `success` / `failure`
-(and Leader green for auto-merge) are written later by the Early Gate monitor,
-or immediately as `failure` when any child failed (RHOAIENG-97052 / RHAI-8079).
-Pending children never conclude the Leader.
+`/early-gate` on the **Leader** once (RHAI-10942). Final overall `success` /
+`failure`, Leader green, and child check conclusion for build-passing PRs are
+written by the Early Gate results monitor; overall `failure` is set immediately
+when any child failed without EG (RHOAIENG-97052 / RHAI-8079). Pending children
+never conclude the Leader.
 
 ## CEL trigger evaluator setup
 
@@ -134,7 +137,7 @@ component PR has a final gate status (`success`, `merge-failure`, or
 |----------|--------------------------|---------------|------------------|
 | Any still `new` or `build-pending` | omitted | none | no (stay pending) |
 | All final, any `merge-failure` or `build-failure` | `failure` | green Leader (history, RHAI-8079) | yes — only `success` children |
-| All `success` (or existing `build-success`) | `early-gate-triggered` | comment `/early-gate` once (RHAI-10942); children still greened per RHAI-8261 | yes — child GitHub success unchanged |
+| All `success` (or existing `build-success`) | `early-gate-triggered` | comment `/early-gate` once (RHAI-10942); children stay pending until EG-results | no — EG-results posts child success/failure |
 | Existing final `success` / `failure` (EG monitor) | preserved | green Leader | yes |
 
 All-success does **not** set `overall-status=success` in this monitor. That final

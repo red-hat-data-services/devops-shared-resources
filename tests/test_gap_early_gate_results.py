@@ -10,7 +10,7 @@ import pytest
 
 from scripts import gap_early_gate_results as eg
 from scripts.gap_pr_monitor import PublishResult
-from lib.pr_status_updater import PullRequestRef, StatusUpdateResult
+from lib.pr_status_updater import PullRequestRef, StatusUpdateResult, parse_pr_url
 
 
 def _status_ok() -> StatusUpdateResult:
@@ -662,11 +662,30 @@ def test_run_dry_run_does_not_write(
     assert path.read_text() == before
 
 
-def test_run_publish_path_greens_leader(
+class _RecordingUpdater:
+    """Minimal updater that records post_status_for_pr calls."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        self.posts: list[tuple[str, str, dict[str, Any]]] = []
+
+    def post_status_for_pr(self, pr_url: str, status: str, **kwargs: Any) -> StatusUpdateResult:
+        self.posts.append((pr_url, status, kwargs))
+        return StatusUpdateResult(
+            pr=parse_pr_url(pr_url),
+            head_sha="deadbeef",
+            state={"completed": "success"}.get(status, status),
+            context="gated artifacts promoter",
+            dry_run=False,
+            skipped=False,
+        )
+
+
+def test_run_publish_path_greens_leader_and_children(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _state(tmp_path, overall="early-gate-triggered")
     checkouts: list[str] = []
+    holder: dict[str, _RecordingUpdater] = {}
 
     def fake_checkout(repo_root: Path, head_ref: str, **kwargs: Any) -> None:
         checkouts.append(head_ref)
@@ -674,9 +693,9 @@ def test_run_publish_path_greens_leader(
     def fake_publish(*args: Any, **kwargs: Any) -> PublishResult:
         return PublishResult(sha="abc123", committed=True, dry_run=False)
 
-    class FakeUpdater:
-        def __init__(self, **kwargs: Any) -> None:
-            pass
+    def factory(**kwargs: Any) -> _RecordingUpdater:
+        holder["u"] = _RecordingUpdater(**kwargs)
+        return holder["u"]
 
     monkeypatch.setattr(
         eg,
@@ -694,12 +713,160 @@ def test_run_publish_path_greens_leader(
         trigger_id="gap-egtest01",
         publish=True,
         head_ref="gap-leader/gap-egtest01",
-        updater_factory=FakeUpdater,
+        updater_factory=factory,
     )
     assert result.applied is True
     assert result.leader_status_posted is True
     assert result.published_sha == "abc123"
     assert checkouts == ["gap-leader/gap-egtest01"]
+    assert result.child_check_state == "success"
+    assert result.child_urls_posted == (
+        "https://github.com/example/kserve-branch/pull/1",
+    )
+    assert holder["u"].posts[0][:2] == (
+        "https://github.com/example/kserve-branch/pull/1",
+        "success",
+    )
+    assert (
+        holder["u"].posts[0][2].get("description") == eg.CHILD_EG_SUCCESS_DESCRIPTION
+    )
+
+
+def test_child_pass_pr_urls_skips_build_failures() -> None:
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "a",
+                "pr-url": "https://github.com/ex/a/pull/1",
+                "pr-status": "success",
+            },
+            {
+                "repo": "b",
+                "pr-url": "https://github.com/ex/b/pull/2",
+                "pr-status": "build-failure",
+            },
+            {
+                "repo": "c",
+                "pr-url": "https://github.com/ex/c/pull/3",
+                "pr-status": "build-success",
+            },
+        ]
+    }
+    assert eg.child_pass_pr_urls(payload) == [
+        "https://github.com/ex/a/pull/1",
+        "https://github.com/ex/c/pull/3",
+    ]
+
+
+def test_post_child_statuses_eg_failure_leaves_build_failure_alone() -> None:
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "ok",
+                "pr-url": "https://github.com/ex/ok/pull/1",
+                "pr-status": "success",
+            },
+            {
+                "repo": "bad",
+                "pr-url": "https://github.com/ex/bad/pull/2",
+                "pr-status": "build-failure",
+            },
+        ]
+    }
+    updater = _RecordingUpdater()
+    posted = eg.post_child_statuses_for_early_gate(
+        payload, overall_status="failure", updater=updater
+    )
+    assert posted == ("https://github.com/ex/ok/pull/1",)
+    assert updater.posts == [
+        (
+            "https://github.com/ex/ok/pull/1",
+            "failure",
+            {"description": eg.CHILD_EG_FAILURE_DESCRIPTION},
+        )
+    ]
+
+
+def test_run_publish_eg_failure_fails_build_ok_children(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    folder = tmp_path / "GAP Leaders" / "2026-10-29_gap-egtest01"
+    folder.mkdir(parents=True)
+    payload = {
+        "overall-status": "early-gate-triggered",
+        "pull-requests": [
+            {
+                "repo": "ok",
+                "pr-url": "https://github.com/ex/ok/pull/1",
+                "pr-status": "success",
+                "builds": [],
+            },
+            {
+                "repo": "bad",
+                "pr-url": "https://github.com/ex/bad/pull/2",
+                "pr-status": "build-failure",
+                "builds": [],
+            },
+        ],
+    }
+    (folder / "state.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    holder: dict[str, _RecordingUpdater] = {}
+
+    def factory(**kwargs: Any) -> _RecordingUpdater:
+        holder["u"] = _RecordingUpdater(**kwargs)
+        return holder["u"]
+
+    monkeypatch.setattr(
+        eg,
+        "list_leader_pr_comments",
+        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER)],
+    )
+    monkeypatch.setattr(eg, "checkout_leader_branch", lambda *a, **k: None)
+    monkeypatch.setattr(
+        eg,
+        "publish_state",
+        lambda *a, **k: PublishResult(sha="abc123", committed=True, dry_run=False),
+    )
+    monkeypatch.setattr(eg, "verify_leader_head", lambda *a, **k: None)
+    monkeypatch.setattr(eg, "post_leader_conclusion", lambda *a, **k: _status_ok())
+
+    result = eg.run_early_gate_results(
+        repo_root=tmp_path,
+        leader_pr_url="https://github.com/acme/gap/pull/9",
+        trigger_id="gap-egtest01",
+        publish=True,
+        head_ref="gap-leader/gap-egtest01",
+        updater_factory=factory,
+    )
+    assert result.overall_status == "failure"
+    assert result.child_check_state == "failure"
+    assert result.child_urls_posted == ("https://github.com/ex/ok/pull/1",)
+    assert [p[:2] for p in holder["u"].posts] == [
+        ("https://github.com/ex/ok/pull/1", "failure")
+    ]
+
+
+def test_run_dry_run_reports_child_targets(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _state(tmp_path, overall="early-gate-triggered")
+    monkeypatch.setattr(
+        eg,
+        "list_leader_pr_comments",
+        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER)],
+    )
+    result = eg.run_early_gate_results(
+        repo_root=tmp_path,
+        leader_pr_url="https://github.com/acme/gap/pull/9",
+        trigger_id="gap-egtest01",
+        publish=True,
+        dry_run=True,
+    )
+    assert result.dry_run is True
+    assert result.child_check_state == "success"
+    assert result.child_urls_posted == (
+        "https://github.com/example/kserve-branch/pull/1",
+    )
 
 
 def test_run_requires_leader_url(tmp_path: Path) -> None:

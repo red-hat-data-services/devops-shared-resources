@@ -3,11 +3,16 @@
 
 Read leader state.json, evaluate each child PR's component builds and
 main-to-release feasibility checks, post the gated artifacts promoter commit
-status, and update pr-status. Good children are greened only after every
-sibling has concluded (RHAI-8261) — same as before when the child gate passes.
-All-success batches set ``overall-status=early-gate-triggered`` and comment
-``/early-gate`` on the Leader (RHAI-10942); child GitHub success posting is
-unchanged.
+status, and update pr-status.
+
+Good children stay GitHub ``pending`` while siblings are still open (RHAI-8261)
+and again while ``overall-status=early-gate-triggered`` (combined Early Gate on
+the Leader). ``pr-status`` in state.json still records build/gate outcomes.
+Final child ``success`` / Early Gate ``failure`` on those checks is posted by
+``gap_early_gate_results`` after the Leader EG comment. Mixed batches that
+conclude with overall ``failure`` (no EG) still green the good children when
+the batch is done (RHAI-8261). All-success batches set
+``early-gate-triggered`` and comment ``/early-gate`` (RHAI-10942).
 
 State path (RHOAIENG-93564 / sync layout):
 GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json
@@ -96,6 +101,10 @@ CHILD_PASS_PR_STATUSES = frozenset({SUCCESS_PR_STATUS, BUILD_SUCCESS_PR_STATUS})
 # RHAI-8261: hold green on good children until every sibling has concluded.
 DEFERRED_CHILD_GREEN_DESCRIPTION = (
     "GAP: waiting for other component PRs to conclude (RHAI-8261)"
+)
+# After an all-success batch: hold green until Early Gate concludes on Leader.
+WAITING_FOR_EARLY_GATE_DESCRIPTION = (
+    "GAP: waiting for Early Gate build (auto-merge held)"
 )
 # PaC on-comment in gated-artifacts-promoter: ^/early-gate(-build)?$
 EARLY_GATE_COMMENT_BODY = "/early-gate"
@@ -462,16 +471,33 @@ def should_defer_child_success_status(
     batch_concluded: bool,
     overall_status: str | None = None,
 ) -> bool:
-    """Defer green on a good child until every sibling has concluded (RHAI-8261).
+    """Defer GitHub green on a good child until it is safe to auto-merge.
 
-    ``overall_status`` is accepted for call-site compatibility but does not
-    change child greening: when the child gate passes and the batch is done,
-    we still post GitHub ``success`` as before.
+    - Batch still open → pending (RHAI-8261).
+    - Batch all-success / ``early-gate-triggered`` → pending until EG-results
+      posts the final child check after the combined Leader Early Gate.
+    - Batch concluded with overall ``failure`` (child gate failures, no EG) →
+      do not defer; green good children as in RHAI-8261.
+    - Final overall ``success`` → do not defer (idempotent re-post OK).
     """
-    del overall_status
     if pr_status not in CHILD_PASS_PR_STATUSES:
         return False
-    return not batch_concluded
+    if not batch_concluded:
+        return True
+    if overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED:
+        return True
+    return False
+
+
+def child_success_defer_description(
+    *,
+    batch_concluded: bool,
+    overall_status: str | None = None,
+) -> str:
+    """Human-readable pending description while child success is deferred."""
+    if batch_concluded and overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED:
+        return WAITING_FOR_EARLY_GATE_DESCRIPTION
+    return DEFERRED_CHILD_GREEN_DESCRIPTION
 
 
 def status_decision_for_post(
@@ -480,11 +506,11 @@ def status_decision_for_post(
     batch_concluded: bool,
     overall_status: str | None = None,
 ) -> RepositoryGateDecision | PrDecision:
-    """Return the decision to POST; may downgrade success→pending (RHAI-8261).
+    """Return the decision to POST; may downgrade success→pending.
 
     ``pr-status`` in state.json still records the evaluated outcome; only the
     GitHub commit status is deferred so good children cannot auto-merge before
-    siblings conclude.
+    siblings conclude and (for all-success) before Early Gate finishes.
     """
     if getattr(decision, "skip_status_post", False):
         return decision
@@ -497,8 +523,21 @@ def status_decision_for_post(
     return replace(
         decision,
         cli_status="pending",
-        description=DEFERRED_CHILD_GREEN_DESCRIPTION,
+        description=child_success_defer_description(
+            batch_concluded=batch_concluded,
+            overall_status=overall_status,
+        ),
     )
+
+
+def provisional_overall_status(
+    payload: dict[str, Any],
+    status_updates: dict[str, str],
+) -> str | None:
+    """Compute overall-status from payload as if ``status_updates`` were applied."""
+    probe = json.loads(json.dumps(payload))
+    apply_pr_statuses(probe, status_updates)
+    return compute_overall_status(probe)
 
 
 def early_gate_comment_already_present(
@@ -709,11 +748,6 @@ def run_stage1_monitor(
     merge_failures: list[str] = []
     successes: list[str] = []
     post_errors: list[tuple[str, str]] = []
-    # RHAI-8261: evaluate the whole batch before greening any success child.
-    batch_concluded = children_batch_concluded(
-        [decision.pr_status for decision in decisions]
-    )
-
     for decision in decisions:
         status_updates[decision.url] = decision.pr_status
         if decision.pr_status == MERGE_FAILURE_PR_STATUS:
@@ -721,12 +755,21 @@ def run_stage1_monitor(
         else:
             successes.append(decision.url)
 
+    # Evaluate batch + provisional overall before posting (8261 + EG hold).
+    batch_concluded = children_batch_concluded(
+        [decision.pr_status for decision in decisions]
+    )
+    overall_status = provisional_overall_status(payload, status_updates)
+
+    for decision in decisions:
         if decision.skip_status_post:
             skipped.append(decision.url)
             continue
 
         to_post = status_decision_for_post(
-            decision, batch_concluded=batch_concluded
+            decision,
+            batch_concluded=batch_concluded,
+            overall_status=overall_status,
         )
         desc = description if description is not None else to_post.description
         try:
@@ -1665,9 +1708,9 @@ def _publish_gate_decision(
     """Publish a decision, or re-evaluate once when the head has moved.
 
     A second move is left for the next poll. The stale decision is not posted
-    to the untested commit. Success greens are deferred until the batch has a
-    final overall-status (RHAI-8261 / RHAI-10942); ``pr_status`` on the returned
-    decision stays evaluated.
+    to the untested commit. Success greens are deferred while the batch is open
+    (RHAI-8261) and while overall is ``early-gate-triggered`` (EG hold);
+    ``pr_status`` on the returned decision stays evaluated.
     """
     if decision.skip_status_post:
         return decision, None
@@ -1727,9 +1770,10 @@ def _publish_decisions(
     successes: list[str] = []
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
-    batch_concluded = children_batch_concluded(
-        [decision.pr_status for decision in decisions]
-    )
+    # Provisional statuses from first-pass decisions (before head-move refresh).
+    provisional_updates = {d.url: d.pr_status for d in decisions}
+    batch_concluded = children_batch_concluded(list(provisional_updates.values()))
+    overall_status = provisional_overall_status(payload, provisional_updates)
 
     for original in decisions:
         url = original.url
@@ -1744,7 +1788,7 @@ def _publish_decisions(
                 build_app_id=build_app_id,
                 retry_unknown=retry_unknown,
                 batch_concluded=batch_concluded,
-                overall_status=None,
+                overall_status=overall_status,
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))
