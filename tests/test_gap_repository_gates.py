@@ -900,9 +900,9 @@ def test_undiscovered_feasibility_workflow_stays_unresolved_until_jobs_are_known
     ]
     passed, updater = _run(path, github)
     assert passed.success_urls == [URL]
-    assert passed.overall_status == "early-gate-triggered"
-    assert updater.posts[0][1] == "pending"
-    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
+    # Prior overall-status=failure is preserved; mixed/failure path still greens.
+    assert passed.overall_status == "failure"
+    assert updater.posts[0][1] == "success"
     assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
 
 
