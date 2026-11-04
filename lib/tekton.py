@@ -210,7 +210,7 @@ def extract_template_vars(
 
 
 def _lookup_path(data, path: tuple):
-    """Look up a value in nested data by path, handling params lists."""
+    """Look up a value by path through name- or pipelineTaskName-keyed lists."""
     node = data
     i = 0
     while i < len(path):
@@ -222,7 +222,7 @@ def _lookup_path(data, path: tuple):
         elif isinstance(node, list):
             found = None
             for item in node:
-                if isinstance(item, dict) and str(item.get("name")) == str(key):
+                if isinstance(item, dict) and str(item.get("pipelineTaskName", item.get("name"))) == str(key):
                     found = item
                     break
             if found is None:
@@ -283,7 +283,9 @@ def _resolve_and_render_tree(node, existing_data: dict, parent_data: dict | None
                     elif isinstance(val, (CommentedMap, CommentedSeq)):
                         _resolve_and_render_tree(val, existing_data, parent_data, env, variables, item_path, skipped_paths)
                 else:
-                    _resolve_and_render_tree(item, existing_data, parent_data, env, variables, path, skipped_paths)
+                    identity = item.get("pipelineTaskName", item.get("name"))
+                    item_path = path + (str(identity),) if identity is not None else path
+                    _resolve_and_render_tree(item, existing_data, parent_data, env, variables, item_path, skipped_paths)
             elif isinstance(item, CommentedSeq):
                 _resolve_and_render_tree(item, existing_data, parent_data, env, variables, path, skipped_paths)
 
@@ -399,7 +401,7 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
     """Recursively merge template into existing data.
 
     - Dicts: existing key order preserved, template values override, new keys appended
-    - Named lists (items with 'name' key): merge by name, existing order preserved
+    - Keyed lists ('name' or 'pipelineTaskName'): merge by identity, preserving order
     - Plain lists: template values used, with element-wise type preservation
     - Scalars: template content with existing scalar type preserved
 
@@ -425,17 +427,25 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
                 if errors is not None:
                     child_path = f"{path}.{key}" if path else key
                     errors.append(f"{child_path}: missing")
-                result[key] = copy.deepcopy(template[key])
+                value = template[key]
+                empty = {} if isinstance(value, dict) else [] if isinstance(value, list) else None
+                result[key] = _deep_merge(value, empty) if empty is not None else copy.deepcopy(value)
         return result
 
     if isinstance(template, list) and isinstance(existing, list):
         _new_list = type(existing) if hasattr(existing, 'ca') else list
 
-        if template and isinstance(template[0], dict) and "name" in template[0]:
-            template_by_name = {str(p["name"]): p for p in template}
+        identity_key = None
+        if template and isinstance(template[0], dict):
+            if "pipelineTaskName" in template[0]:
+                identity_key = "pipelineTaskName"
+            elif "name" in template[0]:
+                identity_key = "name"
+        if identity_key:
+            template_by_name = {str(p[identity_key]): p for p in template}
             result = _new_list()
             for ei in existing:
-                name = str(ei.get("name", ""))
+                name = str(ei.get(identity_key, ""))
                 if name in template_by_name:
                     tp = template_by_name.pop(name)
                     if tp.get("value") == ABSENT:
@@ -450,7 +460,7 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
                 if p.get("value") != ABSENT:
                     if errors is not None:
                         errors.append(f"{path}[{name}]: missing")
-                    result.append(copy.deepcopy(p))
+                    result.append(_deep_merge(p, {}))
             return result
 
         result = _new_list()
@@ -458,7 +468,9 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
             if i < len(existing):
                 result.append(_deep_merge(tv, existing[i], errors, f"{path}[{i}]", skipped_paths))
             else:
-                result.append(copy.deepcopy(tv))
+                empty = {} if isinstance(tv, dict) else [] if isinstance(tv, list) else None
+                if tv != ABSENT:
+                    result.append(_deep_merge(tv, empty) if empty is not None else copy.deepcopy(tv))
         if errors is not None and len(existing) > len(template):
             dropped = len(existing) - len(template)
             errors.append(f"{path}: {dropped} extra item(s) dropped")

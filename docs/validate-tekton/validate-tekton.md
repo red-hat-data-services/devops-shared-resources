@@ -126,7 +126,9 @@ some-optional-annotation: "{{ _? }}"
 
 Fields defined in the template override the existing file. Fields in the existing file but not in the template are preserved (component-specific params like `dockerfile`, `prefetch-input`, `build-platforms`, etc.).
 
-For params (named lists), merge is by name: template params override matching existing params, non-matching existing params are kept in their original position, new template params are appended.
+For params and steps (lists keyed by `name`), merge is by name. For `taskRunSpecs`, merge is by `pipelineTaskName`. Template entries update matching existing entries, unrelated entries remain in their original positions, and new entries are appended. Nested self-references (`_`) resolve within the matching task and step, not by list position.
+
+`ABSENT` fields are omitted even when their containing task or step override is newly added. An omitted field does not necessarily remove a default from a resolved Task: resource-override precedence and the admitted pod must still be checked before rollout.
 
 When `inherit_params: true` is set in the config, all parent params not explicitly declared in the template are automatically inherited. Semantically identical values with different formatting are preserved as-is (no cosmetic normalization).
 
