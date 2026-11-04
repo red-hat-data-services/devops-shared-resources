@@ -187,6 +187,7 @@ Defined in `lib/tekton_matchers.py` with `@pipeline_matcher`. Each receives `(na
 
 | Matcher | Description |
 |---------|-------------|
+| `is_pipeline_run` | Every `kind: PipelineRun`, independent of event/name/namespace (use in dedicated template sets) |
 | `is_push_pipeline` | Name ends with `-on-push` |
 | `is_push_pipeline_by_cel` | CEL expression contains `event == "push"` (for repos where push PLRs don't use `-on-push` naming) |
 | `is_pr_pipeline` | Annotation contains `pull_request` or name contains `pull-request` |

@@ -45,6 +45,12 @@ def parent_matcher(fn):
 
 
 @pipeline_matcher
+def is_pipeline_run(name, data):
+    """Match every PipelineRun, independently of event, namespace, or naming."""
+    return isinstance(data, dict) and data.get("kind") == "PipelineRun"
+
+
+@pipeline_matcher
 def is_push_pipeline(name, data):
     """Match push pipelines by metadata.name ending with '-on-push'."""
     return name.endswith("-on-push")
