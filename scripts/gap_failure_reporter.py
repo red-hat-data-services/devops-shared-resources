@@ -397,6 +397,25 @@ def _link_from_check_run(run: CheckRun) -> str | None:
     return run.link
 
 
+def _is_on_push_only_check(name: str) -> bool:
+    """True for Konflux on-push pipelines (not on-pull-request).
+
+    Leader summary links are for child *pull requests*. Push pipelines are not
+    the Stage-1 PR gate operators care about; drop them even when CEL over-keeps
+    them as expected.
+    """
+    lowered = (name or "").lower()
+    if "on-pull-request" in lowered:
+        return False
+    return "on-push" in lowered
+
+
+def _without_on_push_links(
+    links: Sequence[BuildCheckLink],
+) -> tuple[BuildCheckLink, ...]:
+    return tuple(link for link in links if not _is_on_push_only_check(link.name))
+
+
 def fetch_failed_build_check_links(
     owner: str,
     repo: str,
@@ -450,9 +469,12 @@ def fetch_failed_build_check_links(
                 url = _link_from_check_run(matched)
                 if not url:
                     continue
+                name = matched.name or item.name_suffix or item.key
+                if _is_on_push_only_check(name):
+                    continue
                 expected_links.append(
                     BuildCheckLink(
-                        name=matched.name or item.name_suffix or item.key,
+                        name=name,
                         conclusion=conclusion,
                         url=url,
                     )
@@ -479,7 +501,9 @@ def fetch_failed_build_check_links(
         }
         for c in check_runs
     ]
-    return tuple(select_failed_build_checks(raw_runs, app_slug=slug, limit=limit))
+    return _without_on_push_links(
+        select_failed_build_checks(raw_runs, app_slug=slug, limit=limit)
+    )
 
 
 def format_build_links_cell(links: Sequence[BuildCheckLink]) -> str:

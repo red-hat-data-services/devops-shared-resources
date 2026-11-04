@@ -41,6 +41,55 @@ def test_should_report_closed_even_if_success_status() -> None:
     assert fr.should_report_child(state_status="build-pending", pr_state="open") is True
 
 
+def test_fetch_failed_links_drops_on_push_even_when_expected(monkeypatch) -> None:
+    """Summary never links on-push pipelines for child PRs (pending or failure)."""
+    from lib.github_check_runs import CheckRun, ExpectedCheck
+
+    runs = [
+        CheckRun(
+            id=2,
+            name="Konflux / odh-foo-on-push",
+            status="completed",
+            conclusion="failure",
+            head_sha="abc",
+            html_url="https://github.com/acme/r/runs/2",
+            details_url="https://konflux-ui.example",
+            external_id=None,
+            app_slug="konflux-internal-p02",
+            app_id=None,
+            started_at=None,
+        ),
+    ]
+    expected = [
+        ExpectedCheck(
+            key="odh-foo",
+            name_suffix="odh-foo-on-push",
+            app_slug="konflux-internal-p02",
+        )
+    ]
+    monkeypatch.setattr(fr, "list_check_runs", lambda *a, **k: runs)
+    monkeypatch.setattr(fr, "fetch_tekton_documents", lambda *a, **k: ["doc"])
+    monkeypatch.setattr(fr, "fetch_changed_files", lambda *a, **k: ())
+    monkeypatch.setattr(fr, "select_build_checks", lambda *a, **k: expected)
+
+    links = fr.fetch_failed_build_check_links(
+        "acme",
+        "r",
+        "abc",
+        pr={
+            "number": 9,
+            "headRefOid": "abc",
+            "baseRefName": "rhoai-2.25",
+            "headRefName": "feature",
+            "title": "t",
+            "labels": [],
+            "url": "https://github.com/acme/r/pull/9",
+        },
+        gh_runner=lambda _args: "",
+    )
+    assert links == ()
+
+
 def test_reporter_matches_stage1_selection_excludes_on_push() -> None:
     """Same select_build_checks as Stage-1: on-event=[push] is not expected on a PR."""
     from lib.gap_check_selection import PullRequestContext, select_build_checks
