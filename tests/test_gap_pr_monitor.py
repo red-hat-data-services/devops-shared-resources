@@ -1924,6 +1924,102 @@ def test_coordinator_failure_publishes_and_greens_leader(
     assert leader_post[2].get("description") == "GAP: overall failure"
 
 
+def test_coordinator_calls_failure_summary_after_publish(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Failure summary upsert runs from the monitor path (no separate workflow)."""
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    calls: list[dict[str, object]] = []
+
+    def fake_summary(**kwargs: object) -> None:
+        calls.append(kwargs)
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._post_leader_failure_summary", fake_summary
+    )
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={"https://github.com/rhoai-rhtap/kserve-branch/pull/15": "success"},
+        overall="success",
+    )
+    leader = "https://github.com/org/gap/pull/9"
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url=leader,
+        publish=True,
+        updater_factory=lambda **kw: FakeUpdater(**kw),
+        dry_run=True,
+    )
+    assert result.published_sha == "published-sha-abc"
+    assert len(calls) == 1
+    assert calls[0]["leader_pr_url"] == leader
+    assert calls[0]["state_path"] == path
+    assert calls[0]["dry_run"] is True
+
+
+def test_coordinator_failure_summary_errors_do_not_fail_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": "https://github.com/rhoai-rhtap/kserve-branch/pull/15",
+                    "pr-status": "new",
+                    "builds": [],
+                }
+            ]
+        },
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._post_leader_failure_summary",
+        lambda **kwargs: (_ for _ in ()).throw(RuntimeError("summary boom")),
+    )
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={"https://github.com/rhoai-rhtap/kserve-branch/pull/15": "success"},
+        overall="success",
+    )
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=True,
+        updater_factory=lambda **kw: FakeUpdater(**kw),
+        dry_run=True,
+    )
+    assert result.published_sha == "published-sha-abc"
+
+
 def test_coordinator_mixed_children_failure_greens_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
