@@ -7,8 +7,8 @@ Separate from Stage-1 build gating. Each run (hourly schedule or dispatch):
 2. Read that Leader's ``state.json``.
 3. For build-failure / merge-failure / build-pending / closed children, gather
    GitHub PR state, GAP commit-status description, comment-derived close
-   reasons, and failed Konflux checks selected like Stage-1
-   (``select_build_checks``; PipelineRun / check URL; no cluster token).
+   reasons, and (for build-failure) failed Konflux ``on-pull-request`` checks
+   from GitHub Checks (PipelineRun / check URL; no cluster token).
 4. Upsert **one** Leader issue comment marked ``<!-- gap-failure-summary -->``
    (create once, then PATCH the same comment) so the thread stays tidy.
 """
@@ -31,21 +31,8 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from lib.gap_check_selection import (
-    DEFAULT_BUILD_APP_SLUG,
-    PullRequestContext,
-    default_build_producer,
-    fetch_changed_files,
-    fetch_tekton_documents,
-    select_build_checks,
-)
-from lib.github_check_runs import (
-    CheckQueryError,
-    CheckRun,
-    latest_matching,
-    list_check_runs,
-)
-from lib.pac_cel import TriggerParseError
+from lib.gap_check_selection import DEFAULT_BUILD_APP_SLUG, default_build_producer
+from lib.github_check_runs import CheckQueryError, list_check_runs
 from lib.pr_status_updater import GhCommandError, parse_pr_url
 from scripts import gap_pr_monitor as gpm
 
@@ -77,16 +64,6 @@ REPORT_PR_STATUSES = frozenset(
         "merge-failure",
         "build-pending",
         "new",
-    }
-)
-
-_FAILED_CHECK_CONCLUSIONS = frozenset(
-    {
-        "failure",
-        "cancelled",
-        "timed_out",
-        "action_required",
-        "startup_failure",
     }
 )
 
@@ -294,21 +271,9 @@ def _short_check_label(name: str) -> str:
     return _clip(label, 72)
 
 
-def _check_priority(link: BuildCheckLink) -> tuple[int, int, str]:
-    """Lower tuple sorts first: PR PipelineRuns before push/noise."""
-    name = link.name.lower()
-    url = link.url.lower()
-    if _CONFORMA_NAME_HINT in name:
-        bucket = 3
-    elif "on-push" in name and "on-pull-request" not in name:
-        bucket = 2
-    elif "on-pull-request" in name or "/pipelinerun/" in url:
-        bucket = 0
-    else:
-        bucket = 1
-    # Prefer failure over cancelled within a bucket.
-    conc = 0 if link.conclusion == "failure" else 1
-    return (bucket, conc, name)
+def _is_on_pull_request_check(name: str) -> bool:
+    """Leader failure links must be PR PipelineRuns only (never on-push)."""
+    return "on-pull-request" in (name or "").lower()
 
 
 def select_failed_build_checks(
@@ -317,90 +282,54 @@ def select_failed_build_checks(
     app_slug: str = DEFAULT_BUILD_APP_SLUG,
     limit: int = 5,
 ) -> list[BuildCheckLink]:
+    """Keep completed Konflux failures whose name includes on-pull-request."""
     candidates: list[BuildCheckLink] = []
+    seen_names: set[str] = set()
     for check in check_runs:
         if not isinstance(check, dict):
             continue
         app = check.get("app") if isinstance(check.get("app"), dict) else {}
         if str(app.get("slug") or "") != app_slug:
             continue
+        status = str(check.get("status") or "").lower()
+        if status and status != "completed":
+            continue
         conclusion = str(check.get("conclusion") or "").lower()
-        if conclusion not in _FAILED_CHECK_CONCLUSIONS:
+        if conclusion != "failure":
             continue
         name = str(check.get("name") or "").strip() or "unnamed-check"
-        # Skip conforma / registry noise; PR build failures matter for GAP.
         if _CONFORMA_NAME_HINT in name.lower():
+            continue
+        if not _is_on_pull_request_check(name):
             continue
         url = _check_run_link(check)
         if not url:
             continue
+        if name in seen_names:
+            continue
+        seen_names.add(name)
         candidates.append(BuildCheckLink(name=name, conclusion=conclusion, url=url))
 
-    candidates.sort(key=_check_priority)
-    # Drop bare on-push entries when an on-pull-request link exists for the row.
-    has_pr_build = any("on-pull-request" in c.name.lower() for c in candidates)
-    if has_pr_build:
-        candidates = [
-            c
-            for c in candidates
-            if not (
-                "on-push" in c.name.lower() and "on-pull-request" not in c.name.lower()
-            )
-        ]
+    candidates.sort(key=lambda link: link.name.lower())
     return candidates[: max(0, limit)]
 
 
-def _labels_from_pr_view(pr: dict[str, Any]) -> frozenset[str]:
-    labels: set[str] = set()
-    raw = pr.get("labels") or []
-    if not isinstance(raw, list):
-        return frozenset()
-    for item in raw:
-        if isinstance(item, dict):
-            name = str(item.get("name") or "").strip()
-        else:
-            name = str(item).strip()
-        if name:
-            labels.add(name)
-    return frozenset(labels)
-
-
-def _pr_context_for_builds(
-    owner: str,
+def format_build_failure_reason(
     repo: str,
-    pr: dict[str, Any],
-    *,
-    gh_runner: Callable[[Sequence[str]], str],
-) -> PullRequestContext:
-    """Build the PR facts Stage-1 uses for PipelineRun selection."""
-    number = int(pr.get("number") or 0)
-    head_sha = str(pr.get("headRefOid") or "").strip()
-    base_ref = str(pr.get("baseRefName") or "").strip() or "main"
-    source_branch = str(pr.get("headRefName") or "").strip() or None
-    title = str(pr.get("title") or "").strip() or None
-    changed: tuple[str, ...] = ()
-    try:
-        changed = fetch_changed_files(owner, repo, number, gh_runner)
-    except (CheckQueryError, GhCommandError, TriggerParseError) as exc:
-        print(
-            f"WARNING: changed-files query failed for {owner}/{repo}#{number}: {exc}",
-            file=sys.stderr,
-        )
-    return PullRequestContext(
-        number=number,
-        base_ref=base_ref,
-        head_sha=head_sha,
-        labels=_labels_from_pr_view(pr),
-        changed_files=changed,
-        source_branch=source_branch,
-        title=title,
-        target_url=str(pr.get("url") or "") or None,
-    )
-
-
-def _link_from_check_run(run: CheckRun) -> str | None:
-    """Prefer PipelineRun details_url; else GitHub check html_url (same as CheckRun.link)."""
-    return run.link
+    pr_number: int,
+    links: Sequence[BuildCheckLink],
+) -> str:
+    """Reason text that matches the Build links column (same names and count)."""
+    prefix = f"{repo}#{pr_number} build-failure"
+    if not links:
+        return prefix
+    first = _short_check_label(links[0].name)
+    conc = links[0].conclusion or "failure"
+    text = f"{prefix}: {first} concluded {conc}"
+    extra = len(links) - 1
+    if extra > 0:
+        text += f" (+{extra} more)"
+    return text
 
 
 def fetch_failed_build_check_links(
@@ -414,20 +343,19 @@ def fetch_failed_build_check_links(
     limit: int = 5,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> tuple[BuildCheckLink, ...]:
-    """Return failed checks Stage-1 expects for this child PR.
+    """Failed on-pull-request Konflux checks on this SHA (GitHub Checks only).
 
-    Uses ``select_build_checks`` + tekton PipelineRun YAML (same as
-    ``gap_pr_monitor``) so the summary links the builds that actually gate
-    the PR — not every Konflux check on the SHA. Falls back to a
-    Konflux-app filter when tekton selection is unavailable.
+    ``pr`` / ``app_id`` are accepted for call-site compatibility; selection does
+    not use ``.tekton`` or CEL. Link a check when it is completed, conclusion
+    is failure, and the name contains ``on-pull-request``.
     """
+    del pr, app_id  # unused; kept so existing call sites stay valid
     if not head_sha:
         return ()
     run = gh_runner or _run_gh
     slug = app_slug
-    aid = app_id
     if slug is None:
-        slug, aid = default_build_producer()
+        slug, _ = default_build_producer()
 
     try:
         check_runs = list_check_runs(owner, repo, head_sha, run)
@@ -438,46 +366,10 @@ def fetch_failed_build_check_links(
         )
         return ()
 
-    expected_links: list[BuildCheckLink] = []
-    if pr is not None:
-        try:
-            documents = fetch_tekton_documents(owner, repo, head_sha, run)
-            context = _pr_context_for_builds(owner, repo, pr, gh_runner=run)
-            expected = select_build_checks(
-                documents, context, app_slug=slug, app_id=aid
-            )
-            for item in expected:
-                matched = latest_matching(item, check_runs)
-                if matched is None:
-                    continue
-                conclusion = (matched.conclusion or "").lower()
-                if conclusion not in _FAILED_CHECK_CONCLUSIONS:
-                    continue
-                url = _link_from_check_run(matched)
-                if not url:
-                    continue
-                expected_links.append(
-                    BuildCheckLink(
-                        name=matched.name or item.name_suffix or item.key,
-                        conclusion=conclusion,
-                        url=url,
-                    )
-                )
-        except (CheckQueryError, TriggerParseError, GhCommandError, ValueError) as exc:
-            print(
-                f"WARNING: expected-build selection failed for "
-                f"{owner}/{repo}@{head_sha[:12]}: {exc}; falling back",
-                file=sys.stderr,
-            )
-            expected_links = []
-
-    if expected_links:
-        return tuple(expected_links[: max(0, limit)])
-
-    # Fallback: same Konflux-app filter used before tekton alignment.
     raw_runs = [
         {
             "name": c.name,
+            "status": c.status,
             "conclusion": c.conclusion,
             "details_url": c.details_url,
             "html_url": c.html_url,
@@ -528,20 +420,49 @@ def build_child_row(
     gap_desc = fetch_gap_status_description(
         ref.owner, ref.repo, head_sha, gh_runner=gh_runner
     )
-    build_links = fetch_failed_build_check_links(
-        ref.owner, ref.repo, head_sha, pr=pr, gh_runner=gh_runner
-    )
     close_reason = None
     if pr_state == "closed":
         comments = list_issue_comments(pr_url, gh_runner=gh_runner)
         close_reason = extract_close_reason_from_comments(comments)
+
+    # Build links only for build-failure. merge-failure / build-pending / new:
+    # reason text only — never attach push or unrelated PR build links.
+    status_key = (state_status or "").strip()
+    if status_key in {"merge-failure", "build-pending", "new"}:
+        build_links: tuple[BuildCheckLink, ...] = ()
+    else:
+        build_links = fetch_failed_build_check_links(
+            ref.owner,
+            ref.repo,
+            head_sha,
+            pr=pr,
+            limit=20,
+            gh_runner=gh_runner,
+        )
 
     reason_parts: list[str] = []
     if pr_state == "closed":
         reason_parts.append("CLOSED" + (" (merged)" if merged else " (not merged)"))
         if close_reason:
             reason_parts.append(close_reason)
-    if gap_desc:
+    if status_key in {"build-pending", "new"}:
+        reason_parts.append("builds pending")
+    elif status_key == "merge-failure":
+        reason_parts.append(gap_desc or f"{repo}#{number} merge-failure")
+    elif status_key == "build-failure" or (
+        pr_state == "closed"
+        and status_key not in {"merge-failure", "build-pending", "new"}
+    ):
+        # Reason names/count must match Build links (not the Stage-1 status blurb).
+        if build_links or status_key == "build-failure":
+            reason_parts.append(
+                format_build_failure_reason(repo, number, build_links)
+            )
+        elif gap_desc:
+            reason_parts.append(gap_desc)
+        else:
+            reason_parts.append(f"{repo}#{number} build-failure")
+    elif gap_desc:
         reason_parts.append(gap_desc)
     elif state_status:
         reason_parts.append(f"state pr-status={state_status}")
@@ -650,9 +571,10 @@ def render_summary_markdown(
         "This comment is maintained by `gap-failure-reporter` "
         "(one comment, updated each run).",
         "",
-        "Build links are the failed Konflux checks selected the same way as Stage-1 "
-        "(``.tekton`` PipelineRuns / ``select_build_checks``). URL prefers a "
-        "PipelineRun page, else the GitHub check run — no cluster token required.",
+        "Build links are completed Konflux check failures whose name includes "
+        "``on-pull-request`` (GitHub Checks only; never ``on-push``). URL prefers "
+        "a PipelineRun page, else the GitHub check run — no cluster token required. "
+        "``merge-failure`` / ``build-pending`` rows leave Build links blank.",
         "",
     ]
     if creator_outcomes:

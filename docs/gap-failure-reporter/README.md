@@ -2,9 +2,10 @@
 
 Upserts **one** markdown table comment on the Leader PR listing children that
 are `build-failure`, `merge-failure`, `build-pending`, `new`, or **closed**,
-including close reasons from PR comments and clickable build links for the
-same Konflux checks Stage-1 expects (``select_build_checks`` / ``.tekton``),
-preferring PipelineRun URLs over Konflux UI home pages.
+including close reasons from PR comments. For `build-failure` rows, Build links
+are completed Konflux GitHub Checks whose name includes `on-pull-request`
+(never `on-push`), preferring PipelineRun URLs over Konflux UI home pages.
+`merge-failure` / `build-pending` rows leave Build links blank.
 
 ## How it runs
 
