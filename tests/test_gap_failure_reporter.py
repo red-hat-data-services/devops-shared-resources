@@ -41,13 +41,87 @@ def test_should_report_closed_even_if_success_status() -> None:
     assert fr.should_report_child(state_status="build-pending", pr_state="open") is True
 
 
-def test_select_failed_build_checks_prefers_non_conforma() -> None:
+def test_fetch_failed_links_uses_expected_build_checks(monkeypatch) -> None:
+    """Only failing checks that Stage-1 would expect are linked."""
+    from lib.github_check_runs import CheckRun, ExpectedCheck
+
+    runs = [
+        CheckRun(
+            id=2,
+            name="Konflux / odh-foo-on-pull-request-9",
+            status="completed",
+            conclusion="failure",
+            head_sha="abc",
+            html_url="https://github.com/acme/r/runs/2",
+            details_url=(
+                "https://konflux-ui.example/ns/t/pipelinerun/odh-foo-on-pull-request-9-abc"
+            ),
+            external_id=None,
+            app_slug="konflux-internal-p02",
+            app_id=None,
+            started_at=None,
+        ),
+        CheckRun(
+            id=3,
+            name="Konflux / odh-foo-on-push",
+            status="completed",
+            conclusion="failure",
+            head_sha="abc",
+            html_url="https://github.com/acme/r/runs/3",
+            details_url="https://konflux-ui.example",
+            external_id=None,
+            app_slug="konflux-internal-p02",
+            app_id=None,
+            started_at=None,
+        ),
+    ]
+    expected = [
+        ExpectedCheck(
+            key="odh-foo",
+            name_suffix="odh-foo-on-pull-request-9",
+            app_slug="konflux-internal-p02",
+        )
+    ]
+
+    monkeypatch.setattr(fr, "list_check_runs", lambda *a, **k: runs)
+    monkeypatch.setattr(fr, "fetch_tekton_documents", lambda *a, **k: ["doc"])
+    monkeypatch.setattr(fr, "fetch_changed_files", lambda *a, **k: ())
+    monkeypatch.setattr(fr, "select_build_checks", lambda *a, **k: expected)
+
+    links = fr.fetch_failed_build_check_links(
+        "acme",
+        "r",
+        "abc",
+        pr={
+            "number": 9,
+            "headRefOid": "abc",
+            "baseRefName": "rhoai-2.25",
+            "headRefName": "feature",
+            "title": "t",
+            "labels": [],
+            "url": "https://github.com/acme/r/pull/9",
+        },
+        gh_runner=lambda _args: "",
+    )
+    assert len(links) == 1
+    assert links[0].name == "Konflux / odh-foo-on-pull-request-9"
+    assert "pipelinerun" in links[0].url
+
+
+def test_select_failed_build_checks_prefers_pr_pipelinerun() -> None:
     runs = [
         {
             "name": "Red Hat Konflux / conforma-registry-rhoai-prod / odh-foo",
             "conclusion": "cancelled",
             "details_url": "https://konflux.example/application-pipeline",
             "html_url": "https://github.com/acme/r/runs/1",
+            "app": {"slug": "konflux-internal-p02"},
+        },
+        {
+            "name": "Konflux Production Internal / odh-foo-on-push",
+            "conclusion": "failure",
+            "details_url": "https://konflux-ui.example",
+            "html_url": "https://github.com/acme/r/runs/9",
             "app": {"slug": "konflux-internal-p02"},
         },
         {
@@ -70,6 +144,17 @@ def test_select_failed_build_checks_prefers_non_conforma() -> None:
     assert len(links) == 1
     assert links[0].conclusion == "failure"
     assert "pipelinerun" in links[0].url
+    assert "on-pull-request" in links[0].name
+
+
+def test_check_run_link_falls_back_to_github_html_url() -> None:
+    url = fr._check_run_link(
+        {
+            "details_url": "https://konflux-ui.apps.example.com",
+            "html_url": "https://github.com/acme/r/runs/123",
+        }
+    )
+    assert url == "https://github.com/acme/r/runs/123"
 
 
 def test_format_build_links_cell_is_name_only() -> None:

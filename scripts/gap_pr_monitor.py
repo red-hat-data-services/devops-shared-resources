@@ -1122,6 +1122,40 @@ def post_leader_success(
     )
 
 
+def _post_leader_failure_summary(
+    *,
+    leader_pr_url: str,
+    repo_root: Path,
+    state_path: Path,
+    head_ref: str,
+    dry_run: bool,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> None:
+    """Upsert the Leader failure/pending/closed summary comment (best-effort).
+
+    Lazy-imports ``gap_failure_reporter`` to avoid an import cycle: that module
+    reuses helpers from this file.
+    """
+    from scripts import gap_failure_reporter as gfr
+
+    # State was just written on this checkout; pass the path explicitly and skip
+    # a redundant branch checkout.
+    summary = gfr.report_for_leader(
+        leader_pr_url=leader_pr_url,
+        repo_root=repo_root,
+        head_ref=None,
+        state_file=str(state_path),
+        dry_run=dry_run,
+        gh_runner=gh_runner,
+    )
+    prefix = "[dry-run] " if dry_run else ""
+    action = "create" if summary.created else ("update" if summary.updated else "noop")
+    print(
+        f"{prefix}Leader failure summary: {action} "
+        f"rows={len(summary.rows)} comment_id={summary.comment_id}"
+    )
+
+
 def run_monitor_publish_and_signal(
     state_path: Path,
     *,
@@ -1143,7 +1177,8 @@ def run_monitor_publish_and_signal(
     Ordering (RHOAIENG-97052 / RHAI-8079 / RHAI-10942):
       evaluate children → save state → commit/push →
       if ``early-gate-triggered``: comment ``/early-gate`` on the Leader once;
-      if ``success`` or ``failure``: post Leader green on the published SHA.
+      if ``success`` or ``failure``: post Leader green on the published SHA;
+      always (when Leader URL known): upsert failure/pending/closed summary comment.
     """
     result = run_monitor(
         state_path,
@@ -1226,6 +1261,25 @@ def run_monitor_publish_and_signal(
             "skipped Leader self-status.",
             file=sys.stderr,
         )
+
+    # After state is published, refresh the single Leader failure/pending/closed
+    # summary comment so the table matches this run's state.json.
+    # Best-effort — never fail the gate run.
+    if leader_url:
+        try:
+            _post_leader_failure_summary(
+                leader_pr_url=leader_url,
+                repo_root=repo_root,
+                state_path=result.state_path,
+                head_ref=branch,
+                dry_run=dry_run,
+                gh_runner=gh_runner,
+            )
+        except Exception as exc:  # noqa: BLE001 — summary must not fail the gate
+            print(
+                f"WARNING: Leader failure summary comment failed for {leader_url}: {exc}",
+                file=sys.stderr,
+            )
 
     return MonitorResult(
         state_path=result.state_path,

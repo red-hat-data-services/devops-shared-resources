@@ -7,8 +7,8 @@ Separate from Stage-1 build gating. Each run (hourly schedule or dispatch):
 2. Read that Leader's ``state.json``.
 3. For build-failure / merge-failure / build-pending / closed children, gather
    GitHub PR state, GAP commit-status description, comment-derived close
-   reasons, and **failed/cancelled Konflux GitHub check** ``details_url`` links
-   (no Konflux cluster token required).
+   reasons, and failed Konflux checks selected like Stage-1
+   (``select_build_checks``; PipelineRun / check URL; no cluster token).
 4. Upsert **one** Leader issue comment marked ``<!-- gap-failure-summary -->``
    (create once, then PATCH the same comment) so the thread stays tidy.
 """
@@ -30,6 +30,21 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lib.gap_check_selection import (
+    DEFAULT_BUILD_APP_SLUG,
+    PullRequestContext,
+    default_build_producer,
+    fetch_changed_files,
+    fetch_tekton_documents,
+    select_build_checks,
+)
+from lib.github_check_runs import (
+    CheckQueryError,
+    CheckRun,
+    latest_matching,
+    list_check_runs,
+)
+from lib.pac_cel import TriggerParseError
 from lib.pr_status_updater import GhCommandError, parse_pr_url
 from scripts import gap_pr_monitor as gpm
 
@@ -48,7 +63,6 @@ ENV_TRIGGER_ID = gpm.ENV_TRIGGER_ID
 
 SUMMARY_MARKER = "<!-- gap-failure-summary -->"
 DEFAULT_CHECK_NAME = "gated artifacts promoter"
-DEFAULT_BUILD_APP_SLUG = "konflux-internal-p02"
 _CONFORMA_NAME_HINT = "conforma-registry"
 
 REPORT_PR_STATUSES = frozenset(
@@ -190,7 +204,8 @@ def fetch_pull_request(
             "-R",
             ref.slug,
             "--json",
-            "number,url,state,mergedAt,title,headRefOid,closedAt",
+            "number,url,state,mergedAt,title,headRefOid,closedAt,"
+            "baseRefName,headRefName,labels",
         ]
     )
     try:
@@ -234,20 +249,60 @@ def fetch_gap_status_description(
     return None
 
 
+def _is_generic_konflux_ui(url: str) -> bool:
+    """True for Konflux home / application-pipeline pages (not a specific run)."""
+    lowered = (url or "").strip().lower().rstrip("/")
+    if not lowered:
+        return True
+    if "application-pipeline" in lowered:
+        return True
+    # Bare UI host with no /ns/.../pipelinerun/... path.
+    if "konflux" in lowered and "/pipelinerun/" not in lowered:
+        # Allow github.com check pages; those are not konflux UI roots.
+        if "github.com" in lowered:
+            return False
+        return True
+    return False
+
+
 def _check_run_link(check: dict[str, Any]) -> str | None:
+    """Prefer a specific PipelineRun URL, else the GitHub check run page.
+
+    Many Konflux checks set ``details_url`` to the Konflux UI home page, which
+    is useless for operators. In that case fall back to ``html_url``.
+    """
     details = str(check.get("details_url") or "").strip()
+    html = str(check.get("html_url") or "").strip()
     if details and "pipelinerun" in details.lower():
         return details
-    if details and "application-pipeline" not in details:
+    if html:
+        return html
+    if details and not _is_generic_konflux_ui(details):
         return details
-    html = str(check.get("html_url") or "").strip()
-    return html or details or None
+    return None
 
 
 def _short_check_label(name: str) -> str:
     parts = [p.strip() for p in (name or "").split("/") if p.strip()]
     label = parts[-1] if parts else (name or "build")
     return _clip(label, 72)
+
+
+def _check_priority(link: BuildCheckLink) -> tuple[int, int, str]:
+    """Lower tuple sorts first: PR PipelineRuns before push/noise."""
+    name = link.name.lower()
+    url = link.url.lower()
+    if _CONFORMA_NAME_HINT in name:
+        bucket = 3
+    elif "on-push" in name and "on-pull-request" not in name:
+        bucket = 2
+    elif "on-pull-request" in name or "/pipelinerun/" in url:
+        bucket = 0
+    else:
+        bucket = 1
+    # Prefer failure over cancelled within a bucket.
+    conc = 0 if link.conclusion == "failure" else 1
+    return (bucket, conc, name)
 
 
 def select_failed_build_checks(
@@ -266,13 +321,80 @@ def select_failed_build_checks(
         conclusion = str(check.get("conclusion") or "").lower()
         if conclusion not in _FAILED_CHECK_CONCLUSIONS:
             continue
+        name = str(check.get("name") or "").strip() or "unnamed-check"
+        # Skip conforma / registry noise; PR build failures matter for GAP.
+        if _CONFORMA_NAME_HINT in name.lower():
+            continue
         url = _check_run_link(check)
         if not url:
             continue
-        name = str(check.get("name") or "").strip() or "unnamed-check"
         candidates.append(BuildCheckLink(name=name, conclusion=conclusion, url=url))
-    preferred = [c for c in candidates if _CONFORMA_NAME_HINT not in c.name.lower()]
-    return (preferred or candidates)[: max(0, limit)]
+
+    candidates.sort(key=_check_priority)
+    # Drop bare on-push entries when an on-pull-request link exists for the row.
+    has_pr_build = any("on-pull-request" in c.name.lower() for c in candidates)
+    if has_pr_build:
+        candidates = [
+            c
+            for c in candidates
+            if not (
+                "on-push" in c.name.lower() and "on-pull-request" not in c.name.lower()
+            )
+        ]
+    return candidates[: max(0, limit)]
+
+
+def _labels_from_pr_view(pr: dict[str, Any]) -> frozenset[str]:
+    labels: set[str] = set()
+    raw = pr.get("labels") or []
+    if not isinstance(raw, list):
+        return frozenset()
+    for item in raw:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item).strip()
+        if name:
+            labels.add(name)
+    return frozenset(labels)
+
+
+def _pr_context_for_builds(
+    owner: str,
+    repo: str,
+    pr: dict[str, Any],
+    *,
+    gh_runner: Callable[[Sequence[str]], str],
+) -> PullRequestContext:
+    """Build the same PR facts Alex's gate uses for PipelineRun selection."""
+    number = int(pr.get("number") or 0)
+    head_sha = str(pr.get("headRefOid") or "").strip()
+    base_ref = str(pr.get("baseRefName") or "").strip() or "main"
+    source_branch = str(pr.get("headRefName") or "").strip() or None
+    title = str(pr.get("title") or "").strip() or None
+    changed: tuple[str, ...] = ()
+    try:
+        changed = fetch_changed_files(owner, repo, number, gh_runner)
+    except (CheckQueryError, GhCommandError, TriggerParseError) as exc:
+        print(
+            f"WARNING: changed-files query failed for {owner}/{repo}#{number}: {exc}",
+            file=sys.stderr,
+        )
+    return PullRequestContext(
+        number=number,
+        base_ref=base_ref,
+        head_sha=head_sha,
+        labels=_labels_from_pr_view(pr),
+        changed_files=changed,
+        source_branch=source_branch,
+        title=title,
+        target_url=str(pr.get("url") or "") or None,
+    )
+
+
+def _link_from_check_run(run: CheckRun) -> str | None:
+    """Prefer PipelineRun details_url; else GitHub check html_url (same as CheckRun.link)."""
+    return run.link
 
 
 def fetch_failed_build_check_links(
@@ -280,46 +402,84 @@ def fetch_failed_build_check_links(
     repo: str,
     head_sha: str,
     *,
-    app_slug: str = DEFAULT_BUILD_APP_SLUG,
+    pr: dict[str, Any] | None = None,
+    app_slug: str | None = None,
+    app_id: int | None = None,
     limit: int = 5,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> tuple[BuildCheckLink, ...]:
+    """Return failed checks Alex's gate expects for this child PR.
+
+    Uses ``select_build_checks`` + tekton PipelineRun YAML (same as
+    ``gap_pr_monitor`` / Stage-1) so the summary links the builds that
+    actually gate the PR — not every Konflux check on the SHA.
+    Falls back to a Konflux-app filter when tekton selection is unavailable.
+    """
     if not head_sha:
         return ()
     run = gh_runner or _run_gh
-    endpoint = f"repos/{owner}/{repo}/commits/{head_sha}/check-runs?per_page=100"
+    slug = app_slug
+    aid = app_id
+    if slug is None:
+        slug, aid = default_build_producer()
+
     try:
-        raw = run(["api", endpoint, "--paginate", "--slurp"])
-    except GhCommandError as exc:
+        check_runs = list_check_runs(owner, repo, head_sha, run)
+    except CheckQueryError as exc:
         print(
             f"WARNING: check-runs query failed for {owner}/{repo}@{head_sha[:12]}: {exc}",
             file=sys.stderr,
         )
         return ()
-    text = (raw or "").strip()
-    if not text:
-        return ()
-    try:
-        data = json.loads(text)
-    except json.JSONDecodeError:
-        return ()
 
-    runs: list[dict[str, Any]] = []
-    pages: list[Any]
-    if isinstance(data, list) and data and all(
-        isinstance(x, dict) and "check_runs" in x for x in data
-    ):
-        pages = data
-    elif isinstance(data, dict) and "check_runs" in data:
-        pages = [data]
-    else:
-        pages = []
-    for page in pages:
-        if isinstance(page, dict):
-            for item in page.get("check_runs") or []:
-                if isinstance(item, dict):
-                    runs.append(item)
-    return tuple(select_failed_build_checks(runs, app_slug=app_slug, limit=limit))
+    expected_links: list[BuildCheckLink] = []
+    if pr is not None:
+        try:
+            documents = fetch_tekton_documents(owner, repo, head_sha, run)
+            context = _pr_context_for_builds(owner, repo, pr, gh_runner=run)
+            expected = select_build_checks(
+                documents, context, app_slug=slug, app_id=aid
+            )
+            for item in expected:
+                matched = latest_matching(item, check_runs)
+                if matched is None:
+                    continue
+                conclusion = (matched.conclusion or "").lower()
+                if conclusion not in _FAILED_CHECK_CONCLUSIONS:
+                    continue
+                url = _link_from_check_run(matched)
+                if not url:
+                    continue
+                expected_links.append(
+                    BuildCheckLink(
+                        name=matched.name or item.name_suffix or item.key,
+                        conclusion=conclusion,
+                        url=url,
+                    )
+                )
+        except (CheckQueryError, TriggerParseError, GhCommandError, ValueError) as exc:
+            print(
+                f"WARNING: expected-build selection failed for "
+                f"{owner}/{repo}@{head_sha[:12]}: {exc}; falling back",
+                file=sys.stderr,
+            )
+            expected_links = []
+
+    if expected_links:
+        return tuple(expected_links[: max(0, limit)])
+
+    # Fallback: same Konflux-app filter used before tekton alignment.
+    raw_runs = [
+        {
+            "name": c.name,
+            "conclusion": c.conclusion,
+            "details_url": c.details_url,
+            "html_url": c.html_url,
+            "app": {"slug": c.app_slug},
+        }
+        for c in check_runs
+    ]
+    return tuple(select_failed_build_checks(raw_runs, app_slug=slug, limit=limit))
 
 
 def format_build_links_cell(links: Sequence[BuildCheckLink]) -> str:
@@ -363,7 +523,7 @@ def build_child_row(
         ref.owner, ref.repo, head_sha, gh_runner=gh_runner
     )
     build_links = fetch_failed_build_check_links(
-        ref.owner, ref.repo, head_sha, gh_runner=gh_runner
+        ref.owner, ref.repo, head_sha, pr=pr, gh_runner=gh_runner
     )
     close_reason = None
     if pr_state == "closed":
@@ -410,8 +570,9 @@ def render_summary_markdown(
         "This comment is maintained by `gap-failure-reporter` "
         "(one comment, updated each run).",
         "",
-        "Build links come from **GitHub Checks** (`details_url` / check run URL) "
-        "for failed or cancelled Konflux checks — no cluster token required.",
+        "Build links are the failed Konflux checks selected the same way as Stage-1 "
+        "(``.tekton`` PipelineRuns / ``select_build_checks``). URL prefers a "
+        "PipelineRun page, else the GitHub check run — no cluster token required.",
         "",
     ]
     if not rows:
