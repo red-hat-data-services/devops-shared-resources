@@ -41,6 +41,87 @@ def test_should_report_closed_even_if_success_status() -> None:
     assert fr.should_report_child(state_status="build-pending", pr_state="open") is True
 
 
+def test_reporter_matches_alex_selection_excludes_on_push() -> None:
+    """Same select_build_checks as Stage-1: on-event=[push] is not expected on a PR."""
+    from lib.gap_check_selection import PullRequestContext, select_build_checks
+    from lib.github_check_runs import CheckRun, latest_matching
+
+    pr_yaml = """
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: odh-foo-on-pull-request-{{pull_request_number}}
+  labels:
+    appstudio.openshift.io/component: odh-foo
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[pull_request]"
+    pipelinesascode.tekton.dev/on-target-branch: "[{{target_branch}}]"
+"""
+    push_yaml = """
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: odh-foo-on-push
+  labels:
+    appstudio.openshift.io/component: odh-foo-push
+  annotations:
+    pipelinesascode.tekton.dev/on-event: "[push]"
+    pipelinesascode.tekton.dev/on-target-branch: "[{{target_branch}}]"
+"""
+    ctx = PullRequestContext(
+        number=9,
+        base_ref="rhoai-2.25",
+        head_sha="abc",
+        labels=frozenset(),
+        changed_files=("src/main.go",),
+    )
+    expected = select_build_checks(
+        [pr_yaml, push_yaml], ctx, app_slug="konflux-internal-p02"
+    )
+    assert [item.name_suffix for item in expected] == ["odh-foo-on-pull-request-9"]
+
+    runs = [
+        CheckRun(
+            id=1,
+            name="Konflux / odh-foo-on-pull-request-9",
+            status="completed",
+            conclusion="failure",
+            head_sha="abc",
+            html_url="https://github.com/acme/r/runs/1",
+            details_url=(
+                "https://konflux-ui.example/ns/t/pipelinerun/odh-foo-on-pull-request-9-x"
+            ),
+            external_id=None,
+            app_slug="konflux-internal-p02",
+            app_id=None,
+            started_at=None,
+        ),
+        CheckRun(
+            id=2,
+            name="Konflux / odh-foo-on-push",
+            status="completed",
+            conclusion="failure",
+            head_sha="abc",
+            html_url="https://github.com/acme/r/runs/2",
+            details_url="https://konflux-ui.example",
+            external_id=None,
+            app_slug="konflux-internal-p02",
+            app_id=None,
+            started_at=None,
+        ),
+    ]
+    # Same loop as fetch_failed_build_check_links after select_build_checks.
+    linked = []
+    for item in expected:
+        matched = latest_matching(item, runs)
+        if matched is None:
+            continue
+        if (matched.conclusion or "").lower() not in fr._FAILED_CHECK_CONCLUSIONS:
+            continue
+        linked.append(matched.name)
+    assert linked == ["Konflux / odh-foo-on-pull-request-9"]
+
+
 def test_fetch_failed_links_uses_expected_build_checks(monkeypatch) -> None:
     """Only failing checks that Stage-1 would expect are linked."""
     from lib.github_check_runs import CheckRun, ExpectedCheck
