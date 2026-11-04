@@ -546,20 +546,34 @@ def build_child_row(
     gap_desc = fetch_gap_status_description(
         ref.owner, ref.repo, head_sha, gh_runner=gh_runner
     )
-    build_links = fetch_failed_build_check_links(
-        ref.owner, ref.repo, head_sha, pr=pr, gh_runner=gh_runner
-    )
     close_reason = None
     if pr_state == "closed":
         comments = list_issue_comments(pr_url, gh_runner=gh_runner)
         close_reason = extract_close_reason_from_comments(comments)
+
+    # Build links only for build-failure (and closed children that failed builds).
+    # merge-failure / build-pending / new: reason text only — no push/PR build links.
+    status_key = (state_status or "").strip()
+    if status_key in {"merge-failure", "build-pending", "new"}:
+        build_links: tuple[BuildCheckLink, ...] = ()
+    else:
+        build_links = fetch_failed_build_check_links(
+            ref.owner,
+            ref.repo,
+            head_sha,
+            pr=pr,
+            limit=20,
+            gh_runner=gh_runner,
+        )
 
     reason_parts: list[str] = []
     if pr_state == "closed":
         reason_parts.append("CLOSED" + (" (merged)" if merged else " (not merged)"))
         if close_reason:
             reason_parts.append(close_reason)
-    if gap_desc:
+    if status_key in {"build-pending", "new"}:
+        reason_parts.append(gap_desc or "builds pending")
+    elif gap_desc:
         reason_parts.append(gap_desc)
     elif state_status:
         reason_parts.append(f"state pr-status={state_status}")
@@ -594,9 +608,8 @@ def render_summary_markdown(
         "This comment is maintained by `gap-failure-reporter` "
         "(one comment, updated each run).",
         "",
-        "Build links are the failed Konflux checks selected the same way as Stage-1 "
-        "(``.tekton`` PipelineRuns / ``select_build_checks``). URL prefers a "
-        "PipelineRun page, else the GitHub check run — no cluster token required.",
+        "Build links (build-failure only): failed on-pull-request Konflux checks "
+        "from Stage-1 selection. merge-failure / build-pending leave this column empty.",
         "",
     ]
     if not rows:

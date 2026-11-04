@@ -41,6 +41,71 @@ def test_should_report_closed_even_if_success_status() -> None:
     assert fr.should_report_child(state_status="build-pending", pr_state="open") is True
 
 
+def test_build_child_row_skips_links_for_pending_and_merge_failure(monkeypatch) -> None:
+    def fake_pr(_url: str, *, gh_runner=None):
+        return {
+            "number": 9,
+            "url": "https://github.com/acme/r/pull/9",
+            "state": "OPEN",
+            "mergedAt": None,
+            "title": "t",
+            "headRefOid": "abc",
+            "closedAt": None,
+            "baseRefName": "main",
+            "headRefName": "feature",
+            "labels": [],
+        }
+
+    calls: list[str] = []
+
+    def fake_links(*_a, **_k):
+        calls.append("links")
+        return (
+            fr.BuildCheckLink(
+                name="odh-foo-on-pull-request-9",
+                conclusion="failure",
+                url="https://example/pipelinerun/x",
+            ),
+        )
+
+    monkeypatch.setattr(fr, "fetch_pull_request", fake_pr)
+    monkeypatch.setattr(fr, "fetch_gap_status_description", lambda *a, **k: "desc")
+    monkeypatch.setattr(fr, "fetch_failed_build_check_links", fake_links)
+
+    pending = fr.build_child_row(
+        {
+            "repo": "r",
+            "pr-url": "https://github.com/acme/r/pull/9",
+            "pr-status": "build-pending",
+        }
+    )
+    assert pending is not None
+    assert pending.build_links == ()
+    assert "pending" in pending.reason.lower() or pending.reason == "desc"
+
+    merge_fail = fr.build_child_row(
+        {
+            "repo": "r",
+            "pr-url": "https://github.com/acme/r/pull/9",
+            "pr-status": "merge-failure",
+        }
+    )
+    assert merge_fail is not None
+    assert merge_fail.build_links == ()
+    assert calls == []  # must not fetch links for pending/merge-failure
+
+    failure = fr.build_child_row(
+        {
+            "repo": "r",
+            "pr-url": "https://github.com/acme/r/pull/9",
+            "pr-status": "build-failure",
+        }
+    )
+    assert failure is not None
+    assert len(failure.build_links) == 1
+    assert calls == ["links"]
+
+
 def test_fetch_failed_links_drops_on_push_even_when_expected(monkeypatch) -> None:
     """Summary never links on-push pipelines for child PRs (pending or failure)."""
     from lib.github_check_runs import CheckRun, ExpectedCheck
@@ -344,6 +409,7 @@ def test_render_summary_markdown_table() -> None:
         "[odh-kuberay-on-pull-request-1](https://konflux-ui.example/ns/rhoai-tenant/pipelinerun/odh-kuberay-1)"
         in body
     )
+    assert "build-failure only" in body
 
 
 def test_find_summary_comment() -> None:
