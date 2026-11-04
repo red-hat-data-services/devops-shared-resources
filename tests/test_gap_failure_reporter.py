@@ -41,7 +41,7 @@ def test_should_report_closed_even_if_success_status() -> None:
     assert fr.should_report_child(state_status="build-pending", pr_state="open") is True
 
 
-def test_reporter_matches_alex_selection_excludes_on_push() -> None:
+def test_reporter_matches_stage1_selection_excludes_on_push() -> None:
     """Same select_build_checks as Stage-1: on-event=[push] is not expected on a PR."""
     from lib.gap_check_selection import PullRequestContext, select_build_checks
     from lib.github_check_runs import CheckRun, latest_matching
