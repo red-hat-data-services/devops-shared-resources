@@ -362,6 +362,55 @@ def test_mixed_generation_cli_reports_ordinary_errors_without_fixing_parents(set
     assert (directory / "widget-pull-request.yaml").exists()
 
 
+def test_shortened_names_keep_parent_matching_and_idempotence(setup):
+    """Match shortened children through unchanged labels, not their hashed name prefix."""
+    root, directory, config, push, parent_path = setup
+    prefix = "odh-data-science-pipelines-argo-workflowcontroller"
+    push["metadata"]["name"] = prefix + "-v3-6-on-push"
+    push["metadata"]["labels"]["appstudio.openshift.io/component"] = prefix + "-v3-6"
+    write(parent_path, push)
+    before = parent_path.read_bytes()
+    data = YAML(typ="safe").load((config / "config.yaml").read_text())
+    data["templates"][1]["parent"]["match_fn"].insert(0, "component_label_match")
+    write(config / "config.yaml", data)
+    template = config / "pull-request.yaml.j2"
+    short_name_template = """metadata:
+  name: "{{ metadata.name.split('-on-pull-request')[0] | shorten_name(36) }}-on-pull-request"
+"""
+    template.write_text(template.read_text().replace("metadata:\n", short_name_template, 1))
+    assert fix(root, config)[0]
+    child_path = directory / (prefix + "-pull-request.yaml")
+    child = YAML(typ="safe").load(child_path.read_text())
+    assert len(child["metadata"]["name"].removesuffix("-on-pull-request")) <= 36
+    assert child["metadata"]["labels"] == push["metadata"]["labels"]
+    assert not any(item["errors"] or item["warnings"] for item in validate(root, config).values())
+    assert not fix(root, config)[0]
+    assert parent_path.read_bytes() == before
+
+
+@pytest.mark.parametrize("duplicate", [False, True])
+def test_legacy_branch_placeholder_reuses_child_without_weakening_ambiguity(setup, duplicate):
+    """Reconcile generic-label legacy PRs, but still reject duplicate children."""
+    root, directory, config, push, parent_path = setup
+    old = copy.deepcopy(push)
+    old["metadata"]["name"] = "widget-{{target_branch}}-on-pull-request-43048"
+    old["metadata"]["labels"]["appstudio.openshift.io/component"] = "pull-request-pipelines"
+    child = directory / "widget-pull-request.yaml"
+    write(child, old)
+    if duplicate:
+        write(directory / "duplicate-pull-request.yaml", old)
+        before = {p.name: p.read_bytes() for p in directory.iterdir()}
+        assert not fix(root, config)[0]
+        assert any("ambiguous child" in error for item in validate(root, config).values() for error in item["errors"])
+        assert before == {p.name: p.read_bytes() for p in directory.iterdir()}
+    else:
+        before = parent_path.read_bytes()
+        assert fix(root, config)[0] == [str(child)]
+        assert not any(item["errors"] or item["warnings"] for item in validate(root, config).values())
+        assert not fix(root, config)[0]
+        assert parent_path.read_bytes() == before
+
+
 def test_generate_rejects_empty_mapping(setup):
     """An explicitly empty generation policy is invalid rather than disabled."""
     _, _, config, _, _ = setup

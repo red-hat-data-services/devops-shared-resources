@@ -64,6 +64,23 @@ YAML, and unsupported configured parent fields fail before PipelineRun writes.
 Orphan children are warnings, never deleted. Missing parents fail the run.
 Normal template-only validation/fix behavior is unchanged without generate.
 
+For consumers with bounded metadata names, `shorten_name(max_length)` leaves
+short strings unchanged and shortens longer ones to a readable prefix plus
+`-` and the first eight lowercase hex characters of SHA-256 of the full input.
+It requires an integer limit of at least 10. It does not sanitize names or set
+consumer naming policy. Reapplying it to an already bounded name is a no-op.
+
+The optional `component_label_match` parent matcher compares exact, nonempty
+`appstudio.openshift.io/component` labels, independently of metadata names.
+Consumers shortening child names can put it before prefix/alias matchers to
+retain parent matching without changing component labels. Missing or different
+labels do not match; existing ambiguous-parent/child checks still apply.
+
+Legacy PR names may include the exact terminal `-{{target_branch}}` release
+placeholder before their event suffix. Component-prefix extraction recognizes
+that placeholder (including whitespace inside the braces), but does not strip
+arbitrary placeholders or bypass ambiguity/filename-collision checks.
+
 ## Release CEL filter
 
 to_release_pr_cel(branch, filename) is a registered filter in tekton_filters.py.

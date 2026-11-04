@@ -94,6 +94,15 @@ def is_scheduled_pipeline(name, data):
 
 
 @parent_matcher
+def component_label_match(parent_data, child_data):
+    """Match exact nonempty component labels independently of metadata name length."""
+    key = "appstudio.openshift.io/component"
+    parent = parent_data.get("metadata", {}).get("labels", {}).get(key)
+    child = child_data.get("metadata", {}).get("labels", {}).get(key)
+    return isinstance(parent, str) and bool(parent) and parent == child
+
+
+@parent_matcher
 def exact_component_match(parent_data, child_data):
     """Match when parent and child have the same component prefix."""
     parent_prefix = extract_component_prefix("", parent_data)

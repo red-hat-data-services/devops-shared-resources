@@ -458,6 +458,18 @@ def to_pr_cel(value):
 
 
 @jinja_filter
+def shorten_name(value, max_length):
+    """Bound a name with a readable prefix and stable hash; leave short names intact."""
+    import hashlib
+    if not isinstance(value, str) or not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 10:
+        raise ValidationError("shorten_name requires a string and maximum length >= 10")
+    if len(value) <= max_length:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return value[:max_length - 9].rstrip("-") + "-" + digest
+
+
+@jinja_filter
 def to_release_pr_cel(value, branch, filename):
     """Convert exact-release push CEL to PR CEL, retaining every other clause."""
     import json

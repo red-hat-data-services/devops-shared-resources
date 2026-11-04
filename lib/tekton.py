@@ -76,6 +76,7 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
     '-on-push'/'-on-pull-request'/'-on-schedule' convention as well as terminal
     '-push'/'-schedule' suffixes and PR names ending in '-pull-request',
     optionally followed by a number or '{{pull_request_number}}', without '-on-'.
+    Legacy terminal '-{{target_branch}}' release placeholders are stripped too.
 
     'odh-dashboard-v3-5-on-push' → 'odh-dashboard'
     'odh-dashboard-on-pull-request' → 'odh-dashboard'
@@ -95,13 +96,13 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
                 )
             prefix = re.sub(r"-v\d+-\d+.*$", "", prefix)
             if prefix != meta_name:
-                return prefix
+                return re.sub(r"-\{\{\s*target_branch\s*\}\}$", "", prefix)
 
     name = filename.removesuffix(".yaml")
     if "-pull-request" in name:
         prefix = name.split("-pull-request")[0].removesuffix("-on")
         m = re.match(r"(.+)-v\d+-\d+.*$", prefix)
-        return m.group(1) if m else prefix
+        return re.sub(r"-\{\{\s*target_branch\s*\}\}$", "", m.group(1) if m else prefix)
     m = re.match(r"(.+)-v\d+-\d+.*-(push|on-push|schedule|scheduled|on-schedule)", name)
     if m:
         return m.group(1)
