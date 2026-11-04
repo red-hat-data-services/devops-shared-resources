@@ -319,11 +319,13 @@ def select_failed_build_checks(
         if str(app.get("slug") or "") != app_slug:
             continue
         conclusion = str(check.get("conclusion") or "").lower()
-        if conclusion not in _FAILED_CHECK_CONCLUSIONS:
+        if conclusion != "failure":
             continue
         name = str(check.get("name") or "").strip() or "unnamed-check"
         # Skip conforma / registry noise; PR build failures matter for GAP.
         if _CONFORMA_NAME_HINT in name.lower():
+            continue
+        if not _is_on_pull_request_check(name):
             continue
         url = _check_run_link(check)
         if not url:
@@ -398,22 +400,44 @@ def _link_from_check_run(run: CheckRun) -> str | None:
 
 
 def _is_on_push_only_check(name: str) -> bool:
-    """True for Konflux on-push pipelines (not on-pull-request).
-
-    Leader summary links are for child *pull requests*. Push pipelines are not
-    the Stage-1 PR gate operators care about; drop them even when CEL over-keeps
-    them as expected.
-    """
+    """True for Konflux on-push pipelines (not on-pull-request)."""
     lowered = (name or "").lower()
     if "on-pull-request" in lowered:
         return False
     return "on-push" in lowered
 
 
+def _is_on_pull_request_check(name: str) -> bool:
+    """Leader failure links must be PR PipelineRuns only."""
+    return "on-pull-request" in (name or "").lower()
+
+
 def _without_on_push_links(
     links: Sequence[BuildCheckLink],
 ) -> tuple[BuildCheckLink, ...]:
-    return tuple(link for link in links if not _is_on_push_only_check(link.name))
+    return tuple(
+        link
+        for link in links
+        if _is_on_pull_request_check(link.name) and not _is_on_push_only_check(link.name)
+    )
+
+
+def format_build_failure_reason(
+    repo: str,
+    pr_number: int,
+    links: Sequence[BuildCheckLink],
+) -> str:
+    """Reason text that matches the Build links column (same names and count)."""
+    prefix = f"{repo}#{pr_number} build-failure"
+    if not links:
+        return prefix
+    first = _short_check_label(links[0].name)
+    conc = links[0].conclusion or "failure"
+    text = f"{prefix}: {first} concluded {conc}"
+    extra = len(links) - 1
+    if extra > 0:
+        text += f" (+{extra} more)"
+    return text
 
 
 def fetch_failed_build_check_links(
@@ -463,14 +487,17 @@ def fetch_failed_build_check_links(
                 matched = latest_matching(item, check_runs)
                 if matched is None:
                     continue
+                # Only completed failures — never pending/success/cancelled noise.
+                if (matched.status or "").lower() != "completed":
+                    continue
                 conclusion = (matched.conclusion or "").lower()
-                if conclusion not in _FAILED_CHECK_CONCLUSIONS:
+                if conclusion != "failure":
                     continue
                 url = _link_from_check_run(matched)
                 if not url:
                     continue
                 name = matched.name or item.name_suffix or item.key
-                if _is_on_push_only_check(name):
+                if not _is_on_pull_request_check(name):
                     continue
                 expected_links.append(
                     BuildCheckLink(
@@ -551,8 +578,8 @@ def build_child_row(
         comments = list_issue_comments(pr_url, gh_runner=gh_runner)
         close_reason = extract_close_reason_from_comments(comments)
 
-    # Build links only for build-failure (and closed children that failed builds).
-    # merge-failure / build-pending / new: reason text only — no push/PR build links.
+    # Build links only for build-failure. merge-failure / build-pending / new:
+    # reason text only — never attach push or unrelated PR build links.
     status_key = (state_status or "").strip()
     if status_key in {"merge-failure", "build-pending", "new"}:
         build_links: tuple[BuildCheckLink, ...] = ()
@@ -572,7 +599,22 @@ def build_child_row(
         if close_reason:
             reason_parts.append(close_reason)
     if status_key in {"build-pending", "new"}:
-        reason_parts.append(gap_desc or "builds pending")
+        reason_parts.append("builds pending")
+    elif status_key == "merge-failure":
+        reason_parts.append(gap_desc or f"{repo}#{number} merge-failure")
+    elif status_key == "build-failure" or (
+        pr_state == "closed" and status_key not in {"merge-failure", "build-pending", "new"}
+    ):
+        # Reason names/count must match Build links (not the Stage-1 status blurb,
+        # which often names a different pending component than the failed link).
+        if build_links or status_key == "build-failure":
+            reason_parts.append(
+                format_build_failure_reason(repo, number, build_links)
+            )
+        elif gap_desc:
+            reason_parts.append(gap_desc)
+        else:
+            reason_parts.append(f"{repo}#{number} build-failure")
     elif gap_desc:
         reason_parts.append(gap_desc)
     elif state_status:
@@ -608,8 +650,9 @@ def render_summary_markdown(
         "This comment is maintained by `gap-failure-reporter` "
         "(one comment, updated each run).",
         "",
-        "Build links (build-failure only): failed on-pull-request Konflux checks "
-        "from Stage-1 selection. merge-failure / build-pending leave this column empty.",
+        "Build links (build-failure only): completed **failure** on-pull-request "
+        "checks; reason names/count match this column. No on-push. "
+        "merge-failure / build-pending leave Build links empty.",
         "",
     ]
     if not rows:

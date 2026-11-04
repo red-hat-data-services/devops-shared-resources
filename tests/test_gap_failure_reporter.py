@@ -81,7 +81,7 @@ def test_build_child_row_skips_links_for_pending_and_merge_failure(monkeypatch) 
     )
     assert pending is not None
     assert pending.build_links == ()
-    assert "pending" in pending.reason.lower() or pending.reason == "desc"
+    assert pending.reason == "builds pending"
 
     merge_fail = fr.build_child_row(
         {
@@ -92,6 +92,7 @@ def test_build_child_row_skips_links_for_pending_and_merge_failure(monkeypatch) 
     )
     assert merge_fail is not None
     assert merge_fail.build_links == ()
+    assert "desc" in merge_fail.reason
     assert calls == []  # must not fetch links for pending/merge-failure
 
     failure = fr.build_child_row(
@@ -103,7 +104,21 @@ def test_build_child_row_skips_links_for_pending_and_merge_failure(monkeypatch) 
     )
     assert failure is not None
     assert len(failure.build_links) == 1
+    assert failure.reason == (
+        "r#9 build-failure: odh-foo-on-pull-request-9 concluded failure"
+    )
     assert calls == ["links"]
+
+
+def test_format_build_failure_reason_matches_link_count() -> None:
+    links = (
+        fr.BuildCheckLink("Konflux / a-on-pull-request-1", "failure", "https://x/1"),
+        fr.BuildCheckLink("Konflux / b-on-pull-request-1", "failure", "https://x/2"),
+    )
+    assert fr.format_build_failure_reason("repo", 7, links) == (
+        "repo#7 build-failure: a-on-pull-request-1 concluded failure (+1 more)"
+    )
+    assert fr.format_build_failure_reason("repo", 7, ()) == "repo#7 build-failure"
 
 
 def test_fetch_failed_links_drops_on_push_even_when_expected(monkeypatch) -> None:
