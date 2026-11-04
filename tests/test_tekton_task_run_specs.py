@@ -8,6 +8,7 @@ from lib.tekton import ABSENT, _deep_merge, _lookup_path, render_and_merge
 
 
 def test_task_run_specs_merge_by_identity_not_position():
+    """Reconcile only the matching task/step without mutation or repeated drift."""
     existing = [
         {"pipelineTaskName": "build", "timeout": "3h"},
         {"pipelineTaskName": "rpms-signature-scan", "timeout": "20m", "stepSpecs": [
@@ -40,6 +41,7 @@ def test_task_run_specs_merge_by_identity_not_position():
 
 
 def test_missing_task_override_appends_without_dropping_existing():
+    """Append a new task override and preserve unrelated entries in place."""
     existing = [{"pipelineTaskName": "build", "timeout": "3h"}]
     template = [{"pipelineTaskName": "rpms-signature-scan", "timeout": "20m"}]
     errors = []
@@ -50,6 +52,7 @@ def test_missing_task_override_appends_without_dropping_existing():
 @pytest.mark.parametrize("existing", [{}, {"spec": {}}, {"spec": {"taskRunSpecs": []}},
     {"spec": {"taskRunSpecs": [{"pipelineTaskName": "build", "timeout": "3h"}]}}])
 def test_new_nested_overrides_do_not_emit_absent_sentinel(existing):
+    """Strip absence markers at every newly created level, idempotently."""
     template = {"spec": {"taskRunSpecs": [{
         "pipelineTaskName": "rpms-signature-scan", "stepSpecs": [{
             "name": "rpms-signature-scan", "computeResources": {
@@ -66,6 +69,7 @@ def test_new_nested_overrides_do_not_emit_absent_sentinel(existing):
 
 
 def test_lookup_nested_task_and_step_identity():
+    """Resolve a nested resource by task and step identity rather than position."""
     data = {"spec": {"taskRunSpecs": [
         {"pipelineTaskName": "build"},
         {"pipelineTaskName": "rpms-signature-scan", "stepSpecs": [
@@ -79,6 +83,7 @@ def test_lookup_nested_task_and_step_identity():
 
 
 def test_template_self_reference_uses_matching_task_and_step(tmp_path):
+    """Preserve the matching step's value when rendering a self-reference."""
     (tmp_path / "resources.yaml.j2").write_text('''spec:
   taskRunSpecs:
     - pipelineTaskName: rpms-signature-scan

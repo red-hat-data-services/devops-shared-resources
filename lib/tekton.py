@@ -463,16 +463,16 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
                     result.append(_deep_merge(p, {}))
             return result
 
+        present_items = [item for item in template if item != ABSENT]
         result = _new_list()
-        for i, tv in enumerate(template):
+        for i, tv in enumerate(present_items):
             if i < len(existing):
                 result.append(_deep_merge(tv, existing[i], errors, f"{path}[{i}]", skipped_paths))
             else:
                 empty = {} if isinstance(tv, dict) else [] if isinstance(tv, list) else None
-                if tv != ABSENT:
-                    result.append(_deep_merge(tv, empty) if empty is not None else copy.deepcopy(tv))
-        if errors is not None and len(existing) > len(template):
-            dropped = len(existing) - len(template)
+                result.append(_deep_merge(tv, empty) if empty is not None else copy.deepcopy(tv))
+        if errors is not None and len(existing) > len(present_items):
+            dropped = len(existing) - len(present_items)
             errors.append(f"{path}: {dropped} extra item(s) dropped")
         return result
 

@@ -363,6 +363,35 @@ def test_deep_merge_plain_list_drops_extra_existing_items_with_error():
     assert any("extra" in e for e in errors)
 
 
+@pytest.mark.parametrize("template", [
+    [ABSENT, "keep"],
+    ["first", ABSENT, "keep"],
+    ["keep", ABSENT],
+    [ABSENT, ABSENT],
+])
+@pytest.mark.parametrize("existing", [[], ["old"], ["old", "extra", "last"]])
+def test_deep_merge_positional_absent_is_idempotent(template, existing):
+    """Omit ABSENT before matching positions, including on repeated passes."""
+    expected = [value for value in template if value != ABSENT]
+    original = list(existing)
+    result = _deep_merge(template, existing)
+    assert result == expected
+    assert existing == original
+    errors = []
+    assert _deep_merge(template, result, errors) == expected
+    assert errors == []
+
+
+def test_deep_merge_positional_absent_preserves_present_scalar_type():
+    """Match retained values against compacted positions without losing style."""
+    from ruamel.yaml.scalarstring import SingleQuotedScalarString
+
+    existing = [SingleQuotedScalarString("old")]
+    result = _deep_merge([ABSENT, "keep"], existing)
+    assert result == ["keep"]
+    assert isinstance(result[0], SingleQuotedScalarString)
+
+
 # --- _lookup_path ---
 
 
