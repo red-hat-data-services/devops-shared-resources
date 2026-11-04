@@ -435,14 +435,15 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
     if isinstance(template, list) and isinstance(existing, list):
         _new_list = type(existing) if hasattr(existing, 'ca') else list
 
+        present_items = [item for item in template if item != ABSENT]
         identity_key = None
-        if template and isinstance(template[0], dict):
-            if "pipelineTaskName" in template[0]:
+        if present_items and isinstance(present_items[0], dict):
+            if "pipelineTaskName" in present_items[0]:
                 identity_key = "pipelineTaskName"
-            elif "name" in template[0]:
+            elif "name" in present_items[0]:
                 identity_key = "name"
         if identity_key:
-            template_by_name = {str(p[identity_key]): p for p in template}
+            template_by_name = {str(p[identity_key]): p for p in present_items}
             result = _new_list()
             for ei in existing:
                 name = str(ei.get(identity_key, ""))
@@ -463,7 +464,6 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
                     result.append(_deep_merge(p, {}))
             return result
 
-        present_items = [item for item in template if item != ABSENT]
         result = _new_list()
         for i, tv in enumerate(present_items):
             if i < len(existing):
