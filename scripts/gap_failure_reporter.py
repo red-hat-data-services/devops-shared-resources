@@ -366,7 +366,7 @@ def _pr_context_for_builds(
     *,
     gh_runner: Callable[[Sequence[str]], str],
 ) -> PullRequestContext:
-    """Build the same PR facts Alex's gate uses for PipelineRun selection."""
+    """Build the PR facts Stage-1 uses for PipelineRun selection."""
     number = int(pr.get("number") or 0)
     head_sha = str(pr.get("headRefOid") or "").strip()
     base_ref = str(pr.get("baseRefName") or "").strip() or "main"
@@ -408,12 +408,12 @@ def fetch_failed_build_check_links(
     limit: int = 5,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> tuple[BuildCheckLink, ...]:
-    """Return failed checks Alex's gate expects for this child PR.
+    """Return failed checks Stage-1 expects for this child PR.
 
     Uses ``select_build_checks`` + tekton PipelineRun YAML (same as
-    ``gap_pr_monitor`` / Stage-1) so the summary links the builds that
-    actually gate the PR — not every Konflux check on the SHA.
-    Falls back to a Konflux-app filter when tekton selection is unavailable.
+    ``gap_pr_monitor``) so the summary links the builds that actually gate
+    the PR — not every Konflux check on the SHA. Falls back to a
+    Konflux-app filter when tekton selection is unavailable.
     """
     if not head_sha:
         return ()
