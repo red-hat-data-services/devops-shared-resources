@@ -222,6 +222,38 @@ def test_ignored_bytecode_not_executed(tooling, setup, tmp_path):
     assert "IGNORED_BYTECODE_EXECUTED" not in result.stderr
 
 
+def test_missing_trusted_module_uses_import_error_without_bytecode_fallback(tooling, setup, tmp_path):
+    import py_compile
+    fake = tmp_path / "ignored.py"
+    fake.write_text("raise RuntimeError('SOURCELESS_BYTECODE_EXECUTED')\n")
+    py_compile.compile(str(fake), cfile=str(tooling / "lib/review_missing.pyc"), doraise=True)
+    source, target = setup
+    module = source / "policy.py"
+    module.write_text('''caught = 0
+try:
+    import lib.review_missing
+except ModuleNotFoundError as exc:
+    assert exc.name == "lib.review_missing"
+    caught += 1
+try:
+    from lib import review_missing
+except ImportError:
+    caught += 1
+CONTEXT_PATHS = ()
+filters = {}
+def decision(data, context):
+    assert caught == 2
+    return {"status": "skipped", "reason": "optional module unavailable", "variables": {}}
+def check(*args):
+    return True
+''')
+    commit(source)
+    report, result = plan(tooling, setup, tmp_path, "--policy-python", module)
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["status"] == "no-changes"
+    assert "SOURCELESS_BYTECODE_EXECUTED" not in result.stderr
+
+
 def test_missing_scope_noop(tooling, setup, tmp_path):
     source, target = setup
     (target / ".tekton/example.yml").unlink()

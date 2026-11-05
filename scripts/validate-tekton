@@ -45,6 +45,10 @@ if __name__ == "__main__" and any(arg in sys.argv[1:] for arg in ("--reconcile",
                 source = _repo_root.joinpath(*fullname.split("."))
                 package = source.is_dir()
                 source = source / "__init__.py" if package else source.with_suffix(".py")
+                if not source.is_file():
+                    # Preserve normal optional-import errors without falling
+                    # through to ignored bytecode or native-extension loaders.
+                    raise ModuleNotFoundError(f"No trusted source for {fullname!r}", name=fullname)
                 return importlib.util.spec_from_file_location(
                     fullname, source, loader=_SourceOnlyLoader(source),
                     submodule_search_locations=[str(source.parent)] if package else None)
@@ -202,7 +206,7 @@ def _load_parent_pipelines_from_ref(ref: str, repo_root: Path, config, layout: s
         warn(f"failed to list files from {ref}: {r.stderr.strip()}")
         return parent_indexes
 
-    yaml_files = [line for line in r.stdout.strip().split("\n") if line.endswith(".yaml")]
+    yaml_files = [line for line in r.stdout.strip().split("\n") if line.endswith((".yaml", ".yml"))]
     log(f"  loading {len(yaml_files)} files from {ref}")
 
     for filepath_str in yaml_files:

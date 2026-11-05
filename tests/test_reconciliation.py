@@ -296,6 +296,33 @@ def test_symlink_payload_directory(checkout, tmp_path):
         replay(checkout, tmp_path, manifest)
 
 
+@pytest.mark.parametrize("name", ["ignored.ctx", "context*.ctx", "context[ab].ctx"])
+def test_ignored_context_is_not_authorized_by_pathspec(checkout, tmp_path, name):
+    (checkout / "context-a.ctx").write_bytes(b"tracked")
+    git(checkout, "add", "context-a.ctx")
+    (checkout / ".gitignore").write_text("*.ctx\n")
+    git(checkout, "add", ".gitignore")
+    git(checkout, "commit", "-qm", "tracked and ignored context fixture")
+    (checkout / name).write_bytes(b"ignored")
+    report = tmp_path / "report"
+    with pytest.raises(ValueError, match="context must be tracked"):
+        r.reconcile(checkout, scope="files", report=report, provenance={},
+                    validate=lambda *args: None, select=lambda *args: ([], []), context_paths=[name])
+    assert not report.exists()
+
+
+def test_literal_tracked_context_with_pathspec_characters(checkout, tmp_path):
+    name = "context[ab]*.ctx"
+    (checkout / name).write_bytes(b"tracked literally")
+    git(checkout, "--literal-pathspecs", "add", "--", name)
+    git(checkout, "commit", "-qm", "literal context fixture")
+    def validate(stage, phase):
+        assert (stage / name).read_bytes() == b"tracked literally"
+    manifest = r.reconcile(checkout, scope="files", report=tmp_path / "report", provenance={},
+                           validate=validate, select=lambda *args: ([], []), context_paths=[name])
+    assert manifest["changes"] == []
+
+
 def test_missing_scope_is_empty(checkout, tmp_path):
     manifest = r.reconcile(checkout, scope="absent", report=tmp_path / "report", provenance={},
                            validate=lambda *args: None, select=lambda *args: ([], []))

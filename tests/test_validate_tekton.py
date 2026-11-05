@@ -708,7 +708,9 @@ def test_render_pr_parent_ref_without_parent_data_resolves_empty():
 
 @pytest.mark.parametrize("source", ["working-tree", "git-ref"])
 @pytest.mark.parametrize("scheduled_first", [False, True])
-def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, source, scheduled_first):
+@pytest.mark.parametrize("layout", ["flat", "nested"])
+@pytest.mark.parametrize("extension", ["yaml", "yml", "mixed"])
+def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, source, scheduled_first, layout, extension):
     """Push and scheduled builds sharing a component must not collide in the parent index."""
     import json
     from subprocess import CompletedProcess
@@ -721,7 +723,9 @@ def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, so
         ("scheduled", "build/schedule/operator-tekton-trigger.txt"),
     ]:
         event = "on-push" if suffix == "push" else "on-schedule"
-        files[f"pipelineruns/rhods-operator/.tekton/odh-operator-v3-6-{suffix}.yaml"] = {
+        parent_path = "pipelineruns/rhods-operator/.tekton" if layout == "nested" else ".tekton"
+        file_extension = ("yml" if suffix == "push" else "yaml") if extension == "mixed" else extension
+        files[f"{parent_path}/odh-operator-v3-6-{suffix}.{file_extension}"] = {
             "apiVersion": "tekton.dev/v1",
             "kind": "PipelineRun",
             "metadata": {
@@ -740,7 +744,8 @@ def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, so
             target = tmp_path / filepath
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(json.dumps(data))
-        _, parents, errors, _ = _vt._load_pipelines(tmp_path, None, config, layout="nested")
+        directory = tmp_path if layout == "nested" else tmp_path / ".tekton"
+        _, parents, errors, _ = _vt._load_pipelines(directory, None, config, layout=layout)
         assert not errors
     else:
         paths = list(files)
@@ -754,7 +759,7 @@ def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, so
             return CompletedProcess(args, 0, json.dumps(files[args[1].split(":", 1)[1]]), "")
 
         monkeypatch.setattr(_vt, "git", fake_git)
-        parents = _vt._load_parent_pipelines_from_ref("origin/rhoai-3.6", tmp_path, config, layout="nested")
+        parents = _vt._load_parent_pipelines_from_ref("origin/rhoai-3.6", tmp_path, config, layout=layout)
 
     assert set(parents["push"]) == {"odh-operator"}
     parent = parents["push"]["odh-operator"]

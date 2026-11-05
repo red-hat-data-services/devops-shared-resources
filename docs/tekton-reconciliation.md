@@ -113,7 +113,13 @@ network resolver, general graph engine, artifact-selected import or callback.
 ## Receipts, source and publication safety
 
 These are **trusted same-job planner receipts**, not protection against a
-compromised trusted planner. Resume never reruns templates or imports the policy
+compromised trusted planner. The optional one-shot `--reconcile --publish`
+operation is intended for trusted callers with pre-provisioned authentication:
+it runs trusted planning, templates, filters and the optional policy module
+while any already-present publication credentials remain in the environment.
+It does not isolate planning from those credentials. Prefer the consumer flow
+shown above: plan, verify, acquire the scoped token, then `--resume-report
+--publish`. The resume operation itself never reruns templates or imports the policy
 module under publication credentials. It compares CLI-selected source/config and
 recorded roles, the exact manifest, base Git bytes, modes and current clean
 checkout before replay; the existing publisher independently checks origin,

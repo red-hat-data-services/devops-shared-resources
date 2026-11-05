@@ -279,7 +279,8 @@ def reconcile(root, *, scope, report, provenance, validate, select, context_path
     if context.keys() & before.keys():
         raise ValueError("context overlaps writable scope")
     for name in context:
-        if not git(root, "ls-files", "--error-unmatch", "--", name):
+        tracked_context = git(root, "--literal-pathspecs", "ls-files", "-z", "--", name)
+        if tracked_context.split(b"\0") != [name.encode(), b""]:
             raise ValueError("context must be tracked")
     tracked = set(git(root, "ls-files", "-z", "--", scope).decode().split("\0")) - {""}
     if tracked != set(before):
