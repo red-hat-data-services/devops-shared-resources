@@ -338,15 +338,45 @@ def resolve_overlay(config_dir, template_name, component_prefix, component_label
 
     Checks: {config_dir}/{component_label}/{template_name} (version-specific), then
             {config_dir}/{component_prefix}/{template_name} (general fallback).
+
+    Both target-derived selectors are checked before selecting either candidate.
+    Absolute paths, traversal, malformed selectors and symlink escapes raise
+    ValueError before template reads/rendering, even when no overlay exists.
+    Nested names and symlinks contained within the trusted config root remain
+    supported; the caller must keep that trusted tree stable while rendering.
     """
+    # Target metadata selects names, never executable template locations outside
+    # the trusted config root. Check BOTH selectors before honoring precedence:
+    # a valid label must not hide an unsafe derived-prefix fallback.
     base = Path(config_dir)
-    if component_label:
-        path = base / component_label / template_name
+    trusted_root = base.resolve()
+
+    def relative_name(value, field):
+        if (not isinstance(value, str) or not value or Path(value).is_absolute()
+                or ".." in Path(value).parts or "\\" in value
+                or any(ord(char) < 32 for char in value)):
+            raise ValueError(f"unsafe overlay {field}: expected a relative in-root path")
+        return value
+
+    relative_name(template_name, "template name")
+    candidates = []
+    for field, selector in (("component label", component_label),
+                            ("component prefix", component_prefix)):
+        if selector is None or selector == "":
+            continue
+        relative_name(selector, field)
+        path = base / selector / template_name
+        try:
+            resolved = path.resolve()
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"unsafe overlay {field}: cannot resolve candidate") from exc
+        if not resolved.is_relative_to(trusted_root):
+            raise ValueError(f"unsafe overlay {field}: candidate escapes trusted config directory")
+        candidates.append(path)
+    for path in candidates:
         if path.exists():
-            return str(path)
-    if component_prefix and component_prefix != component_label:
-        path = base / component_prefix / template_name
-        if path.exists():
+            if not path.is_file():
+                raise ValueError("unsafe overlay candidate: expected a regular template file")
             return str(path)
     return None
 
