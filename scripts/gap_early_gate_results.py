@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-"""GAP Early Gate results monitor (Leader comment → overall-status + children).
+"""GAP merge-orchestrator (Leader EG labels/comments → promotion-gates + children).
 
-After Stage-1 sets ``overall-status=early-gate-triggered`` and comments
-``/early-gate``, Early Gate posts a terminal comment on the **Leader** PR
-(``<!-- early-gate-build-complete -->`` plus Early Gate passed/failed).
+Also imported as the Early Gate results monitor. After Stage-1 sets
+``component-builds=success`` and comments ``/early-gate``, Early Gate posts
+terminal Leader comments and labels. This script wakes on those labels (or
+comments), reconciles comment history, and updates ``promotion-gates``.
 
-This script:
+Phase-1 contract (``promotion-gates`` is SoT; ``overall-status`` is not written):
 
-1. Lists Leader PR comments (paginated) and selects the latest **trusted**
-   terminal Early Gate report.
-2. When state is ``early-gate-triggered``, writes ``success`` / ``failure``.
-3. Optionally publishes ``state.json``, greens the Leader (RHAI-8079), and
-   posts ``gated artifacts promoter`` on **build-passing** child PRs:
-   ``success`` when EG passed (auto-merge signal), ``failure`` when EG failed
-   (short note; children that already failed their build gate are left alone).
+1. Require ``component-builds=success`` (EG was triggered).
+2. Record EG build + test gate statuses from comments (labels as fallback).
+3. When EG has **concluded** (both gates terminal, or EG build failed so
+   tests never run): publish ``promotion-gates``, green the Leader
+   (RHAI-8079), and post ``gated artifacts promoter`` **success** on
+   build-passing children with a short description noting the EG outcome.
+   Stage-1 holds those children pending until this step.
 
-Progress comments (``eg-operator-build-status``, queue notices, ``/early-gate``
-triggers) and untrusted authors are ignored. Final ``success`` / ``failure``
-are never overwritten. A triggering Actions comment is only a wake-up signal;
-the script always reconciles current comment history.
+Progress comments and untrusted authors are ignored. A label/comment wake-up
+is only a signal; the script always reconciles current comment + label state
+for **that** Leader.
 """
 
 from __future__ import annotations
@@ -36,9 +36,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lib.gap_promotion_gates import (
+    GATE_COMPONENT_BUILDS,
+    GATE_EARLY_GATE_BUILD,
+    GATE_EARLY_GATE_TEST,
+    GATE_STATUS_FAILURE,
+    GATE_STATUS_SUCCESS,
+    LABEL_EG_BUILD_FAILED,
+    LABEL_EG_BUILD_SUCCESS,
+    LABEL_EG_TEST_FAILED,
+    LABEL_EG_TEST_SUCCESS,
+    derive_legacy_overall_status,
+    early_gate_concluded,
+    early_gate_pair_overall,
+    ensure_promotion_gates,
+    gate_status_from_labels,
+    get_gate_status,
+    mark_eg_test_skipped_after_build_failure,
+    migrate_legacy_overall_status,
+    set_gate_status,
+    strip_legacy_overall_status,
+)
 from lib.pr_status_updater import GhCommandError, PRStatusUpdater, parse_pr_url
 from lib.state_file import (
-    OVERALL_STATUS_EARLY_GATE_TRIGGERED,
     OVERALL_STATUS_FAILURE,
     OVERALL_STATUS_SUCCESS,
 )
@@ -52,9 +72,7 @@ ENV_LEADER_PR_URL = gpm.ENV_LEADER_PR_URL
 ENV_PR_LABELS = gpm.ENV_PR_LABELS
 ENV_STATE_FILE = gpm.ENV_STATE_FILE
 ENV_TRIGGER_ID = gpm.ENV_TRIGGER_ID
-FINAL_OVERALL_STATUSES = gpm.FINAL_OVERALL_STATUSES
 GapPrMonitorError = gpm.GapPrMonitorError
-apply_overall_status = gpm.apply_overall_status
 checkout_leader_branch = gpm.checkout_leader_branch
 load_state = gpm.load_state
 post_leader_conclusion = gpm.post_leader_conclusion
@@ -66,24 +84,26 @@ split_labels_csv = gpm.split_labels_csv
 verify_leader_head = gpm.verify_leader_head
 _run_gh = gpm._run_gh
 
-# Child check descriptions after combined Leader Early Gate (Miro / Stage-2.5+).
+# Child check descriptions after both EG build + test are terminal (phase-1).
 CHILD_EG_SUCCESS_DESCRIPTION = (
-    "GAP: Early Gate passed — cleared for auto-merge"
+    "GAP: Early Gate build+tests passed — cleared for auto-merge"
 )
 CHILD_EG_FAILURE_DESCRIPTION = (
-    "GAP: Early Gate failed — auto-merge held (combined Leader EG build)"
+    "GAP: Early Gate build/tests failed — phase-1 still cleared for auto-merge"
 )
 
-# HTML marker used by rhods-ci-bot terminal EG reports (may include digest lines).
+# HTML markers used by rhods-ci-bot terminal EG reports.
 EARLY_GATE_BUILD_COMPLETE_MARKER = "early-gate-build-complete"
+EARLY_GATE_JOB_COMPLETE_MARKER = "early-gate-job-complete"
 
 # Default Early Gate reporting identity (override via GAP_EG_TRUSTED_AUTHORS).
 DEFAULT_TRUSTED_EG_AUTHORS = frozenset({"rhods-ci-bot"})
 ENV_TRUSTED_AUTHORS = "GAP_EG_TRUSTED_AUTHORS"
 
-# Visible headlines / Status row (screenshot contract) — only with the marker.
-_PASSED_PATTERNS = (
+# Visible headlines / Status row — build comments (early-gate-build-complete).
+_BUILD_PASSED_PATTERNS = (
     re.compile(r"\*\*Early Gate passed\*\*", re.IGNORECASE),
+    re.compile(r"\*\*Early Gate Build [Pp]assed\*\*", re.IGNORECASE),
     re.compile(r"Early Gate passed", re.IGNORECASE),
     re.compile(
         r"\*\*Status\*\*\s*\|\s*:white_check_mark:\s*SUCCESS",
@@ -91,12 +111,35 @@ _PASSED_PATTERNS = (
     ),
     re.compile(r"\|\s*\*\*Status\*\*\s*\|\s*:white_check_mark:\s*SUCCESS", re.IGNORECASE),
 )
-_FAILED_PATTERNS = (
+_BUILD_FAILED_PATTERNS = (
     re.compile(r"\*\*Early Gate failed\*\*", re.IGNORECASE),
+    re.compile(r"\*\*Early Gate Build [Ff]ailed\*\*", re.IGNORECASE),
     re.compile(r"Early Gate failed", re.IGNORECASE),
     re.compile(r"\*\*Status\*\*\s*\|\s*:x:\s*FAILED", re.IGNORECASE),
     re.compile(r"\|\s*\*\*Status\*\*\s*\|\s*:x:\s*FAILED", re.IGNORECASE),
 )
+
+# Test comments (early-gate-job-complete).
+_TEST_PASSED_PATTERNS = (
+    re.compile(r"\*\*Early Gate Tests? Passed\*\*", re.IGNORECASE),
+    re.compile(r"Early Gate Tests? Passed", re.IGNORECASE),
+    re.compile(
+        r"\*\*Status\*\*\s*\|\s*:white_check_mark:\s*SUCCESS",
+        re.IGNORECASE,
+    ),
+    re.compile(r"\|\s*\*\*Status\*\*\s*\|\s*:white_check_mark:\s*SUCCESS", re.IGNORECASE),
+)
+_TEST_FAILED_PATTERNS = (
+    re.compile(r"\*\*Early Gate Tests? Failed\*\*", re.IGNORECASE),
+    re.compile(r"Early Gate Tests? Failed", re.IGNORECASE),
+    re.compile(r"\*\*Early Gate Test - Complete\*\*", re.IGNORECASE),
+    re.compile(r"\*\*Status\*\*\s*\|\s*:x:\s*FAILED", re.IGNORECASE),
+    re.compile(r"\|\s*\*\*Status\*\*\s*\|\s*:x:\s*FAILED", re.IGNORECASE),
+)
+
+# Back-compat aliases used by older tests.
+_PASSED_PATTERNS = _BUILD_PASSED_PATTERNS
+_FAILED_PATTERNS = _BUILD_FAILED_PATTERNS
 
 # Progress / non-terminal markers — never conclude from these alone.
 _PROGRESS_MARKERS = (
@@ -107,17 +150,18 @@ _PROGRESS_MARKERS = (
 
 @dataclass(frozen=True)
 class EarlyGateCommentOutcome:
-    """Parsed terminal Early Gate comment."""
+    """Parsed terminal Early Gate comment (build or test)."""
 
     overall_status: str  # success | failure
     comment_id: int | None = None
     created_at: str | None = None
     author: str | None = None
+    gate: str = GATE_EARLY_GATE_BUILD
 
 
 @dataclass(frozen=True)
 class EarlyGateResultsResult:
-    """Outcome of one EG-results run."""
+    """Outcome of one merge-orchestrator / EG-results run."""
 
     state_path: Path
     previous_overall: str | None
@@ -129,6 +173,8 @@ class EarlyGateResultsResult:
     reason: str = ""
     child_urls_posted: tuple[str, ...] = ()
     child_check_state: str | None = None
+    eg_build_status: str | None = None
+    eg_test_status: str | None = None
 
 
 def trusted_early_gate_authors(
@@ -167,39 +213,56 @@ def is_trusted_early_gate_author(
 
 
 def comment_looks_like_early_gate_complete(body: str) -> bool:
-    """True when a comment body is a candidate terminal EG report.
+    """True when a comment body is a candidate terminal EG build or test report."""
+    text = (body or "").lower()
+    return (
+        EARLY_GATE_BUILD_COMPLETE_MARKER in text
+        or EARLY_GATE_JOB_COMPLETE_MARKER in text
+    )
 
-    Used by the Actions job filter / early-exit path. Prefer the HTML marker.
-    """
-    text = body or ""
-    return EARLY_GATE_BUILD_COMPLETE_MARKER in text
 
-
-def parse_early_gate_outcome_from_body(body: str) -> str | None:
-    """Return ``success`` / ``failure`` from a structured EG comment, else None.
-
-    Requires the ``early-gate-build-complete`` marker so casual discussion that
-    merely mentions \"Early Gate passed\" cannot conclude the Leader.
-    """
+def _parse_marked_outcome(
+    body: str,
+    *,
+    marker: str,
+    passed_patterns: Sequence[re.Pattern[str]],
+    failed_patterns: Sequence[re.Pattern[str]],
+) -> str | None:
     text = body or ""
     if not text.strip():
         return None
-
     stripped_lower = text.lower()
-    if EARLY_GATE_BUILD_COMPLETE_MARKER not in stripped_lower:
+    if marker not in stripped_lower:
         return None
     if any(m in stripped_lower for m in _PROGRESS_MARKERS):
-        # Marker should not appear on progress comments; belt-and-suspenders.
         return None
-
-    passed = any(p.search(text) for p in _PASSED_PATTERNS)
-    failed = any(p.search(text) for p in _FAILED_PATTERNS)
+    passed = any(p.search(text) for p in passed_patterns)
+    failed = any(p.search(text) for p in failed_patterns)
     if passed and not failed:
         return OVERALL_STATUS_SUCCESS
     if failed and not passed:
         return OVERALL_STATUS_FAILURE
-    # Ambiguous or re-seed stub with marker but no verdict.
     return None
+
+
+def parse_early_gate_outcome_from_body(body: str) -> str | None:
+    """Return ``success`` / ``failure`` from an EG **build** comment, else None."""
+    return _parse_marked_outcome(
+        body,
+        marker=EARLY_GATE_BUILD_COMPLETE_MARKER,
+        passed_patterns=_BUILD_PASSED_PATTERNS,
+        failed_patterns=_BUILD_FAILED_PATTERNS,
+    )
+
+
+def parse_early_gate_test_outcome_from_body(body: str) -> str | None:
+    """Return ``success`` / ``failure`` from an EG **test** comment, else None."""
+    return _parse_marked_outcome(
+        body,
+        marker=EARLY_GATE_JOB_COMPLETE_MARKER,
+        passed_patterns=_TEST_PASSED_PATTERNS,
+        failed_patterns=_TEST_FAILED_PATTERNS,
+    )
 
 
 def _comment_sort_key(comment: dict[str, Any]) -> tuple[str, int]:
@@ -216,12 +279,18 @@ def select_latest_early_gate_outcome(
     comments: Sequence[dict[str, Any]],
     *,
     trusted_authors: frozenset[str] | None = None,
+    gate: str = GATE_EARLY_GATE_BUILD,
 ) -> EarlyGateCommentOutcome | None:
-    """Pick the latest trusted comment that parses to a definite EG overall."""
+    """Pick the latest trusted comment for one EG gate (build or test)."""
     allowed = (
         trusted_authors
         if trusted_authors is not None
         else trusted_early_gate_authors()
+    )
+    parse = (
+        parse_early_gate_test_outcome_from_body
+        if gate == GATE_EARLY_GATE_TEST
+        else parse_early_gate_outcome_from_body
     )
     best: EarlyGateCommentOutcome | None = None
     best_key: tuple[str, int] = ("", -1)
@@ -232,7 +301,7 @@ def select_latest_early_gate_outcome(
         if not is_trusted_early_gate_author(login, trusted=allowed):
             continue
         body = str(comment.get("body") or "")
-        outcome = parse_early_gate_outcome_from_body(body)
+        outcome = parse(body)
         if outcome is None:
             continue
         key = _comment_sort_key(comment)
@@ -251,8 +320,42 @@ def select_latest_early_gate_outcome(
                 )
                 or None,
                 author=login,
+                gate=gate,
             )
     return best
+
+
+def resolve_eg_gate_status(
+    *,
+    gate: str,
+    comments: Sequence[dict[str, Any]],
+    labels: Sequence[str],
+    trusted_authors: frozenset[str] | None = None,
+) -> tuple[str | None, str]:
+    """Resolve one EG gate from comments (preferred) or Leader labels."""
+    selected = select_latest_early_gate_outcome(
+        comments, trusted_authors=trusted_authors, gate=gate
+    )
+    if selected is not None:
+        return (
+            selected.overall_status,
+            f"comment id={selected.comment_id} author={selected.author}",
+        )
+    if gate == GATE_EARLY_GATE_BUILD:
+        from_labels = gate_status_from_labels(
+            labels,
+            success_label=LABEL_EG_BUILD_SUCCESS,
+            failed_label=LABEL_EG_BUILD_FAILED,
+        )
+    else:
+        from_labels = gate_status_from_labels(
+            labels,
+            success_label=LABEL_EG_TEST_SUCCESS,
+            failed_label=LABEL_EG_TEST_FAILED,
+        )
+    if from_labels is None:
+        return None, "no trusted terminal comment or wake label"
+    return from_labels, f"leader label ({from_labels})"
 
 
 def _flatten_gh_paginate_slurp(data: Any) -> list[dict[str, Any]]:
@@ -363,41 +466,123 @@ def fetch_leader_head_ref(
 
 def decide_overall_from_comments(
     *,
-    current_overall: str | None,
+    current_overall: str | None = None,
     comments: Sequence[dict[str, Any]],
     trusted_authors: frozenset[str] | None = None,
-) -> tuple[str | None, str]:
-    """Decide the next overall-status from current EG comment history.
+    labels: Sequence[str] | None = None,
+    payload: dict[str, Any] | None = None,
+    eg_already_concluded: bool | None = None,
+) -> tuple[str | None, str, dict[str, str | None]]:
+    """Update EG gates from comments/labels; return derived overall when both done.
 
-    Always selects the latest trusted terminal report. A workflow wake-up
-    comment body is intentionally not applied on its own (stale retries).
+    ``promotion-gates`` on ``payload`` is mutated. Returns
+    ``(derived_overall_or_None, reason, gate_snapshot)``.
+    ``None`` means do not publish Leader/child conclusion yet (or already done).
 
-    Returns ``(new_overall_or_None, reason)``.
-    ``None`` means do not change state.
+    ``current_overall`` is ignored (legacy arg); gates are SoT.
     """
-    existing = (current_overall or "").strip() or None
-    if existing in FINAL_OVERALL_STATUSES:
-        return None, f"overall-status already final ({existing}); no-op"
+    del current_overall  # legacy; gates are SoT
+    label_list = list(labels or [])
+    working = payload if payload is not None else {}
+    ensure_promotion_gates(working)
+    migrate_legacy_overall_status(working)
 
-    if existing != OVERALL_STATUS_EARLY_GATE_TRIGGERED:
+    builds = get_gate_status(working, GATE_COMPONENT_BUILDS)
+    current_snap = {
+        GATE_EARLY_GATE_BUILD: get_gate_status(working, GATE_EARLY_GATE_BUILD),
+        GATE_EARLY_GATE_TEST: get_gate_status(working, GATE_EARLY_GATE_TEST),
+    }
+    # Normalize pending → None in snapshot for callers that expect unknown.
+    for key, val in list(current_snap.items()):
+        if val == "pending":
+            current_snap[key] = None
+
+    already = (
+        early_gate_concluded(working)
+        if eg_already_concluded is None
+        else bool(eg_already_concluded)
+    )
+    if already and early_gate_concluded(working):
+        mark_eg_test_skipped_after_build_failure(working)
         return (
             None,
-            f"overall-status={existing!r} is not {OVERALL_STATUS_EARLY_GATE_TRIGGERED!r}; "
-            "waiting for Stage-1 Early Gate handoff",
+            "early-gate already concluded; no-op",
+            {
+                GATE_EARLY_GATE_BUILD: get_gate_status(working, GATE_EARLY_GATE_BUILD),
+                GATE_EARLY_GATE_TEST: get_gate_status(working, GATE_EARLY_GATE_TEST),
+            },
         )
 
-    selected = select_latest_early_gate_outcome(
-        comments, trusted_authors=trusted_authors
+    if builds != GATE_STATUS_SUCCESS:
+        return (
+            None,
+            (
+                f"component-builds={builds!r}; waiting for Stage-1 all-builds "
+                "success before applying Early Gate results"
+            ),
+            current_snap,
+        )
+
+    build_status, build_src = resolve_eg_gate_status(
+        gate=GATE_EARLY_GATE_BUILD,
+        comments=comments,
+        labels=label_list,
+        trusted_authors=trusted_authors,
     )
-    if selected is None:
-        return None, "no trusted terminal Early Gate passed/failed comment found"
-    return (
-        selected.overall_status,
-        (
-            f"applied from latest Early Gate comment id={selected.comment_id} "
-            f"author={selected.author}"
+    test_status, test_src = resolve_eg_gate_status(
+        gate=GATE_EARLY_GATE_TEST,
+        comments=comments,
+        labels=label_list,
+        trusted_authors=trusted_authors,
+    )
+    if build_status is not None:
+        set_gate_status(working, GATE_EARLY_GATE_BUILD, build_status)
+    if test_status is not None:
+        set_gate_status(working, GATE_EARLY_GATE_TEST, test_status)
+    # EG build failure ⇒ tests never start; mark test failure and conclude.
+    if mark_eg_test_skipped_after_build_failure(working):
+        test_status = GATE_STATUS_FAILURE
+        test_src = "skipped (early-gate-build failed)"
+
+    snapshot = {
+        GATE_EARLY_GATE_BUILD: build_status
+        if build_status is not None
+        else (
+            None
+            if get_gate_status(working, GATE_EARLY_GATE_BUILD) == "pending"
+            else get_gate_status(working, GATE_EARLY_GATE_BUILD)
         ),
+        GATE_EARLY_GATE_TEST: test_status
+        if test_status is not None
+        else (
+            None
+            if get_gate_status(working, GATE_EARLY_GATE_TEST) == "pending"
+            else get_gate_status(working, GATE_EARLY_GATE_TEST)
+        ),
+    }
+
+    if not early_gate_concluded(working):
+        return (
+            None,
+            (
+                "waiting for early-gate conclusion "
+                f"(build={build_status!r} via {build_src}; "
+                f"test={test_status!r} via {test_src})"
+            ),
+            snapshot,
+        )
+
+    pair = early_gate_pair_overall(working)
+    assert pair in {GATE_STATUS_SUCCESS, GATE_STATUS_FAILURE}
+    new_overall = (
+        OVERALL_STATUS_SUCCESS if pair == GATE_STATUS_SUCCESS else OVERALL_STATUS_FAILURE
     )
+    reason = (
+        f"EG concluded "
+        f"(build={snapshot[GATE_EARLY_GATE_BUILD]} via {build_src}; "
+        f"test={snapshot[GATE_EARLY_GATE_TEST]} via {test_src})"
+    )
+    return (new_overall, reason, snapshot)
 
 
 def child_pass_pr_urls(payload: dict[str, Any]) -> list[str]:
@@ -423,11 +608,16 @@ def child_pass_pr_urls(payload: dict[str, Any]) -> list[str]:
 
 
 def child_check_for_overall(overall_status: str) -> tuple[str, str]:
-    """Map final overall-status to child commit-status state + description."""
+    """Map final overall-status to child commit-status state + description.
+
+    Phase-1: always post GitHub ``success`` once both EG gates are done so
+    children can auto-merge; description notes EG failure when overall failed.
+    """
     if overall_status == OVERALL_STATUS_SUCCESS:
         return "success", CHILD_EG_SUCCESS_DESCRIPTION
     if overall_status == OVERALL_STATUS_FAILURE:
-        return "failure", CHILD_EG_FAILURE_DESCRIPTION
+        # Phase-1: still green the check; note EG failure in the description.
+        return "success", CHILD_EG_FAILURE_DESCRIPTION
     raise GapPrMonitorError(
         f"Cannot post child Early Gate checks for overall-status={overall_status!r}"
     )
@@ -440,7 +630,7 @@ def post_child_statuses_for_early_gate(
     updater: PRStatusUpdater,
     continue_on_error: bool = True,
 ) -> tuple[str, ...]:
-    """Post EG outcome onto build-passing children; leave build-failures untouched.
+    """Post phase-1 conclusion onto build-passing children; leave build-failures.
 
     Returns the tuple of child PR URLs that received a status post (not skipped).
     """
@@ -500,9 +690,13 @@ def run_early_gate_results(
     if not leader_url:
         raise GapPrMonitorError("Leader PR URL is required.")
 
-    resolved_labels = list(labels) if labels else None
-    if not resolved_labels and not (trigger_id or "").strip() and not (state_file or "").strip():
+    # None = not provided (may fetch); explicit [] skips fetch (unit tests / CLI).
+    if labels is not None:
+        resolved_labels: list[str] | None = list(labels)
+    elif not (trigger_id or "").strip() and not (state_file or "").strip():
         resolved_labels = fetch_leader_labels(leader_url, gh_runner=gh_runner)
+    else:
+        resolved_labels = None
 
     branch = (head_ref or "").strip() or None
     if publish and not dry_run:
@@ -517,26 +711,42 @@ def run_early_gate_results(
         root=root,
     )
     payload = load_state(state_path)
-    previous = str(payload.get("overall-status") or "").strip() or None
+    ensure_promotion_gates(payload)
+    migrate_legacy_overall_status(payload)
+    previous = derive_legacy_overall_status(payload)
+    eg_already = early_gate_concluded(payload)
 
-    # Always reconcile full comment history (wake-up event may be stale).
+    # Always reconcile full comment + label history (wake-up may be stale).
     comments = list_leader_pr_comments(leader_url, gh_runner=gh_runner)
-    new_overall, reason = decide_overall_from_comments(
-        current_overall=previous,
+    if resolved_labels is not None:
+        leader_labels = list(resolved_labels)
+    else:
+        leader_labels = fetch_leader_labels(leader_url, gh_runner=gh_runner)
+    new_overall, reason, gate_snap = decide_overall_from_comments(
         comments=comments,
         trusted_authors=trusted_authors,
+        labels=leader_labels,
+        payload=payload,
+        eg_already_concluded=eg_already,
     )
+    strip_legacy_overall_status(payload)
+    derived = derive_legacy_overall_status(payload)
 
     if new_overall is None:
+        # Persist partial promotion-gates progress (e.g. build done, test pending).
+        if not dry_run:
+            save_state(state_path, payload)
         return EarlyGateResultsResult(
             state_path=state_path,
             previous_overall=previous,
-            overall_status=previous,
+            overall_status=derived,
             applied=False,
             leader_status_posted=False,
             published_sha=None,
             dry_run=dry_run,
             reason=reason,
+            eg_build_status=gate_snap.get(GATE_EARLY_GATE_BUILD),
+            eg_test_status=gate_snap.get(GATE_EARLY_GATE_TEST),
         )
 
     child_targets = child_pass_pr_urls(payload)
@@ -544,8 +754,14 @@ def run_early_gate_results(
 
     if dry_run:
         print(
-            f"[dry-run] would set overall-status={new_overall!r} on {state_path} "
+            f"[dry-run] would conclude EG as {new_overall!r} on {state_path} "
             f"({reason})"
+        )
+        print(
+            f"[dry-run] would set promotion-gates "
+            f"component-builds={get_gate_status(payload, GATE_COMPONENT_BUILDS)!r} "
+            f"build={gate_snap.get(GATE_EARLY_GATE_BUILD)!r} "
+            f"test={gate_snap.get(GATE_EARLY_GATE_TEST)!r}"
         )
         print(
             f"[dry-run] would post child check state={child_check_state!r} "
@@ -562,9 +778,10 @@ def run_early_gate_results(
             reason=reason,
             child_urls_posted=tuple(child_targets),
             child_check_state=child_check_state,
+            eg_build_status=gate_snap.get(GATE_EARLY_GATE_BUILD),
+            eg_test_status=gate_snap.get(GATE_EARLY_GATE_TEST),
         )
 
-    apply_overall_status(payload, new_overall)
     save_state(state_path, payload)
 
     if not publish:
@@ -577,6 +794,10 @@ def run_early_gate_results(
             published_sha=None,
             dry_run=False,
             reason=reason,
+            child_urls_posted=tuple(child_targets),
+            child_check_state=child_check_state,
+            eg_build_status=gate_snap.get(GATE_EARLY_GATE_BUILD),
+            eg_test_status=gate_snap.get(GATE_EARLY_GATE_TEST),
         )
 
     assert branch is not None
@@ -587,7 +808,7 @@ def run_early_gate_results(
         remote=remote,
         dry_run=False,
         commit_message=(
-            f"Update GAP overall-status from Early Gate results ({new_overall})"
+            f"Update GAP promotion-gates from merge-orchestrator ({new_overall})"
         ),
         git_runner=git_runner,
     )
@@ -620,6 +841,8 @@ def run_early_gate_results(
         reason=reason,
         child_urls_posted=child_posted,
         child_check_state=child_check_state,
+        eg_build_status=gate_snap.get(GATE_EARLY_GATE_BUILD),
+        eg_test_status=gate_snap.get(GATE_EARLY_GATE_TEST),
     )
 
 
@@ -735,6 +958,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(f"published_sha: {result.published_sha}")
     print(f"child_check_state: {result.child_check_state}")
     print(f"child_urls_posted: {list(result.child_urls_posted)}")
+    print(f"eg_build_status: {result.eg_build_status}")
+    print(f"eg_test_status: {result.eg_test_status}")
     print(f"dry_run: {result.dry_run}")
     print(f"reason: {result.reason}")
     return 0

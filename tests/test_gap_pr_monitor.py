@@ -86,11 +86,19 @@ def _fake_child_monitor(
 
     def fake_run(state_path, **kwargs):
         import scripts.gap_pr_monitor as mod
+        from lib.gap_promotion_gates import (
+            apply_component_builds_from_children,
+            derive_legacy_overall_status,
+        )
 
         path = Path(state_path)
         payload = json.loads(path.read_text(encoding="utf-8"))
         mod.apply_pr_statuses(payload, statuses)
-        mod.apply_overall_status(payload, overall)
+        if overall is not None:
+            mod.apply_overall_status(payload, overall)
+        else:
+            apply_component_builds_from_children(payload)
+        derived = derive_legacy_overall_status(payload)
         if not kwargs.get("dry_run"):
             mod.save_state(path, payload)
         return MonitorResult(
@@ -102,7 +110,7 @@ def _fake_child_monitor(
             ],
             success_urls=[url for url, status in statuses.items() if status == "success"],
             dry_run=bool(kwargs.get("dry_run")),
-            overall_status=overall,
+            overall_status=derived if derived is not None else overall,
         )
 
     monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor", fake_run)
@@ -736,7 +744,9 @@ def test_run_stage1_monitor_posts_success_and_merge_failure(tmp_path: Path) -> N
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["pull-requests"][0]["pr-status"] == "merge-failure"
     assert saved["pull-requests"][1]["pr-status"] == "success"
-    assert saved["overall-status"] == "failure"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "failure"
     assert result.overall_status == "failure"
     assert result.leader_status_posted is False
 
@@ -779,7 +789,9 @@ def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
     ]
     saved = json.loads(path.read_text(encoding="utf-8"))
     assert saved["pull-requests"][0]["pr-status"] == "success"
-    assert saved["overall-status"] == "early-gate-triggered"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
     assert result.overall_status == "early-gate-triggered"
 
 
@@ -950,11 +962,16 @@ def test_compute_overall_status_build_pending_not_stage1_final() -> None:
 
 
 def test_apply_overall_status_set_and_clear() -> None:
+    from lib.gap_promotion_gates import get_gate_status
+
     payload: dict[str, Any] = {"pull-requests": []}
     apply_overall_status(payload, "success")
-    assert payload["overall-status"] == "success"
+    assert "overall-status" not in payload
+    assert get_gate_status(payload, "component-builds") == "success"
+    assert get_gate_status(payload, "early-gate-build") == "success"
     apply_overall_status(payload, "failure")
-    assert payload["overall-status"] == "failure"
+    assert "overall-status" not in payload
+    assert get_gate_status(payload, "component-builds") == "failure"
     apply_overall_status(payload, None)
     assert "overall-status" not in payload
 
@@ -989,15 +1006,22 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
         return holder["u"]
 
     child = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
-    _fake_child_monitor(monkeypatch, statuses={child: "success"}, overall="success")
+    _fake_child_monitor(
+        monkeypatch, statuses={child: "success"}, overall="early-gate-triggered"
+    )
     leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/12"
     publish_calls: list[str] = []
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.post_early_gate_trigger_comment",
+        lambda *a, **k: True,
+    )
 
     def fake_publish(repo_root, state_path, head_ref, **kwargs):
         publish_calls.append(head_ref)
-        # State must already be saved before publish (ordering under test).
         saved_before = json.loads(Path(state_path).read_text(encoding="utf-8"))
-        assert saved_before["overall-status"] == "success"
+        assert "overall-status" not in saved_before
+        gates = {g["id"]: g["status"] for g in saved_before["promotion-gates"]}
+        assert gates["component-builds"] == "success"
         return PublishResult(sha="published-sha-abc", committed=True)
 
     import scripts.gap_pr_monitor as mod
@@ -1010,17 +1034,15 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
         publish=True,
         updater_factory=factory,
     )
-    assert result.overall_status == "success"
-    assert result.leader_status_posted is True
+    assert result.overall_status == "early-gate-triggered"
+    assert result.leader_status_posted is False
+    assert result.early_gate_comment_posted is True
     assert result.published_sha == "published-sha-abc"
     assert publish_calls == ["leader-branch"]
-    posts = holder["u"].posts
-    assert (leader, "completed") in [(u, s) for u, s, _ in posts]
-    leader_post = next(p for p in posts if p[0] == leader)
-    assert leader_post[2].get("head_sha") == "published-sha-abc"
-    assert leader_post[2].get("description") == "GAP: overall success"
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "success"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
 
 
 def test_run_stage1_monitor_writes_failure_without_leader_automerge(
@@ -1067,7 +1089,9 @@ def test_run_stage1_monitor_writes_failure_without_leader_automerge(
     assert result.leader_status_posted is False
     assert all(u != leader for u, _s, _k in holder["u"].posts)
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "failure"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "failure"
 
 
 def test_run_stage1_monitor_three_children_all_success_posts_leader(
@@ -1113,9 +1137,13 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
             "https://github.com/rhoai-rhtap/kubeflow/pull/85": "success",
             "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67": "success",
         },
-        overall="success",
+        overall="early-gate-triggered",
     )
     leader = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/99"
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.post_early_gate_trigger_comment",
+        lambda *a, **k: True,
+    )
 
     def fake_publish(repo_root, state_path, head_ref, **kwargs):
         return PublishResult(sha="published-sha-abc", committed=True)
@@ -1130,13 +1158,15 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
         publish=True,
         updater_factory=factory,
     )
-    assert result.overall_status == "success"
-    assert result.leader_status_posted is True
+    assert result.overall_status == "early-gate-triggered"
+    assert result.leader_status_posted is False
+    assert result.early_gate_comment_posted is True
     assert len(result.success_urls) == 3
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "success"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
     assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
-    assert (leader, "completed") in [(u, s) for u, s, _ in holder["u"].posts]
 
 
 def test_run_stage1_monitor_two_success_one_failure_no_leader_signal(
@@ -1206,7 +1236,9 @@ def test_run_stage1_monitor_two_success_one_failure_no_leader_signal(
     assert result.leader_status_posted is False
     assert all(u != leader for u, _s, _k in holder["u"].posts)
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "failure"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "failure"
 
 
 def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
@@ -1231,7 +1263,7 @@ def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
     _fake_child_monitor(
         monkeypatch,
         statuses={"https://github.com/rhoai-rhtap/kserve-branch/pull/15": "success"},
-        overall="success",
+        overall="early-gate-triggered",
     )
 
     def fake_publish(repo_root, state_path, head_ref, **kwargs):
@@ -1247,10 +1279,12 @@ def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
         publish=True,
         updater_factory=FakeUpdater,
     )
-    assert result.overall_status == "success"
+    assert result.overall_status == "early-gate-triggered"
     assert result.leader_status_posted is False
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "success"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
     err = capsys.readouterr().err
     assert "no Leader PR URL" in err
 
@@ -1868,7 +1902,11 @@ def test_coordinator_posts_leader_only_after_publish(
     _fake_child_monitor(
         monkeypatch,
         statuses={"https://github.com/rhoai-rhtap/kserve-branch/pull/15": "success"},
-        overall="success",
+        overall="early-gate-triggered",
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.post_early_gate_trigger_comment",
+        lambda *a, **k: (order.append("eg_comment") or True),
     )
 
     leader = "https://github.com/org/gap/pull/9"
@@ -1880,11 +1918,11 @@ def test_coordinator_posts_leader_only_after_publish(
         publish=True,
         updater_factory=factory,
     )
-    order.append("leader_post_done" if result.leader_status_posted else "leader_missing")
+    order.append("eg_done" if result.early_gate_comment_posted else "eg_missing")
     assert order[:2] == ["save", "publish"]
-    assert result.leader_status_posted is True
-    leader_post = next(p for p in holder["u"].posts if p[0] == leader)
-    assert leader_post[2].get("head_sha") == "published-sha-abc"
+    assert result.leader_status_posted is False
+    assert result.early_gate_comment_posted is True
+    assert "eg_comment" in order
 
 
 def test_coordinator_failure_publishes_and_greens_leader(
@@ -2322,7 +2360,7 @@ def test_run_stage1_monitor_no_longer_posts_leader_directly(
     )
     assert result.overall_status == "early-gate-triggered"
     assert result.leader_status_posted is False
-    # Child stays pending until EG-results; Leader green is coordinator-only.
+    # Child stays pending until merge-orchestrator posts EG note green.
     assert [u for u, _s, _k in holder["u"].posts] == [
         "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     ]
@@ -2349,6 +2387,7 @@ def test_children_batch_concluded_helpers() -> None:
     [
         ("success", False, None, True),
         ("success", True, None, False),
+        # Builds success / EG not done → hold child green for EG note.
         ("success", True, "early-gate-triggered", True),
         ("success", True, "success", False),
         ("success", True, "failure", False),
@@ -2425,7 +2464,6 @@ def test_status_decision_for_post_defers_when_early_gate_triggered() -> None:
     )
     assert posted.cli_status == "pending"
     assert posted.description == WAITING_FOR_EARLY_GATE_DESCRIPTION
-    assert decision.cli_status == "success"
 
 
 
@@ -2594,16 +2632,16 @@ def test_run_monitor_greens_only_good_children_when_batch_fails(
     assert (bad, "failure") in posts
     assert (good, "pending") not in posts
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "failure"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "failure"
 
 
 def test_run_monitor_holds_child_green_when_all_succeed_for_early_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """All-success → early-gate-triggered; children stay pending until EG-results."""
-    from scripts.gap_pr_monitor import WAITING_FOR_EARLY_GATE_DESCRIPTION
-
+    """All-success → wait for EG; children stay pending with EG-hold description."""
     a = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     b = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
     c = "https://github.com/rhoai-rhtap/modelmesh-serving/pull/67"
@@ -2638,6 +2676,8 @@ def test_run_monitor_holds_child_green_when_all_succeed_for_early_gate(
         holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
         return holder["u"]
 
+    from scripts.gap_pr_monitor import WAITING_FOR_EARLY_GATE_DESCRIPTION
+
     result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
     assert result.overall_status == "early-gate-triggered"
     assert set(result.success_urls) == {a, b, c}
@@ -2646,7 +2686,9 @@ def test_run_monitor_holds_child_green_when_all_succeed_for_early_gate(
     for key in posts:
         assert posts[key].get("description") == WAITING_FOR_EARLY_GATE_DESCRIPTION
     saved = json.loads(path.read_text(encoding="utf-8"))
-    assert saved["overall-status"] == "early-gate-triggered"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
     assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
 
 
@@ -2703,9 +2745,7 @@ def test_run_monitor_single_success_child_holds_for_early_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """One-child all-success → early-gate-triggered; child stays pending for EG."""
-    from scripts.gap_pr_monitor import WAITING_FOR_EARLY_GATE_DESCRIPTION
-
+    """One-child all-success → hold pending until EG concludes."""
     only = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
     path = tmp_path / "state.json"
     save_state(
@@ -2730,6 +2770,8 @@ def test_run_monitor_single_success_child_holds_for_early_gate(
     def factory(*, check_name: str, dry_run: bool = False) -> FakeUpdater:
         holder["u"] = FakeUpdater(check_name=check_name, dry_run=dry_run)
         return holder["u"]
+
+    from scripts.gap_pr_monitor import WAITING_FOR_EARLY_GATE_DESCRIPTION
 
     result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
     assert result.overall_status == "early-gate-triggered"
@@ -2924,9 +2966,12 @@ def test_compute_overall_preserves_existing_final_failure() -> None:
 
 
 def test_apply_overall_status_accepts_early_gate_triggered() -> None:
+    from lib.gap_promotion_gates import get_gate_status
+
     payload: dict[str, Any] = {"pull-requests": []}
     apply_overall_status(payload, "early-gate-triggered")
-    assert payload["overall-status"] == "early-gate-triggered"
+    assert "overall-status" not in payload
+    assert get_gate_status(payload, "component-builds") == "success"
 
 
 
@@ -3167,10 +3212,10 @@ def test_coordinator_preserves_success_and_greens_leader(
         updater_factory=factory,
         gh_runner=lambda *_: "",
     )
+    # EG already concluded in state → Stage-1 does not re-trigger EG or re-green Leader.
     assert result.overall_status == "success"
     assert result.early_gate_comment_posted is False
-    assert result.leader_status_posted is True
-    assert (leader, "completed") in [(u, s) for u, s, _ in holder["u"].posts]
+    assert result.leader_status_posted is False
 
 
 def test_run_monitor_greens_children_when_overall_already_success(

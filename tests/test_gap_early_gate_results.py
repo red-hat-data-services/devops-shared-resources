@@ -109,6 +109,28 @@ FBC_IMAGE_REF_BY_DIGEST=
 | **PipelineRun** | `rhods-operator-gap-eg-build-s88ff` |
 """
 
+TESTS_PASSED = """\
+<!-- early-gate-job-complete job_url=/job/devops/job/promotion-gate-tests/99/ correlation_id=eg-51-1 -->
+:white_check_mark: **Early Gate Tests Passed**
+
+| Field | Value |
+|-------|-------|
+| **Job URL** | https://jenkins.example/job/99/ |
+| **Status** | :white_check_mark: SUCCESS |
+| **RHOAI version** | rhoai-3.6 |
+"""
+
+TESTS_FAILED = """\
+<!-- early-gate-job-complete job_url=/job/devops/job/promotion-gate-tests/35/ correlation_id=eg-51-1793802717 -->
+:x: **Early Gate Tests Failed**
+
+| Field | Value |
+|-------|-------|
+| **Job URL** | https://jenkins.example/job/35/ |
+| **Status** | :x: FAILED - 1 test(s) failed |
+| **RHOAI version** | rhoai-3.6 |
+"""
+
 OPERATOR_PROGRESS_PASSED = """\
 <!-- eg-operator-build-status -->
 ## :white_check_mark: EG Operator Build - Passed
@@ -204,6 +226,8 @@ def test_trusted_authors_from_csv_override() -> None:
         (PASSED_BARE_MARKER, True),
         (FAILED_BARE_MARKER, True),
         (FAILED_WITH_EMPTY_DIGESTS, True),
+        (TESTS_PASSED, True),
+        (TESTS_FAILED, True),
         (HEADLINE_ONLY_PASSED, False),
         (DISCUSSION_MENTIONS_PASSED, False),
         (OPERATOR_PROGRESS_PASSED, False),
@@ -242,6 +266,23 @@ def test_comment_looks_like_early_gate_complete(body: str, expected: bool) -> No
 )
 def test_parse_early_gate_outcome_from_body(body: str, expected: str | None) -> None:
     assert eg.parse_early_gate_outcome_from_body(body) == expected
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (TESTS_PASSED, "success"),
+        (TESTS_FAILED, "failure"),
+        (PASSED_BARE_MARKER, None),
+        (FAILED_BARE_MARKER, None),
+        (QUEUE_COMMENT, None),
+        ("", None),
+    ],
+)
+def test_parse_early_gate_test_outcome_from_body(
+    body: str, expected: str | None
+) -> None:
+    assert eg.parse_early_gate_test_outcome_from_body(body) == expected
 
 
 # ---------------------------------------------------------------------------
@@ -324,76 +365,156 @@ def test_select_latest_tie_break_by_id() -> None:
 # ---------------------------------------------------------------------------
 
 
-def test_decide_noop_when_already_success() -> None:
-    overall, reason = eg.decide_overall_from_comments(
-        current_overall="success",
-        comments=[_bot_comment(FAILED_BARE_MARKER)],
+def _eg_ready_payload() -> dict:
+    """Stage-1 handoff: builds passed; EG gates still pending."""
+    return {
+        "overall-status": "early-gate-triggered",
+        "pull-requests": [
+            {
+                "repo": "kserve-branch",
+                "pr-url": "https://github.com/example/kserve-branch/pull/1",
+                "pr-status": "success",
+            }
+        ],
+    }
+
+
+def test_decide_noop_when_eg_already_terminal() -> None:
+    payload = {
+        "promotion-gates": [
+            {"id": "component-builds", "required": True, "status": "success"},
+            {"id": "early-gate-build", "required": False, "status": "success"},
+            {"id": "early-gate-test", "required": False, "status": "success"},
+        ]
+    }
+    overall, reason, _ = eg.decide_overall_from_comments(
+        comments=[_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
+        payload=payload,
+        eg_already_concluded=True,
     )
     assert overall is None
-    assert "already final" in reason
+    assert "already concluded" in reason
 
 
-def test_decide_noop_when_already_failure() -> None:
-    overall, reason = eg.decide_overall_from_comments(
-        current_overall="failure",
-        comments=[_bot_comment(PASSED_BARE_MARKER)],
+def test_decide_noop_when_legacy_overall_success_migrated() -> None:
+    payload = {"overall-status": "success"}
+    overall, reason, _ = eg.decide_overall_from_comments(
+        comments=[_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
+        payload=payload,
     )
     assert overall is None
-    assert "already final" in reason
+    assert "already concluded" in reason
+    assert "overall-status" not in payload
 
 
-def test_decide_noop_when_not_early_gate_triggered() -> None:
-    overall, reason = eg.decide_overall_from_comments(
-        current_overall=None,
-        comments=[_bot_comment(PASSED_BARE_MARKER)],
-    )
-    assert overall is None
-    assert "early-gate-triggered" in reason
-
-
-def test_decide_applies_latest_trusted_failure() -> None:
-    overall, reason = eg.decide_overall_from_comments(
-        current_overall="early-gate-triggered",
+def test_decide_concludes_when_eg_build_failed_without_test() -> None:
+    """EG build failure ⇒ do not wait for a test job that never starts."""
+    payload = _eg_ready_payload()
+    overall, reason, snap = eg.decide_overall_from_comments(
         comments=[_bot_comment(FAILED_BARE_MARKER, cid=9)],
+        payload=payload,
     )
     assert overall == "failure"
-    assert "latest Early Gate comment" in reason
+    assert "EG concluded" in reason
+    assert snap["early-gate-build"] == "failure"
+    assert snap["early-gate-test"] == "failure"
+    gates = {g["id"]: g["status"] for g in payload["promotion-gates"]}
+    assert gates["early-gate-build"] == "failure"
+    assert gates["early-gate-test"] == "failure"
 
 
-def test_decide_prefers_newer_failure_over_older_success() -> None:
+def test_decide_waits_when_builds_not_success() -> None:
+    overall, reason, _ = eg.decide_overall_from_comments(
+        comments=[_bot_comment(PASSED_BARE_MARKER), _bot_comment(TESTS_PASSED)],
+        payload={},
+    )
+    assert overall is None
+    assert "component-builds" in reason
+
+
+def test_decide_waits_until_test_when_build_passed() -> None:
+    payload = _eg_ready_payload()
+    overall, reason, snap = eg.decide_overall_from_comments(
+        comments=[_bot_comment(PASSED_BARE_MARKER, cid=9)],
+        payload=payload,
+    )
+    assert overall is None
+    assert "waiting for early-gate conclusion" in reason
+    assert snap["early-gate-build"] == "success"
+    assert snap["early-gate-test"] is None
+    assert "overall-status" not in payload
+
+
+def test_decide_applies_when_build_and_test_failed() -> None:
+    payload = _eg_ready_payload()
+    overall, reason, snap = eg.decide_overall_from_comments(
+        comments=[
+            _bot_comment(FAILED_BARE_MARKER, cid=9),
+            _bot_comment(TESTS_FAILED, cid=10),
+        ],
+        payload=payload,
+    )
+    assert overall == "failure"
+    assert "EG concluded" in reason
+    assert snap["early-gate-build"] == "failure"
+    assert snap["early-gate-test"] == "failure"
+
+
+def test_decide_prefers_newer_build_failure_over_older_success() -> None:
     """Stale wake-up / older success must not win over a newer failure."""
     comments = [
         _bot_comment(PASSED_BARE_MARKER, cid=1, created="2026-10-01T00:00:00Z"),
         _bot_comment(FAILED_BARE_MARKER, cid=2, created="2026-10-29T00:00:00Z"),
+        _bot_comment(TESTS_PASSED, cid=3, created="2026-10-29T01:00:00Z"),
     ]
-    overall, _ = eg.decide_overall_from_comments(
-        current_overall="early-gate-triggered",
+    overall, _, snap = eg.decide_overall_from_comments(
         comments=comments,
+        payload=_eg_ready_payload(),
     )
     assert overall == "failure"
+    assert snap["early-gate-build"] == "failure"
 
 
-def test_decide_prefers_newer_success_over_older_failure() -> None:
+def test_decide_success_when_build_and_test_passed() -> None:
     comments = [
         _bot_comment(FAILED_BARE_MARKER, cid=1, created="2026-10-01T00:00:00Z"),
         _bot_comment(PASSED_BARE_MARKER, cid=2, created="2026-10-29T00:00:00Z"),
+        _bot_comment(TESTS_PASSED, cid=3, created="2026-10-29T01:00:00Z"),
     ]
-    overall, _ = eg.decide_overall_from_comments(
-        current_overall="early-gate-triggered",
+    overall, _, snap = eg.decide_overall_from_comments(
         comments=comments,
+        payload=_eg_ready_payload(),
     )
     assert overall == "success"
+    assert snap["early-gate-build"] == "success"
+    assert snap["early-gate-test"] == "success"
+
+
+def test_decide_can_use_labels_when_comments_missing() -> None:
+    overall, reason, snap = eg.decide_overall_from_comments(
+        comments=[],
+        labels=[
+            "early-gate-build-successful",
+            "early-gate-tests-failed",
+        ],
+        payload=_eg_ready_payload(),
+    )
+    assert overall == "failure"
+    assert "EG concluded" in reason
+    assert snap["early-gate-build"] == "success"
+    assert snap["early-gate-test"] == "failure"
 
 
 def test_decide_rejects_untrusted_only_comments() -> None:
-    overall, reason = eg.decide_overall_from_comments(
-        current_overall="early-gate-triggered",
+    overall, reason, _ = eg.decide_overall_from_comments(
         comments=[
             _bot_comment(PASSED_BARE_MARKER, login="evil-user"),
+            _bot_comment(TESTS_PASSED, login="evil-user"),
         ],
+        payload=_eg_ready_payload(),
     )
     assert overall is None
-    assert "no trusted terminal" in reason
+    assert "waiting for early-gate conclusion" in reason
 
 
 # ---------------------------------------------------------------------------
@@ -519,21 +640,31 @@ def test_run_applies_success_without_publish(
     _state(tmp_path, overall="early-gate-triggered")
 
     def fake_list(url: str, **kwargs: Any) -> list[dict[str, Any]]:
-        return [_bot_comment(PASSED_WITH_DIGESTS, cid=5)]
+        return [
+            _bot_comment(PASSED_WITH_DIGESTS, cid=5),
+            _bot_comment(TESTS_PASSED, cid=6),
+        ]
 
     monkeypatch.setattr(eg, "list_leader_pr_comments", fake_list)
     result = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     assert result.applied is True
     assert result.overall_status == "success"
+    assert result.eg_build_status == "success"
+    assert result.eg_test_status == "success"
     saved = json.loads(
         (tmp_path / "GAP Leaders" / "2026-10-29_gap-egtest01" / "state.json").read_text()
     )
-    assert saved["overall-status"] == "success"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
+    assert gates["early-gate-build"] == "success"
+    assert gates["early-gate-test"] == "success"
 
 
 def test_run_applies_failure_without_publish(
@@ -544,12 +675,13 @@ def test_run_applies_failure_without_publish(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
     )
     result = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     assert result.applied is True
@@ -571,13 +703,18 @@ def test_run_ignores_untrusted_spoof(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     assert result.applied is False
     saved = json.loads(
         (tmp_path / "GAP Leaders" / "2026-10-29_gap-egtest01" / "state.json").read_text()
     )
-    assert saved["overall-status"] == "early-gate-triggered"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
+    assert gates["early-gate-build"] == "pending"
+    assert gates["early-gate-test"] == "pending"
 
 
 def test_run_reconciles_latest_when_older_success_and_newer_failure(
@@ -591,12 +728,14 @@ def test_run_reconciles_latest_when_older_success_and_newer_failure(
         lambda *a, **k: [
             _bot_comment(PASSED_BARE_MARKER, cid=1, created="2026-10-01T00:00:00Z"),
             _bot_comment(FAILED_BARE_MARKER, cid=2, created="2026-10-29T00:00:00Z"),
+            _bot_comment(TESTS_FAILED, cid=3, created="2026-10-29T01:00:00Z"),
         ],
     )
     result = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     assert result.applied is True
@@ -610,12 +749,13 @@ def test_run_noop_when_already_final(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
     )
     result = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     assert result.applied is False
@@ -629,12 +769,13 @@ def test_run_noop_when_not_triggered(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER), _bot_comment(TESTS_PASSED)],
     )
     result = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     assert result.applied is False
@@ -648,12 +789,16 @@ def test_run_dry_run_does_not_write(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(PASSED_WITH_DIGESTS)],
+        lambda *a, **k: [
+            _bot_comment(PASSED_WITH_DIGESTS),
+            _bot_comment(TESTS_PASSED),
+        ],
     )
     result = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
         dry_run=True,
     )
@@ -700,7 +845,10 @@ def test_run_publish_path_greens_leader_and_children(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(PASSED_WITH_DIGESTS)],
+        lambda *a, **k: [
+            _bot_comment(PASSED_WITH_DIGESTS),
+            _bot_comment(TESTS_PASSED),
+        ],
     )
     monkeypatch.setattr(eg, "checkout_leader_branch", fake_checkout)
     monkeypatch.setattr(eg, "publish_state", fake_publish)
@@ -711,6 +859,7 @@ def test_run_publish_path_greens_leader_and_children(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=True,
         head_ref="gap-leader/gap-egtest01",
         updater_factory=factory,
@@ -778,10 +927,11 @@ def test_post_child_statuses_eg_failure_leaves_build_failure_alone() -> None:
         payload, overall_status="failure", updater=updater
     )
     assert posted == ("https://github.com/ex/ok/pull/1",)
+    # Phase-1: children still get GitHub success so auto-merge can proceed.
     assert updater.posts == [
         (
             "https://github.com/ex/ok/pull/1",
-            "failure",
+            "success",
             {"description": eg.CHILD_EG_FAILURE_DESCRIPTION},
         )
     ]
@@ -819,7 +969,7 @@ def test_run_publish_eg_failure_fails_build_ok_children(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
     )
     monkeypatch.setattr(eg, "checkout_leader_branch", lambda *a, **k: None)
     monkeypatch.setattr(
@@ -834,16 +984,19 @@ def test_run_publish_eg_failure_fails_build_ok_children(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=True,
         head_ref="gap-leader/gap-egtest01",
         updater_factory=factory,
     )
     assert result.overall_status == "failure"
-    assert result.child_check_state == "failure"
+    assert result.child_check_state == "success"
     assert result.child_urls_posted == ("https://github.com/ex/ok/pull/1",)
+    # Phase-1: EG failure still posts GitHub success so auto-merge proceeds.
     assert [p[:2] for p in holder["u"].posts] == [
-        ("https://github.com/ex/ok/pull/1", "failure")
+        ("https://github.com/ex/ok/pull/1", "success")
     ]
+    assert holder["u"].posts[0][2].get("description") == eg.CHILD_EG_FAILURE_DESCRIPTION
 
 
 def test_run_dry_run_reports_child_targets(
@@ -853,12 +1006,13 @@ def test_run_dry_run_reports_child_targets(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER), _bot_comment(TESTS_PASSED)],
     )
     result = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=True,
         dry_run=True,
     )
@@ -885,8 +1039,9 @@ def test_main_dry_run_exit_zero(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER), _bot_comment(TESTS_PASSED)],
     )
+    monkeypatch.setattr(eg, "fetch_leader_labels", lambda *a, **k: [])
     code = eg.main(
         [
             "--repo-root",
@@ -913,23 +1068,25 @@ def test_second_run_idempotent(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(PASSED_BARE_MARKER), _bot_comment(TESTS_PASSED)],
     )
     first = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER)],
+        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
     )
     second = eg.run_early_gate_results(
         repo_root=tmp_path,
         leader_pr_url="https://github.com/acme/gap/pull/9",
         trigger_id="gap-egtest01",
+        labels=[],
         publish=False,
     )
     assert first.applied is True
