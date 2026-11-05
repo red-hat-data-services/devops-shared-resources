@@ -16,10 +16,45 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ruamel.yaml import YAML
-
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
+
+# Operational mode runs only workflow-selected source, not ignored bytecode or
+# target-provided modules. Keep the longstanding validate/fix import path intact.
+if __name__ == "__main__" and any(arg in sys.argv[1:] for arg in ("--reconcile", "--resume-report", "--inventory-root")):
+    check = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                           cwd=_repo_root, capture_output=True, text=True, check=True)
+    if check.stdout:
+        sys.exit("error: trusted shared source checkout must be clean")
+    import importlib.abc
+    import importlib.util
+
+    class _SourceOnlyLoader(importlib.abc.Loader):
+        def __init__(self, path):
+            self.path = path
+
+        def create_module(self, spec):
+            return None
+
+        def exec_module(self, module):
+            exec(compile(self.path.read_bytes(), str(self.path), "exec"), module.__dict__)
+
+    class _TrustedLibFinder(importlib.abc.MetaPathFinder):
+        def find_spec(self, fullname, path=None, target=None):
+            if fullname == "lib" or fullname.startswith("lib."):
+                source = _repo_root.joinpath(*fullname.split("."))
+                package = source.is_dir()
+                source = source / "__init__.py" if package else source.with_suffix(".py")
+                return importlib.util.spec_from_file_location(
+                    fullname, source, loader=_SourceOnlyLoader(source),
+                    submodule_search_locations=[str(source.parent)] if package else None)
+            return None
+
+    sys.meta_path.insert(0, _TrustedLibFinder())
+    from lib.tekton_reconciliation import main as reconciliation_main
+    sys.exit(reconciliation_main())
+
+from ruamel.yaml import YAML
 from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
 from lib.tekton_config import load_config
 from lib.tekton_filters import DELETE_FILE_PREFIX
@@ -70,10 +105,13 @@ def _glob_tekton_files(base_dir: Path, layout: str = "flat", pipeline_dir: Path 
     if layout == "nested":
         if pipeline_dir is not None:
             yield from sorted((base_dir / pipeline_dir).glob(".tekton/*.yaml"))
+            yield from sorted((base_dir / pipeline_dir).glob(".tekton/*.yml"))
         else:
             yield from sorted(base_dir.glob("pipelineruns/*/.tekton/*.yaml"))
+            yield from sorted(base_dir.glob("pipelineruns/*/.tekton/*.yml"))
     else:
         yield from sorted(base_dir.glob("*.yaml"))
+        yield from sorted(base_dir.glob("*.yml"))
 
 
 def _load_pipelines(
@@ -532,6 +570,10 @@ def fix_tekton_dir(
 
 def main():
     global verbose, json_mode
+
+    if any(arg in sys.argv[1:] for arg in ("--reconcile", "--resume-report", "--inventory-root")):
+        from lib.tekton_reconciliation import main as reconciliation_main
+        sys.exit(reconciliation_main())
 
     parser = argparse.ArgumentParser(
         description="Validate Tekton PipelineRun files in the current repo.",
