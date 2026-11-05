@@ -28,6 +28,18 @@ candidate checkouts and exact-change plans are temporary and are not copied into
 reports. Reports cannot be resumed, verified or used as input to a later command.
 Do not upload temporary stage trees.
 
+In GitHub Actions, successful previews automatically append a readable section to
+`GITHUB_STEP_SUMMARY` without replacing prior content or changing stdout JSON.
+It includes operation counts, planned paths, deferred manual/unresolved counts,
+and a collapsible escaped diff. Readiness applies to the plan, not complete
+branch alignment. Escaped UTF-8 output is bounded (48 KB paths, 160 KB diff,
+220 KB per preview, 900 KB total including prior summary text); truncation is
+explicit. Download the job's report artifact and open `enforcement.patch` for
+the full unchanged patch, or `result.json` for all paths and diagnostics.
+Workflows still upload those reports; the shared command does not upload them.
+Summary failures only warn on stderr. Local runs without `GITHUB_STEP_SUMMARY`,
+inventory calls, and publication calls do not append this preview section.
+
 Only existing regular-file changes are supported. The default is modifications
 only (`--allowed-operations M`). Explicit `M,D` also permits deletions, but only
 for matched PipelineRuns with an initial template deletion signal. Deletion
