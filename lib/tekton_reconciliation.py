@@ -6,7 +6,9 @@ Exact-change plans exist only inside this invocation; saved reports are diagnost
 from collections import Counter
 from io import StringIO
 import argparse
+import html
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -14,6 +16,7 @@ import subprocess
 import sys
 import tempfile
 import types
+from urllib.parse import quote, urlsplit
 
 from ruamel.yaml import YAML
 from lib import reconciliation as worker
@@ -250,16 +253,122 @@ def plan(args, report):
     return result
 
 
-def summary(result):
-    lines = ["", "## Shared reconciliation checks", "",
-             "Preview, fix, non-fix validation and idempotence passed. Only selected existing files changed.",
-             "No automatic merge or workflow dispatch is requested.", ""]
-    lines += [f"- {row['status']}: `{row['path']}`" for row in result["changes"]]
+def display_text(value):
+    """Escape untrusted display data without allowing new Markdown/HTML blocks."""
+    text = re.sub(r"[\x00-\x1f\x7f]", " ", str(value))
+    return re.sub(r"([\\`*_{}\[\]()#!|~])", r"\\\1", html.escape(text, quote=False))
+
+
+def repository_name(value):
+    return bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*/[A-Za-z0-9][A-Za-z0-9_.-]*", value or ""))
+
+
+def commit_id(value):
+    return bool(re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value or ""))
+
+
+def safe_server(value):
+    try:
+        parts = urlsplit(value)
+    except ValueError:
+        return None
+    if (parts.scheme != "https" or not parts.hostname or parts.username or parts.password
+            or not re.fullmatch(r"[A-Za-z0-9.-]+(?::[0-9]+)?", parts.netloc)
+            or parts.query or parts.fragment or parts.path not in ("", "/")
+            or re.search(r"[\s<>\\]", value)):
+        return None
+    return value.rstrip("/")
+
+
+def policy_repository_url(source):
+    """Use only the actual policy origin; never infer it from the target or run."""
+    try:
+        origin = git(source, "remote", "get-url", "origin").rstrip("/").removesuffix(".git")
+    except subprocess.CalledProcessError:
+        return None
+    for prefix in ("https://github.com/", "git@github.com:", "ssh://git@github.com/"):
+        if origin.startswith(prefix) and repository_name(origin[len(prefix):]):
+            return "https://github.com/" + origin[len(prefix):]
+    return None
+
+
+def linked_path(path, repository, revision, kind):
+    """Link a safe repository-relative path at an immutable commit, else plain text."""
+    text = display_text(path)
+    try:
+        worker.safe_name(path)
+    except ValueError:
+        return text
+    if not repository or not commit_id(revision):
+        return text
+    return f"[{text}]({repository}/{kind}/{revision}/{quote(path, safe='/')})"
+
+
+def workflow_context(environ):
+    lines = ["## Created by", ""]
+    repo = environ.get("GITHUB_REPOSITORY", "")
+    name = environ.get("GITHUB_WORKFLOW", "")
+    reference = environ.get("GITHUB_WORKFLOW_REF", "")
+    server = safe_server(environ.get("GITHUB_SERVER_URL", "https://github.com"))
+    if not name and not reference and not environ.get("GITHUB_RUN_ID"):
+        return lines + ["Local run (GitHub Actions context unavailable)."]
+    lines.append(f"- **Workflow:** {display_text(name or 'Not supplied')}")
+    if "/.github/workflows/" in reference:
+        workflow_repo, file_ref = reference.split("/.github/workflows/", 1)
+        filename, separator, ref = file_ref.partition("@refs/")
+        if not separator:
+            filename, separator, ref = file_ref.rpartition("@")
+        path = ".github/workflows/" + filename
+        revision = environ.get("GITHUB_WORKFLOW_SHA", "")
+        if not revision and workflow_repo == repo:
+            revision = environ.get("GITHUB_SHA", "")
+        base = f"{server}/{workflow_repo}" if server and repository_name(workflow_repo) and separator else None
+        label = linked_path(path, base, revision, "blob")
+        lines.append(f"- **Workflow file:** {label}")
+        if not base or not commit_id(revision):
+            lines.append(f"- **Workflow ref:** {display_text(reference)} (exact commit unavailable)")
+    elif reference:
+        lines.append(f"- **Workflow ref:** {display_text(reference)}")
+    run = environ.get("GITHUB_RUN_ID", "")
+    if run.isdigit() and server and repository_name(repo):
+        lines.append(f"- **Run:** [{display_text(run)}]({server}/{repo}/actions/runs/{run})")
+    elif run:
+        lines.append(f"- **Run:** {display_text(run)}")
+    return lines
+
+
+def summary(result, *, policy_source, config_dir, environ=None):
+    """Render presentation context without changing plan/provenance identities."""
+    environ = os.environ if environ is None else environ
+    lines = ["", *workflow_context(environ), "", "## Templates", ""]
+    provenance = result["provenance"]
+    revision = provenance["policy_revision"]
+    repository = policy_repository_url(policy_source)
+    try:
+        config_path = Path(config_dir).resolve().relative_to(Path(policy_source).resolve()).as_posix()
+    except ValueError:
+        config_path, repository = str(config_dir), None
+    lines += [f"- **Config directory:** {linked_path(config_path, repository, revision, 'tree')}",
+              f"- **Policy revision:** {display_text(revision)}"]
+    if provenance.get("policy_python"):
+        lines.append(f"- **Policy module:** {linked_path(provenance['policy_python'], repository, revision, 'blob')}")
+    lines += ["", "## Changes", ""]
+    for status, heading in (("M", "Modified"), ("D", "Deleted")):
+        paths = [row["path"] for row in result["changes"] if row["status"] == status]
+        lines += [f"### {heading} ({len(paths)})", ""]
+        lines += [f"- {display_text(path)}" for path in paths] if paths else ["- None"]
+        lines.append("")
+    lines += ["## Shared reconciliation checks", "",
+              "Preview, fix, non-fix validation and idempotence passed. Only selected existing files changed.",
+              "No automatic merge or workflow dispatch is requested."]
     diagnostics = result.get("diagnostics", {})
-    for row in diagnostics.get("files", []) if isinstance(diagnostics.get("files"), list) else []:
-        if row["status"] in ("manual", "unresolved"):
-            lines.append(f"- {row['status']}: `{row['path']}`: {row.get('reason', '')}")
-    lines += ["", "Provenance:", "```json", json.dumps(result["provenance"], indent=2), "```"]
+    rows = diagnostics.get("files", [])
+    deferred = [row for row in rows if row["status"] in ("manual", "unresolved")] if isinstance(rows, list) else []
+    if deferred:
+        counts = Counter(row["status"] for row in deferred)
+        lines += ["", "## Deferred cases", "", f"Manual: {counts['manual']}; unresolved: {counts['unresolved']}."]
+        lines += [f"- {row['status']}: {display_text(row['path'])}: {display_text(row.get('reason', ''))}" for row in deferred]
+    lines += ["", "## Provenance", "", "```json", json.dumps(provenance, indent=2), "```"]
     return "\n".join(lines)
 
 
@@ -287,7 +396,7 @@ def publish_candidate(args, result, report):
     for key in ("repository", "marker", "title", "body_file", "lifecycle"):
         if not getattr(args, key):
             raise ValueError(f"publication requires --{key.replace('_', '-')}")
-    body = args.body_file.read_text() + summary(result)
+    body = args.body_file.read_text() + summary(result, policy_source=source, config_dir=config_dir)
     if args.tracking_url:
         if not re.fullmatch(r"https://[^\s<>]+", args.tracking_url):
             raise ValueError("invalid tracking URL")
