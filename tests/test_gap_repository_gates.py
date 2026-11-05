@@ -704,7 +704,11 @@ def test_all_current_checks_pass_and_preserve_image_uri(tmp_path: Path) -> None:
     assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
     saved = _saved(path)
     assert saved["pull-requests"][0]["pr-status"] == "success"
-    assert saved["overall-status"] == "early-gate-triggered"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
+    assert gates["early-gate-build"] == "pending"
+    assert gates["early-gate-test"] == "pending"
     assert saved["pull-requests"][0]["builds"] == [
         {"component": "existing", "image": "quay.io/example/existing:1"}
     ]
@@ -904,10 +908,15 @@ def test_undiscovered_feasibility_workflow_stays_unresolved_until_jobs_are_known
     ]
     passed, updater = _run(path, github)
     assert passed.success_urls == [URL]
-    # Prior overall-status=failure is preserved; mixed/failure path still greens.
-    assert passed.overall_status == "failure"
-    assert updater.posts[0][1] == "success"
-    assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
+    # Gates SoT: child recovered to success → component-builds success, hold for EG.
+    assert passed.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
+    saved = _saved(path)
+    assert saved["pull-requests"][0]["pr-status"] == "success"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
 
 
 def test_unfinished_workflow_uses_the_revision_deadline(tmp_path: Path) -> None:
