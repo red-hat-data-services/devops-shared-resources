@@ -113,7 +113,9 @@ def test_build_receipt_survives_eg_result_and_history_snapshot(tmp_path, monkeyp
     """Stage-2 result handling and history retain Stage-1 evidence and image data."""
     from scripts import gap_early_gate_results as eg
     from lib.leader_history import write_history_snapshot
-    from tests.test_gap_early_gate_results import _bot_comment, PASSED_BARE_MARKER, FAILED_BARE_MARKER
+    from tests.test_gap_early_gate_results import (
+        _bot_comment, PASSED_BARE_MARKER, FAILED_BARE_MARKER, TESTS_PASSED,
+    )
     receipt = {"source": "konflux", "repository": REPO, "pr": 123,
                "head-sha": SHA, "pr-state": "OPEN", "runs": [observe([run()]).to_dict()]}
     images = [{"component": "odh-foo", "image": "quay.io/acme/foo@sha256:" + "b" * 64}]
@@ -125,10 +127,13 @@ def test_build_receipt_survives_eg_result_and_history_snapshot(tmp_path, monkeyp
         "pr-status": "success", "builds": images, "build-observations": receipt,
     }]}))
     comment = PASSED_BARE_MARKER if outcome == "success" else FAILED_BARE_MARKER
-    monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: [_bot_comment(comment)])
+    comments = [_bot_comment(comment)]
+    if outcome == "success":
+        comments.append(_bot_comment(TESTS_PASSED))
+    monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: comments)
     result = eg.run_early_gate_results(
         repo_root=tmp_path, leader_pr_url="https://github.com/acme/gap/pull/9",
-        state_file=str(path), publish=False)
+        state_file=str(path), labels=[], publish=False)
     assert result.overall_status == outcome
     for saved in (path, write_history_snapshot(tmp_path, path)):
         child = json.loads(saved.read_text())["pull-requests"][0]

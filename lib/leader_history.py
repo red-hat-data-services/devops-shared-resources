@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import re
 from pathlib import Path
 from typing import Callable, Sequence
 
+from lib.gap_promotion_gates import derive_legacy_overall_status
 from lib.github_cli import run_gh
 from lib.pr_status_updater import parse_pr_url
 
@@ -19,7 +21,14 @@ RESULT_LABELS = {"success": "result-gap-success", "failure": "result-gap-failure
 def write_history_snapshot(repo_root: Path, state_path: Path) -> Path | None:
     """Copy either terminal outcome; retain the canonical monitor state path."""
     payload = json.loads(state_path.read_text(encoding="utf-8"))
-    folder = HISTORY_FOLDERS.get(payload.get("overall-status"))
+    # Canonical gates take precedence, even when empty or incomplete. Derivation
+    # normalizes gates, so use a copy to preserve the exact archived payload.
+    overall = (
+        derive_legacy_overall_status(copy.deepcopy(payload))
+        if "promotion-gates" in payload
+        else payload.get("overall-status")
+    )
+    folder = HISTORY_FOLDERS.get(overall)
     if folder is None:
         return None
     relative = state_path.resolve().relative_to(repo_root.resolve())

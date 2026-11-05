@@ -152,6 +152,47 @@ def test_snapshot_preserves_canonical_and_child_outcome(tmp_path, outcome, folde
     assert write_history_snapshot(tmp_path, state).read_bytes() == first
 
 
+@pytest.mark.parametrize("legacy", [None, "success", "failure", "early-gate-triggered"])
+@pytest.mark.parametrize("statuses,folder", [
+    pytest.param([], None, id="empty"),
+    pytest.param(["pending"], None, id="partial-pending"),
+    pytest.param(["success"], None, id="partial-builds-success"),
+    pytest.param(["pending", "pending", "pending"], None, id="pending"),
+    pytest.param(["success", "success", "pending"], None, id="awaiting-tests"),
+    pytest.param(["success", "success", "success"], "successful", id="success"),
+    pytest.param(["success", "success", "failure"], "unsuccessful", id="test-failure"),
+    pytest.param(["success", "failure", "pending"], "unsuccessful", id="eg-build-failure"),
+    pytest.param(["failure", "pending", "pending"], "unsuccessful", id="component-failure"),
+])
+def test_snapshot_uses_canonical_gates_without_changing_payload(tmp_path, statuses, folder, legacy):
+    state = tmp_path / "GAP Leaders" / "2026-11-04_gap-test" / "state.json"
+    state.parent.mkdir(parents=True)
+    gate_ids = ("component-builds", "early-gate-build", "early-gate-test")
+    payload = {
+        "promotion-gates": [
+            {"id": gate_id, "status": status}
+            for gate_id, status in zip(gate_ids, statuses)
+        ],
+        "pull-requests": [{"repo": "component", "pr-status": "success", "builds": []}],
+    }
+    if legacy is not None:
+        payload["overall-status"] = legacy
+    state.write_text(json.dumps(payload))
+    original = state.read_bytes()
+
+    snapshot = write_history_snapshot(tmp_path, state)
+
+    assert state.read_bytes() == original
+    if folder is None:
+        assert snapshot is None
+        assert not (tmp_path / "GAP History").exists()
+    else:
+        assert snapshot == tmp_path / f"GAP History/{folder}/2026-11-04_gap-test/state.json"
+        assert json.loads(snapshot.read_text()) == payload
+        assert write_history_snapshot(tmp_path, state).read_bytes() == snapshot.read_bytes()
+        assert state.read_bytes() == original
+
+
 @pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
 def test_state_and_snapshot_land_in_same_real_git_commit(tmp_path, outcome, folder):
     """Prove both copies survive a normal local push; no GitHub or mocks."""
