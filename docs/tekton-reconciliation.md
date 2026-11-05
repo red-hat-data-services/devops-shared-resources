@@ -82,7 +82,43 @@ completed operation, not a gate for a second command. Publication details are
 saved separately in diagnostic `publication.json`. Publication to main/master is
 rejected. Caller-provided `--allowed-branches` restricts releases further.
 
-## Scan-specific policy
+## Template selection and optional guards
+
+An optional `selection_template` config key names a contained Jinja sidecar.
+It renders JSON with exactly two keys: `status` (`applicable`, `skipped`,
+`manual`, or `unresolved`) and string `reason`. Results are limited to 16 KiB;
+reasons to 4096 characters. Duplicate JSON keys and extra fields are rejected.
+No selection sidecar means the existing template matchers remain authoritative.
+
+Selection uses the ordinary renderer variables plus detached `context`:
+`{"branch": branch, "documents": {path: data_or_None}}`. Declare fixed
+branch-local inputs in config `context_paths`. These paths must be unique,
+contained and disjoint from writable scope. Existing inputs must be tracked;
+they are snapshotted, mode/hash recorded in provenance, and copied into the
+stage. Context is parsed once from that initial stage and copied into each
+selection/render/guard invocation; CLI variables cannot overwrite it. Context
+bytes and the stage index are checked after every phase.
+
+The generic `unique_item(items, key, target)` filter returns a matching mapping
+or an empty mapping, rejecting duplicate target identities. The Jinja global
+`fail(message)` raises an explicit validation error. Business decisions belong
+in the sidecar, not in a framework policy callback.
+
+With selection configured, `--policy-python` may supply only
+`check(original, candidate, context)` (and optional isolated `filters`). The
+post-merge guard must return `True`; all strict candidates are guarded and
+serialized before any strict file write. Without selection configured, the
+legacy `decision`/`check` contract below remains supported. No consumer migration
+is required to adopt this shared update.
+
+Both profiles use the ordinary `validate-tekton` fix engine. Strict reconciliation
+uses a localized, fail-closed writer; the ordinary CLI default retains its legacy
+whole-document round-trip writer and anchor support. Strict reports retain the
+existing `files` list and status `counts`, including manual/unresolved counts.
+Nested strict identities are repository-relative paths, not basenames. The
+ordinary CLI output schema and flat basename identities remain unchanged.
+
+## Legacy scan-specific policy
 
 Use `--policy-python source/script/scan_resource_policy.py` with the existing
 nested-layout config. Keep M-only unless the operation's profile explicitly
@@ -104,7 +140,7 @@ marker `Conformance-Generated: true`, the existing scan-review body file, and
 ## Existing-file comments and formatting
 
 The ordinary template merge retains existing round-trip container comments and
-styles. The reconciliation policy path additionally emits localized source edits
+styles. Strict reconciliation (selection or legacy policy) emits localized source edits
 instead of dumping the entire document. Unchanged source spans are retained,
 including unrelated multiline flow values, null spelling and line endings.
 Changed fields and list items may be inserted, removed or updated.

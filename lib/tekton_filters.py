@@ -102,6 +102,19 @@ class SkipValidation(str):
 DELETE_FILE_PREFIX = "DELETE: "
 
 
+@jinja_filter
+def unique_item(items, key, target):
+    """Return a unique keyed mapping; ambiguous target identities fail closed."""
+    if items is None:
+        return {}
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("keyed collection must contain mappings")
+    matches = [item for item in items if item.get(key) == target]
+    if len(matches) > 1:
+        raise ValueError(f"duplicate {key}: {target}")
+    return matches[0] if matches else {}
+
+
 # =============================================================================
 # Transform filters
 # =============================================================================

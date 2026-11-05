@@ -17,7 +17,7 @@ def get_annotation(data: dict, key: str) -> str | None:
 
 
 def get_label(data: dict, key: str) -> str | None:
-    return data.get("metadata", {}).get("labels", {}).get(key)
+    return (data.get("metadata", {}).get("labels") or {}).get(key)
 
 
 def get_pipeline_ref_param(data: dict, name: str) -> str | None:
@@ -114,7 +114,7 @@ def extract_component_prefix(filename: str, data: dict | None = None) -> str | N
 
 
 def _create_jinja_env(template_dir: str, mode: str = "validate", errors: list | None = None,
-                      component: str | None = None):
+                      component: str | None = None, extra_filters: dict | None = None):
     import jinja2
     from lib import tekton_filters
 
@@ -125,8 +125,15 @@ def _create_jinja_env(template_dir: str, mode: str = "validate", errors: list | 
 
     if errors is None:
         errors = []
+    def fail(message):
+        raise ValueError(str(message))
+    env.globals["fail"] = fail
     env._skipped = False
     env.filters.update(tekton_filters.make_filters(mode, errors, component=component, env=env))
+    for name, function in (extra_filters or {}).items():
+        if not isinstance(name, str) or not callable(function):
+            raise ValueError("invalid policy filter")
+        env.filters[name] = tekton_filters._wrap_filter(function, mode, errors)
 
     return env
 
@@ -143,7 +150,7 @@ def _annotations_dict(data: dict) -> dict:
 
 def _labels_dict(data: dict) -> dict:
     """Get labels as a plain dict with string keys/values."""
-    return {str(k): str(v) for k, v in data.get("metadata", {}).get("labels", {}).items()}
+    return {str(k): str(v) for k, v in (data.get("metadata", {}).get("labels") or {}).items()}
 
 
 def extract_template_vars(
@@ -184,7 +191,7 @@ def extract_template_vars(
         "labels": labels,
         "pipelineref": pipelineref_params,
         "repo_url": repo_url,
-        "metadata": data.get("metadata", {}),
+        "metadata": data.get("metadata") or {},
         "spec": data.get("spec", {}),
         "_existing_data": dict(data) if hasattr(data, 'keys') else data,
         "parent_params": {},
@@ -382,7 +389,8 @@ def resolve_overlay(config_dir, template_name, component_prefix, component_label
 
 
 def render_template(template_dir: str, template_name: str, variables: dict, mode: str = "fix",
-                    errors: list | None = None, overlay_path: str | None = None) -> dict:
+                    errors: list | None = None, overlay_path: str | None = None,
+                    template_filters: dict | None = None) -> dict:
     """Render a Jinja template Ansible-style.
 
     1. Parse the template as valid YAML (Jinja expressions are in quoted strings)
@@ -414,8 +422,8 @@ def render_template(template_dir: str, template_name: str, variables: dict, mode
 
     existing_data = variables.get("_existing_data", {})
     parent_data = variables.get("_parent_data")
-    component = variables.get("labels", {}).get("appstudio.openshift.io/component", "")
-    env = _create_jinja_env(template_dir, mode=mode, errors=errors, component=component)
+    component = (variables.get("labels") or {}).get("appstudio.openshift.io/component", "")
+    env = _create_jinja_env(template_dir, mode=mode, errors=errors, component=component, extra_filters=template_filters)
 
     skipped_paths = set()
     _resolve_and_render_tree(tree, existing_data, parent_data, env, variables, skipped_paths=skipped_paths)
@@ -646,6 +654,8 @@ def render_and_merge(
     cli_vars: dict | None = None,
     inherit_params: bool = False,
     overlay_path: str | None = None,
+    template_context: dict | None = None,
+    template_filters: dict | None = None,
 ) -> dict:
     """Render a template with variables extracted from existing data, then merge.
 
@@ -657,7 +667,10 @@ def render_and_merge(
     before rendering.
     """
     variables = extract_template_vars(existing_data, filename, branch, parent_data=parent_data, cli_vars=cli_vars)
-    rendered = render_template(template_dir, template_name, variables, mode=mode, errors=errors, overlay_path=overlay_path)
+    if template_context is not None:
+        from copy import deepcopy
+        variables["context"] = deepcopy(template_context)
+    rendered = render_template(template_dir, template_name, variables, mode=mode, errors=errors, overlay_path=overlay_path, template_filters=template_filters)
 
     tmpl_param_names = _template_param_names(rendered) if inherit_params else set()
 

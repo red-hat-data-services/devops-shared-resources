@@ -76,7 +76,7 @@ def source_relative(path, source):
     raise ValueError("path is outside trusted source")
 
 
-def load_policy(path, source):
+def load_policy(path, source, require_decision=True):
     if not path:
         return None
     path = Path(path).absolute()
@@ -87,7 +87,7 @@ def load_policy(path, source):
     module = types.ModuleType("trusted_tekton_policy")
     module.__file__ = str(path)
     exec(compile(data, str(path), "exec"), module.__dict__)
-    for key in ("decision", "check"):
+    for key in (("decision", "check") if require_decision else ("check",)):
         if not callable(getattr(module, key, None)):
             raise ValueError(f"policy lacks {key}")
     return module
@@ -113,61 +113,36 @@ def documents(root, scope, layout):
     return runs
 
 
-def context_for(root, policy, branch):
+def declared_context_paths(config, policy):
+    paths = [*getattr(config, "context_paths", ()), *getattr(policy, "CONTEXT_PATHS", ())]
+    if len(set(paths)) != len(paths):
+        raise ValueError("duplicate declared context path")
+    return paths
+
+
+def context_for(root, policy, branch, config=None):
     context = {"branch": branch, "documents": {}}
     yaml = YAML(typ="safe", pure=True)
-    for name in getattr(policy, "CONTEXT_PATHS", ()):
+    for name in declared_context_paths(config, policy):
         path = worker.contained(root, name)
         context["documents"][name] = detached_data(yaml.load(worker.read_file(root, name))) if path.exists() else None
     return context
 
 
-def scan_phase(stage, phase, config, policy, branch, scope, layout):
-    from lib import tekton_filters
-    from lib.tekton_yaml import localized_yaml
-    for name, function in getattr(policy, "filters", {}).items():
-        if not isinstance(name, str) or not callable(function):
-            raise ValueError("invalid policy filter")
-        setattr(tekton_filters, name, tekton_filters.jinja_filter(function))
-    context = context_for(stage, policy, branch)
-    yaml = YAML()
-    yaml.preserve_quotes, yaml.width = True, 4096
-    rows, copies = [], []
-    for name, original in documents(stage, scope, layout).items():
-        source = worker.read_file(stage, name)
-        data = yaml.load(source)
-        decision = policy.decision(detached_data(original), detached_data(context))
-        status = decision["status"]
-        if status not in ("applicable", "skipped", "manual", "unresolved"):
-            raise ValueError("invalid policy decision")
-        row = {"path": name, "status": status, "reason": decision.get("reason", "")}
-        if status == "applicable":
-            template = config.get_template(classify_pipeline(Path(name).name, data, config))
-            if template is None or template.parent:
-                raise ValueError("policy requires an existing non-parent template")
-            overlay = resolve_overlay(config.config_dir, template.file,
-                                      extract_component_prefix(Path(name).name, data),
-                                      data.get("metadata", {}).get("labels", {}).get("appstudio.openshift.io/component"))
-            errors = []
-            candidate = render_and_merge(config.config_dir, template.file, data, Path(name).name,
-                                         branch, mode="validate" if phase == "validation" else "fix",
-                                         cli_vars=decision.get("variables", {}),
-                                         errors=errors if phase == "validation" else None, overlay_path=overlay)
-            if errors or policy.check(detached_data(original), detached_data(candidate), detached_data(context)) is not True:
-                raise ValueError(f"policy rejected candidate {name}: {errors}")
-            row["status"] = "conformant" if candidate == data else "planned"
-            if candidate != data:
-                serialized = localized_yaml(source, candidate)
-                if detached_data(YAML(typ="safe", pure=True).load(serialized)) != detached_data(candidate):
-                    raise ValueError("serialized candidate differs")
-                copies.append((stage / name, serialized))
-        rows.append(row)
-    if phase in ("validation", "idempotence") and copies:
-        raise ValueError("validation/idempotence still plans changes")
-    if phase == "fix":
-        for path, text in copies:
-            path.write_bytes(text.encode("utf-8"))
-    return {"files": rows, "counts": dict(Counter(row["status"] for row in rows))}
+def scan_phase(stage, phase, config, policy, branch, scope, layout, context=None):
+    """Compatibility adapter; ordinary validate-tekton owns the only fix loop."""
+    from lib.tekton_validation import StrictProfile
+    path = ROOT / "scripts" / "validate-tekton"
+    module = types.ModuleType("trusted_validate_tekton")
+    module.__file__ = str(path)
+    exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
+    module.json_mode = True
+    profile = StrictProfile(stage, phase, config, branch,
+                            documents(stage, scope, layout),
+                            context if context is not None else context_for(stage, policy, branch, config), policy)
+    module.fix_tekton_dir(Path(stage), branch, None, True, config=config,
+                          layout=layout, profile=profile)
+    return profile.finish()
 
 
 def plan(args, report):
@@ -182,20 +157,27 @@ def plan(args, report):
         raise ValueError("existing-file reconciliation does not support generation/external parents")
     layout = config.tekton_layout
     scope = ".tekton" if layout == "flat" else "pipelineruns"
-    policy = load_policy(args.policy_python, source)
-    if policy is None and layout != "flat":
+    policy = load_policy(args.policy_python, source, require_decision=not config.selection_template)
+    strict_profile = policy is not None or config.selection_template is not None
+    context = None
+    if not strict_profile and layout != "flat":
         raise ValueError("nested reconciliation currently requires a document policy")
     allowed = args.allowed_operations.split(",")
     if allowed not in (["M"], ["M", "D"]):
         raise ValueError("allowed operations must be M or M,D")
-    if policy and allowed != ["M"]:
+    if strict_profile and allowed != ["M"]:
         raise ValueError("document policy profile is modifications only")
     before_runs = documents(root, scope, layout)
     phases = {}
     selected, deletions = [], []
     def validate(stage, phase):
-        if policy:
-            output = scan_phase(stage, phase, config, policy, args.branch, scope, layout)
+        nonlocal context
+        if strict_profile:
+            if context is None:
+                if worker.snapshot_paths(stage, context_paths) != context_snapshot:
+                    raise ValueError("staged context differs from provenance")
+                context = context_for(stage, policy, args.branch, config)
+            output = scan_phase(stage, phase, config, policy, args.branch, scope, layout, context)
         else:
             flags = {"initial": [], "preview": ["--fix", "--dry-run"], "fix": ["--fix"],
                      "validation": [], "idempotence": ["--fix"]}[phase]
@@ -221,7 +203,7 @@ def plan(args, report):
         (logs / f"{phase}.json").write_text(json.dumps(output, indent=2) + "\n")
         return output
     def select(initial, inventory):
-        if policy:
+        if strict_profile:
             selected.extend(row["path"] for row in initial["files"] if row["status"] == "planned")
         else:
             for name, details in initial["files"].items():
@@ -235,10 +217,11 @@ def plan(args, report):
             raise ValueError("policy requested deletion but caller permits only M")
         return selected, deletions
     context_paths = []
-    for name in getattr(policy, "CONTEXT_PATHS", ()):
+    for name in declared_context_paths(config, policy):
         if worker.contained(root, name).exists():
             context_paths.append(name)
-    provenance = {"branch": args.branch, "policy_revision": policy_revision,
+    context_snapshot = worker.snapshot_paths(root, context_paths)
+    provenance = {"branch": args.branch, "context": context_snapshot, "policy_revision": policy_revision,
                   "worker_revision": revision, "validator_revision": revision, "publisher_revision": revision,
                   "policy_digest": policy_digest(config_dir), "inventory_revision": args.inventory_revision,
                   "policy_python": str(Path(args.policy_python).resolve().relative_to(source)) if policy else None}
