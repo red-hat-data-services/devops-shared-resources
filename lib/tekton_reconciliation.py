@@ -21,6 +21,7 @@ from urllib.parse import quote, urlsplit
 from ruamel.yaml import YAML
 from lib import reconciliation as worker
 from lib import validated_pr_publisher as publisher
+from lib.tekton_preview_summary import append_preview_summary
 from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
 from lib.tekton_config import load_config
 
@@ -516,6 +517,8 @@ def main(argv=None):
                         if "\n" in value or "\r" in value:
                             raise ValueError("unsafe workflow output")
                         stream.write(f"{key}={value}\n")
+        if not args.inventory_root and not args.publish:
+            append_preview_summary(result, report, os.environ)
         print(json.dumps(result, indent=None if args.json else 2))
         return 0
     except Exception as exc:
