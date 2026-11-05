@@ -17,7 +17,8 @@ def create_candidate_source(destination=None):
     root.mkdir(parents=True, exist_ok=False)
     shutil.copytree(source / "lib", root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
     (root / "scripts").mkdir()
-    shutil.copy2(source / "scripts/validate-tekton", root / "scripts/validate-tekton")
+    for name in ("validate-tekton", "reconcile-tekton"):
+        shutil.copy2(source / "scripts" / name, root / "scripts" / name)
     (root / ".gitignore").write_text("__pycache__/\n*.pyc\n")
     def git(*args):
         return subprocess.check_output(["git", *args], cwd=root, stderr=subprocess.PIPE).decode().strip()

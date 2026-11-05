@@ -38,7 +38,8 @@ def tooling(tmp_path_factory):
     init(root)
     shutil.copytree(ROOT / "lib", root / "lib", ignore=shutil.ignore_patterns("__pycache__"))
     (root / "scripts").mkdir()
-    shutil.copy2(ROOT / "scripts/validate-tekton", root / "scripts/validate-tekton")
+    for name in ("validate-tekton", "reconcile-tekton"):
+        shutil.copy2(ROOT / "scripts" / name, root / "scripts" / name)
     (root / ".gitignore").write_text("__pycache__/\n*.pyc\n")
     commit(root)
     return root
@@ -61,30 +62,33 @@ def setup(tmp_path):
     return source, target
 
 
-def run(tooling, *args):
-    return subprocess.run([sys.executable, str(tooling / "scripts/validate-tekton"), *map(str, args)],
+def run(tooling, *args, command="reconcile-tekton"):
+    return subprocess.run([sys.executable, str(tooling / "scripts" / command), *map(str, args)],
                           capture_output=True, text=True)
 
 
 def plan(tooling, setup, tmp_path, *extra):
     source, target = setup
     report = tmp_path / "report"
-    result = run(tooling, "--reconcile", "--path", target, "--config-dir", source / "templates",
+    result = run(tooling, "--path", target, "--config-dir", source / "templates",
                  "--branch", "rhoai-3.6", "--report-dir", report, *extra)
     return report, result
 
 
-def resume_args(setup, report, tmp_path):
-    source, target = setup
+def publication_args(tmp_path):
     body = tmp_path / "notes.md"
     body.write_text("Trusted policy review notes")
-    return ["--resume-report", report, "--path", target, "--config-dir", source / "templates",
-            "--branch", "rhoai-3.6", "--repository", "example/component", "--head", "automation/test",
+    return ["--repository", "example/component", "--head", "automation/test",
             "--marker", "policy-marker", "--title", "Reconcile pipelines", "--body-file", body,
             "--lifecycle", "create-or-report"]
 
 
-def test_actual_cli_plan_verify_repeat_without_target_writes(tooling, setup, tmp_path):
+def operation_args(setup, report):
+    source, target = setup
+    return ["--path", target, "--config-dir", source / "templates", "--branch", "rhoai-3.6", "--report-dir", report]
+
+
+def test_actual_cli_preview_repeat_without_target_writes_or_durable_plan(tooling, setup, tmp_path):
     target = setup[1]
     original = (target / ".tekton/example.yml").read_bytes()
     report, result = plan(tooling, setup, tmp_path)
@@ -92,10 +96,11 @@ def test_actual_cli_plan_verify_repeat_without_target_writes(tooling, setup, tmp
     data = json.loads(result.stdout)
     assert data["status"] == "ready"
     assert data["changes"][0]["path"] == ".tekton/example.yml"
-    for _ in range(2):
-        verified = run(tooling, *resume_args(setup, report, tmp_path))
-        assert verified.returncode == 0, verified.stderr
-        assert json.loads(verified.stdout)["ready_to_publish"] is True
+    repeated_report, repeated = plan(tooling, setup, tmp_path / "repeated")
+    assert repeated.returncode == 0, repeated.stderr
+    for directory in (report, repeated_report):
+        assert not (directory / "stage").exists()
+        assert not (directory / "bundle").exists()
     assert (target / ".tekton/example.yml").read_bytes() == original
     assert not git(target, "status", "--porcelain")
     assert {path.stem for path in (report / "phases").glob("*.json") if not path.name.endswith("command.json")} == {
@@ -103,26 +108,31 @@ def test_actual_cli_plan_verify_repeat_without_target_writes(tooling, setup, tmp
 
 
 @pytest.mark.parametrize("tamper", ["payload", "manifest", "base", "source", "dirty-target", "index", "untracked"])
-def test_resume_rejects_tampering(tooling, setup, tmp_path, tamper):
-    report, result = plan(tooling, setup, tmp_path)
-    assert result.returncode == 0, result.stderr
+def test_single_invocation_rechecks_candidate_before_publication(tooling, setup, tmp_path, tamper, monkeypatch):
     source, target = setup
-    if tamper == "payload":
-        (report / "bundle/files/.tekton/example.yml").write_text("evil")
-    elif tamper == "manifest":
-        manifest = json.loads((report / "bundle/manifest.json").read_text())
-        manifest["changes"] = []
-        (report / "bundle/manifest.json").write_text(json.dumps(manifest))
-    elif tamper == "base":
-        git(target, "commit", "--allow-empty", "-qm", "advance")
-    elif tamper == "source":
-        (source / "templates/all.yaml.j2").write_text("changed")
-    else:
-        (target / ("untracked" if tamper == "untracked" else ".tekton/example.yml")).write_text("unrelated")
-        if tamper == "index":
-            git(target, "add", ".")
-    checked = run(tooling, *resume_args(setup, report, tmp_path))
-    assert checked.returncode != 0
+    monkeypatch.setattr(operation, "ROOT", tooling)
+    original_plan = operation.plan
+    def tamper_plan(args, internal):
+        result = original_plan(args, internal)
+        if tamper == "payload":
+            (internal / "bundle/files/.tekton/example.yml").write_text("evil")
+        elif tamper == "manifest":
+            manifest = json.loads((internal / "bundle/manifest.json").read_text())
+            manifest["changes"] = []
+            (internal / "bundle/manifest.json").write_text(json.dumps(manifest))
+        elif tamper == "base":
+            git(target, "commit", "--allow-empty", "-qm", "advance")
+        elif tamper == "source":
+            (source / "templates/all.yaml.j2").write_text("changed")
+        else:
+            (target / ("untracked" if tamper == "untracked" else ".tekton/example.yml")).write_text("unrelated")
+            if tamper == "index":
+                git(target, "add", ".")
+        return result
+    monkeypatch.setattr(operation, "plan", tamper_plan)
+    monkeypatch.setattr(operation.publisher, "publish", lambda *args: pytest.fail("invalid candidate reached publisher"))
+    args = [*operation_args(setup, tmp_path / "report"), *publication_args(tmp_path), "--publish"]
+    assert operation.main(list(map(str, args))) == 1
 
 
 def test_explicit_template_deletion_requires_opt_in(tooling, setup, tmp_path):
@@ -132,7 +142,7 @@ def test_explicit_template_deletion_requires_opt_in(tooling, setup, tmp_path):
     report, denied = plan(tooling, setup, tmp_path)
     assert denied.returncode != 0
     report = tmp_path / "allowed"
-    result = run(tooling, "--reconcile", "--path", target, "--config-dir", source / "templates", "--branch", "rhoai-3.6",
+    result = run(tooling, "--path", target, "--config-dir", source / "templates", "--branch", "rhoai-3.6",
                  "--report-dir", report, "--allowed-operations", "M,D")
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["changes"][0]["status"] == "D"
@@ -166,9 +176,10 @@ def test_no_pipeline_resource_stream_noop(tooling, setup, tmp_path):
     report, result = plan(tooling, setup, tmp_path)
     assert result.returncode == 0, result.stderr
     assert json.loads(result.stdout)["status"] == "no-changes"
-    verified = run(tooling, *resume_args(setup, report, tmp_path))
-    assert verified.returncode == 0, verified.stderr
-    assert json.loads(verified.stdout)["ready_to_publish"] is False
+    empty_report, published = plan(tooling, setup, tmp_path / "empty-publish", "--publish")
+    assert published.returncode == 0, published.stderr
+    assert json.loads(published.stdout)["publication"] == {"status": "no-changes"}
+    assert not (empty_report / "bundle").exists()
 
 
 def test_inventory_membership_batch_and_booleans(tooling, tmp_path):
@@ -263,9 +274,13 @@ def test_missing_scope_noop(tooling, setup, tmp_path):
     assert json.loads(result.stdout)["status"] == "no-changes"
 
 
-def test_actual_publication_boundary_is_existing_publisher(tooling, setup, tmp_path, monkeypatch):
-    report, result = plan(tooling, setup, tmp_path)
-    assert result.returncode == 0, result.stderr
+@pytest.mark.parametrize("deletion", [False, True])
+def test_actual_publication_boundary_is_existing_publisher(tooling, setup, tmp_path, monkeypatch, deletion):
+    source, target = setup
+    if deletion:
+        (source / "templates/all.yaml.j2").write_text('kind: "{{ _ if (metadata.get(\'name\') | delete_if(\'example-on-push\')) else _ }}"\n')
+        commit(source)
+    report = tmp_path / "report"
     monkeypatch.setattr(operation, "ROOT", tooling)
     calls = []
     def publish(root, request):
@@ -273,10 +288,17 @@ def test_actual_publication_boundary_is_existing_publisher(tooling, setup, tmp_p
         calls.append(request)
         return {"status": "published", "url": "https://github.com/example/component/pull/1"}
     monkeypatch.setattr(operation.publisher, "publish", publish)
-    assert operation.main([*map(str, resume_args(setup, report, tmp_path)), "--publish"]) == 0
+    outputs = tmp_path / "outputs"
+    args = [*operation_args(setup, report), *publication_args(tmp_path), "--publish", "--github-output", outputs]
+    if deletion:
+        args += ["--allowed-operations", "M,D"]
+    assert operation.main(list(map(str, args))) == 0
     assert len(calls) == 1
-    assert calls[0]["changes"][0]["status"] == "M"
+    assert calls[0]["changes"][0]["status"] == ("D" if deletion else "M")
     assert (report / "publication.json").exists()
+    assert "publication_url=https://github.com/example/component/pull/1\n" in outputs.read_text()
+    assert not (report / "bundle").exists()
+    assert not (report / "stage").exists()
 
 
 @pytest.mark.parametrize("reject", [False, True])
@@ -303,27 +325,23 @@ def check(original, candidate, context):
     (target / "pipelines").mkdir()
     (target / "pipelines/allowed.yaml").write_text("kind: Pipeline\n")
     commit(target)
-    report, result = plan(tooling, setup, tmp_path, "--tekton-layout", "nested", "--policy-python", module)
+    config = source / "templates/config.yaml"
+    config.write_text("tekton_layout: nested\n" + config.read_text())
+    commit(source)
+    report, result = plan(tooling, setup, tmp_path, "--policy-python", module)
     if reject:
         assert result.returncode != 0
     else:
         assert result.returncode == 0, result.stderr
         data = json.loads(result.stdout)
         assert data["diagnostics"]["counts"] == {"planned": 1, "manual": 1}
-        args = resume_args(setup, report, tmp_path)
-        checked = run(tooling, *args, "--policy-python", module)
-        assert checked.returncode == 0, checked.stderr
     assert not git(target, "status", "--porcelain")
 
 
-@pytest.mark.parametrize("phase", ["plan", "resume"])
-def test_allowlist_applies_to_all_actions(tooling, setup, tmp_path, phase):
-    if phase == "plan":
-        _, result = plan(tooling, setup, tmp_path, "--allowed-branches", "other-release")
-    else:
-        report, planned = plan(tooling, setup, tmp_path)
-        assert planned.returncode == 0, planned.stderr
-        result = run(tooling, *resume_args(setup, report, tmp_path), "--allowed-branches", "other-release")
+@pytest.mark.parametrize("publish", [False, True])
+def test_allowlist_applies_to_preview_and_publication(tooling, setup, tmp_path, publish):
+    args = ["--allowed-branches", "other-release"] + (["--publish"] if publish else [])
+    _, result = plan(tooling, setup, tmp_path, *args)
     assert result.returncode != 0
     assert "release not allowed" in result.stderr
 
@@ -332,7 +350,7 @@ def test_ordinary_cli_discovers_both_yaml_extensions(tooling, setup, tmp_path):
     source, target = setup
     shutil.copy2(target / ".tekton/example.yml", target / ".tekton/second.yaml")
     commit(target)
-    checked = run(tooling, "--path", target, "--config-dir", source / "templates", "--branch", "rhoai-3.6", "--no-checkout", "--json")
+    checked = run(tooling, "--path", target, "--config-dir", source / "templates", "--branch", "rhoai-3.6", "--no-checkout", "--json", command="validate-tekton")
     assert checked.returncode == 1  # both are intentionally nonconformant
     assert set(json.loads(checked.stdout)["files"]) == {"example.yml", "second.yaml"}
 
@@ -373,16 +391,57 @@ def check(*args):
     assert result.returncode == 0, result.stderr
     (source / "unsafe.py").symlink_to(module)
     commit(source)
-    denied = run(tooling, "--reconcile", "--path", target, "--branch", "rhoai-3.6", "--config-dir", source / "templates",
+    denied = run(tooling, "--path", target, "--branch", "rhoai-3.6", "--config-dir", source / "templates",
                  "--policy-python", source / "unsafe.py", "--report-dir", tmp_path / "denied")
     assert denied.returncode != 0
     assert "symlink" in denied.stderr
     (source / "inner").symlink_to(source, target_is_directory=True)
     commit(source)
-    denied = run(tooling, "--reconcile", "--path", target, "--branch", "rhoai-3.6", "--config-dir", source / "templates",
+    denied = run(tooling, "--path", target, "--branch", "rhoai-3.6", "--config-dir", source / "templates",
                  "--policy-python", source / "inner/policy.py", "--report-dir", tmp_path / "inner-denied")
     assert denied.returncode != 0
     assert "symlink" in denied.stderr
+
+
+@pytest.mark.parametrize("invalid", [False, True])
+def test_head_prefix_preserves_digest_identity_and_validates_resolved_head(tooling, setup, tmp_path, monkeypatch, invalid):
+    monkeypatch.setattr(operation, "ROOT", tooling)
+    requests = []
+    def publish(root, request):
+        operation.publisher.verify(root, request)
+        requests.append(request)
+        return {"status": "published"}
+    monkeypatch.setattr(operation.publisher, "publish", publish)
+    metadata = publication_args(tmp_path)
+    position = metadata.index("--head")
+    metadata[position:position + 2] = ["--head-prefix", "automation/invalid..-" if invalid else "automation/enforce-pipelineruns-rhoai-3.6-templates-"]
+    args = [*operation_args(setup, tmp_path / "report"), *metadata, "--publish"]
+    assert operation.main(list(map(str, args))) == (1 if invalid else 0)
+    if invalid:
+        assert not requests
+        assert not git(setup[1], "status", "--porcelain")
+    else:
+        assert requests[0]["head"] == "automation/enforce-pipelineruns-rhoai-3.6-templates-" + operation.policy_digest(setup[0] / "templates")[:12]
+
+
+def test_head_and_prefix_are_mutually_exclusive(tooling):
+    result = run(tooling, "--head", "automation/test", "--head-prefix", "automation/prefix-")
+    assert result.returncode == 2
+    assert "not allowed with argument" in result.stderr
+
+
+@pytest.mark.parametrize("flag", ["--resume-report", "--reconcile", "--tekton-layout"])
+def test_new_command_has_no_resume_or_redundant_mode_or_layout_flags(tooling, flag):
+    result = run(tooling, flag)
+    assert result.returncode == 2
+    assert "unrecognized arguments" in result.stderr
+
+
+@pytest.mark.parametrize("flag", ["--reconcile", "--resume-report", "--inventory-root"])
+def test_validator_rejects_operational_routing(tooling, setup, flag):
+    result = run(tooling, "--config-dir", setup[0] / "templates", flag, command="validate-tekton")
+    assert result.returncode == 2
+    assert "unrecognized arguments" in result.stderr
 
 
 def test_graph_detachment():

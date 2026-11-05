@@ -1,7 +1,7 @@
-"""Concrete existing-file Tekton plan/verify/publish operation.
+"""Preview Tekton reconciliation or plan, validate and publish in one operation.
 
-Trusted workflows choose this source, policy templates and optional narrow Python
-policy. Receipts are same-job trusted planner output, never executable selectors.
+Trusted workflows choose the source, templates and optional narrow Python policy.
+Exact-change plans exist only inside this invocation; saved reports are diagnostic.
 """
 from collections import Counter
 from io import StringIO
@@ -168,8 +168,8 @@ def scan_phase(stage, phase, config, policy, branch, scope, layout):
     return {"files": rows, "counts": dict(Counter(row["status"] for row in rows))}
 
 
-def plan(args):
-    root, report, config_dir = args.path.resolve(), args.report_dir.resolve(), args.config_dir.resolve()
+def plan(args, report):
+    root, config_dir = args.path.resolve(), args.config_dir.resolve()
     _, revision = source_identity(ROOT)
     source, policy_revision = source_identity(config_dir)
     if args.source_sha and args.source_sha != policy_revision:
@@ -178,7 +178,7 @@ def plan(args):
     raw = YAML(typ="safe", pure=True).load((config_dir / "config.yaml").read_text())
     if config.parent_ref or any("generate" in row for row in raw.get("templates", [])):
         raise ValueError("existing-file reconciliation does not support generation/external parents")
-    layout = args.tekton_layout or config.tekton_layout
+    layout = config.tekton_layout
     scope = ".tekton" if layout == "flat" else "pipelineruns"
     policy = load_policy(args.policy_python, source)
     if policy is None and layout != "flat":
@@ -263,9 +263,9 @@ def summary(result):
     return "\n".join(lines)
 
 
-def resume(args):
-    root, report, config_dir = args.path.resolve(), args.resume_report.resolve(), args.config_dir.resolve()
-    result = json.loads(worker.read_file(report, "result.json"), object_pairs_hook=worker.unique_object)
+def publish_candidate(args, result, report):
+    """Publish only this invocation's fully checked candidate, never a saved report."""
+    root, config_dir = args.path.resolve(), args.config_dir.resolve()
     _, revision = source_identity(ROOT)
     source, policy_revision = source_identity(config_dir)
     if args.inventory_revision is not None and args.inventory_revision != result["provenance"].get("inventory_revision"):
@@ -281,41 +281,33 @@ def resume(args):
         raise ValueError("stale policy/source receipt")
     if args.branch in ("main", "master"):
         raise ValueError("release publication cannot target main/master")
-    for key in ("repository", "head", "marker", "title", "body_file", "lifecycle"):
+    head = args.head_prefix + result["policy_digest_short"] if args.head_prefix else args.head
+    if not head:
+        raise ValueError("publication requires --head or --head-prefix")
+    for key in ("repository", "marker", "title", "body_file", "lifecycle"):
         if not getattr(args, key):
-            raise ValueError(f"resume requires --{key.replace('_', '-')}")
+            raise ValueError(f"publication requires --{key.replace('_', '-')}")
     body = args.body_file.read_text() + summary(result)
     if args.tracking_url:
         if not re.fullmatch(r"https://[^\s<>]+", args.tracking_url):
             raise ValueError("invalid tracking URL")
         body += f"\n\nTracking: [issue]({args.tracking_url})\n"
     request = {"version": 1, "repository": args.repository, "base": args.branch,
-               "base_oid": result["base"], "head": args.head, "marker": args.marker,
+               "base_oid": result["base"], "head": head, "marker": args.marker,
                "title": args.title, "body": body, "lifecycle": args.lifecycle,
                "changes": result["changes"], "provenance": expected}
     publisher.validate_request(request)
-    # Verification prepares a disposable clean clone. Planning never needs a token
-    # and verification never applies a bundle to the caller's target checkout.
     worker.clean_base(root, result["base"])
-    with tempfile.TemporaryDirectory(prefix="tekton-verify-") as temp:
-        destination = root
-        if not args.publish:
-            destination = Path(temp) / "target"
-            subprocess.run(["git", "clone", "--quiet", "--no-hardlinks", str(root), str(destination)], check=True, capture_output=True)
-            worker.git(destination, "remote", "set-url", "origin", git(root, "remote", "get-url", "origin"))
-        rows = result["changes"]
-        bundle = json.loads(worker.read_file(report, "bundle/manifest.json"), object_pairs_hook=worker.unique_object)
-        if bundle.get("changes") != rows:
-            raise ValueError("bundle differs from trusted receipt")
-        worker.prepare_bundle(destination, report / "bundle", scope=result["scope"], base_oid=result["base"],
-                              expected_provenance=expected, allowed_statuses=tuple(result["allowed_operations"]),
-                              authorize=lambda row, original, candidate: row in rows)
-        output = publisher.publish(destination, request) if args.publish else (
-            publisher.verify(destination, request) and {"status": "verified" if rows else "no-changes"})
-    output.update(base=result["base"], ready_to_publish=bool(result["changes"]))
-    if args.publish:
-        (report / "publication.json").write_text(json.dumps(output, indent=2) + "\n")
-    return output
+    for ref in (args.branch, head):
+        worker.git(root, "check-ref-format", f"refs/heads/{ref}")
+    rows = result["changes"]
+    bundle = json.loads(worker.read_file(report, "bundle/manifest.json"), object_pairs_hook=worker.unique_object)
+    if bundle.get("changes") != rows:
+        raise ValueError("candidate differs from this invocation's checked plan")
+    worker.prepare_bundle(root, report / "bundle", scope=result["scope"], base_oid=result["base"],
+                          expected_provenance=expected, allowed_statuses=tuple(result["allowed_operations"]),
+                          authorize=lambda row, original, candidate: row in rows)
+    return publisher.publish(root, request)
 
 
 def boolean(value):
@@ -353,24 +345,32 @@ def inventory(args):
     return {"include": [{"repository": name, "inventory_revision": revision} for name in names]}
 
 
+def save_diagnostics(internal, report):
+    """Persist useful reports, never the internal candidate checkout or bundle."""
+    for name in ("result.json", "enforcement.patch", "publication.json"):
+        path = internal / name
+        if path.is_file():
+            shutil.copyfile(path, report / name)
+    if (internal / "phases").is_dir():
+        shutil.copytree(internal / "phases", report / "phases")
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    action = parser.add_mutually_exclusive_group(required=True)
-    action.add_argument("--reconcile", action="store_true")
-    action.add_argument("--resume-report", type=Path)
-    action.add_argument("--inventory-root", type=Path)
+    parser.add_argument("--inventory-root", type=Path)
     for name in ("path", "config-dir", "policy-python", "report-dir", "body-file", "github-output"):
         parser.add_argument("--" + name, type=Path)
-    for name in ("branch", "source-sha", "inventory-revision", "repository", "head", "marker", "title", "tracking-url", "allowed-branches"):
+    for name in ("branch", "source-sha", "inventory-revision", "repository", "marker", "title", "tracking-url", "allowed-branches"):
         parser.add_argument("--" + name)
-    parser.add_argument("--tekton-layout", choices=("flat", "nested"))
+    head = parser.add_mutually_exclusive_group()
+    head.add_argument("--head")
+    head.add_argument("--head-prefix", help="Append this plan's policy digest (first 12 characters), without an extra separator")
     parser.add_argument("--allowed-operations", default="M")
     parser.add_argument("--select-repository", default="all")
     parser.add_argument("--publication-intent", type=boolean, default=False)
     parser.add_argument("--allow-batch-publication", type=boolean, default=False)
     parser.add_argument("--lifecycle", choices=("create-or-report", "create-or-update"))
-    parser.add_argument("--publish", action="store_true")
-    parser.add_argument("--no-checkout", action="store_true")
+    parser.add_argument("--publish", action="store_true", help="Plan, validate and publish in this invocation using caller-supplied authentication")
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     try:
@@ -381,22 +381,29 @@ def main(argv=None):
                 raise ValueError("inventory never publishes")
             result = inventory(args)
         else:
-            if not args.path or not args.config_dir or not args.branch:
-                raise ValueError("path, config-dir and branch are required")
-            if args.reconcile:
-                if not args.report_dir:
-                    raise ValueError("reconcile requires report-dir")
-                result = plan(args)
-                if args.publish:
-                    args.resume_report = args.report_dir
-                    result = resume(args)
-            else:
-                result = resume(args)
+            if not args.path or not args.config_dir or not args.branch or not args.report_dir:
+                raise ValueError("path, config-dir, branch and report-dir are required")
+            root, report = args.path.resolve(), args.report_dir.resolve()
+            if report.is_relative_to(root) or root.is_relative_to(report):
+                raise ValueError("report and target must be disjoint")
+            report.mkdir(parents=True, exist_ok=False)
+            with tempfile.TemporaryDirectory(prefix="tekton-reconcile-") as temp:
+                internal = Path(temp) / "plan"
+                try:
+                    result = plan(args, internal)
+                    if args.publish:
+                        publication = publish_candidate(args, result, internal) if result["changes"] else {"status": "no-changes"}
+                        (internal / "publication.json").write_text(json.dumps(publication, indent=2) + "\n")
+                        result["publication"] = publication
+                        if publication.get("url"):
+                            result["publication_url"] = publication["url"]
+                finally:
+                    save_diagnostics(internal, report)
         if args.github_output:
             with args.github_output.open("a") as stream:
-                for key in ("status", "base", "policy_digest_short", "ready_to_publish"):
+                for key in ("status", "base", "policy_digest_short", "publication_url"):
                     if key in result:
-                        value = str(result[key]).lower() if isinstance(result[key], bool) else str(result[key])
+                        value = str(result[key])
                         if "\n" in value or "\r" in value:
                             raise ValueError("unsafe workflow output")
                         stream.write(f"{key}={value}\n")

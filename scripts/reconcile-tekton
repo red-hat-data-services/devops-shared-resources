@@ -1,0 +1,55 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["ruamel.yaml", "jinja2", "cel-python", "requests"]
+# ///
+"""Preview existing-file Tekton reconciliation, or plan and publish with --publish."""
+import importlib.abc
+import importlib.util
+from pathlib import Path
+import subprocess
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+
+class _SourceOnlyLoader(importlib.abc.Loader):
+    def __init__(self, path):
+        self.path = path
+
+    def create_module(self, spec):
+        return None
+
+    def exec_module(self, module):
+        exec(compile(self.path.read_bytes(), str(self.path), "exec"), module.__dict__)
+
+
+class _TrustedLibFinder(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path=None, target=None):
+        if fullname == "lib" or fullname.startswith("lib."):
+            source = ROOT.joinpath(*fullname.split("."))
+            package = source.is_dir()
+            source = source / "__init__.py" if package else source.with_suffix(".py")
+            if not source.is_file():
+                raise ModuleNotFoundError(f"No trusted source for {fullname!r}", name=fullname)
+            return importlib.util.spec_from_file_location(
+                fullname, source, loader=_SourceOnlyLoader(source),
+                submodule_search_locations=[str(source.parent)] if package else None)
+        return None
+
+
+def main():
+    # Trusted workflow-selected code only: reject dirty source before importing
+    # lib, and never fall through to ignored bytecode/native modules for lib.*.
+    check = subprocess.run(["git", "status", "--porcelain", "--untracked-files=all"],
+                           cwd=ROOT, capture_output=True, text=True, check=True)
+    if check.stdout:
+        sys.exit("error: trusted shared source checkout must be clean")
+    sys.meta_path.insert(0, _TrustedLibFinder())
+    from lib.tekton_reconciliation import main as reconciliation_main
+    return reconciliation_main()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
