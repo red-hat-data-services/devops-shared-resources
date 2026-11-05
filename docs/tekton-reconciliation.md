@@ -101,6 +101,28 @@ For scan PRs, use literal `--head "automation/pipelinerun-conformance/$RELEASE"`
 marker `Conformance-Generated: true`, the existing scan-review body file, and
 `--lifecycle create-or-update`.
 
+## Existing-file comments and formatting
+
+The ordinary template merge retains existing round-trip container comments and
+styles. The reconciliation policy path additionally emits localized source edits
+instead of dumping the entire document. Unchanged source spans are retained,
+including unrelated multiline flow values, null spelling and line endings.
+Changed fields and list items may be inserted, removed or updated.
+
+This is not a general lossless YAML editor. A changed flow collection or a
+structurally changed collection may be emitted as one bounded subtree; formatting
+inside that subtree can change. There is no whole-document formatting fallback.
+Edits are checked for valid, nonoverlapping source spans, and the complete emitted
+document must parse to the candidate before any file is written.
+
+Changed applicable files containing anchors or aliases currently fail closed,
+even when the anchor is outside the selected field: aliases do not have distinct
+source locations. Collection type changes and flow replacements without retained
+round-trip style also fail closed. Existing duplicate-key and policy checks still
+apply. Appending after an end-of-file comment retains its text but can change its
+association with list items. Inspect the preview diff; byte-identical formatting
+or comment associations inside edited collections are not guaranteed.
+
 ## Safe inventory before fleet fanout
 
 ```sh

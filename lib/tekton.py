@@ -441,11 +441,12 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
     import copy
 
     if isinstance(template, dict) and isinstance(existing, dict):
-        result = type(existing)() if hasattr(existing, 'ca') else {}
+        result = copy.deepcopy(existing)
         for key in existing:
             if key in template:
                 child_path = f"{path}.{key}" if path else key
                 if template[key] == ABSENT:
+                    del result[key]
                     if errors is not None:
                         errors.append(f"{child_path}: should not exist")
                 else:
@@ -463,8 +464,6 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
         return result
 
     if isinstance(template, list) and isinstance(existing, list):
-        _new_list = type(existing) if hasattr(existing, 'ca') else list
-
         present_items = [item for item in template if item != ABSENT]
         identity_key = None
         if present_items and isinstance(present_items[0], dict):
@@ -474,19 +473,20 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
                 identity_key = "name"
         if identity_key:
             template_by_name = {str(p[identity_key]): p for p in present_items}
-            result = _new_list()
-            for ei in existing:
+            result = copy.deepcopy(existing)
+            removed = 0
+            for index, ei in enumerate(existing):
                 name = str(ei.get(identity_key, ""))
                 if name in template_by_name:
                     tp = template_by_name.pop(name)
                     if tp.get("value") == ABSENT:
+                        del result[index - removed]
+                        removed += 1
                         if errors is not None:
                             errors.append(f"{path}[{name}]: should not exist")
                     else:
                         child_path = f"{path}[{name}]"
-                        result.append(_deep_merge(tp, ei, errors, child_path, skipped_paths))
-                else:
-                    result.append(copy.deepcopy(ei))
+                        result[index - removed] = _deep_merge(tp, ei, errors, child_path, skipped_paths)
             for name, p in template_by_name.items():
                 if p.get("value") != ABSENT:
                     if errors is not None:
@@ -494,10 +494,11 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
                     result.append(_deep_merge(p, {}))
             return result
 
-        result = _new_list()
+        result = copy.deepcopy(existing)
+        del result[len(present_items):]
         for i, tv in enumerate(present_items):
             if i < len(existing):
-                result.append(_deep_merge(tv, existing[i], errors, f"{path}[{i}]", skipped_paths))
+                result[i] = _deep_merge(tv, existing[i], errors, f"{path}[{i}]", skipped_paths)
             else:
                 empty = {} if isinstance(tv, dict) else [] if isinstance(tv, list) else None
                 result.append(_deep_merge(tv, empty) if empty is not None else copy.deepcopy(tv))

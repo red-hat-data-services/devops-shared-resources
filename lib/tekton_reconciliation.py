@@ -4,7 +4,6 @@ Trusted workflows choose the source, templates and optional narrow Python policy
 Exact-change plans exist only inside this invocation; saved reports are diagnostic.
 """
 from collections import Counter
-from io import StringIO
 import argparse
 import html
 import json
@@ -125,6 +124,7 @@ def context_for(root, policy, branch):
 
 def scan_phase(stage, phase, config, policy, branch, scope, layout):
     from lib import tekton_filters
+    from lib.tekton_yaml import localized_yaml
     for name, function in getattr(policy, "filters", {}).items():
         if not isinstance(name, str) or not callable(function):
             raise ValueError("invalid policy filter")
@@ -134,7 +134,8 @@ def scan_phase(stage, phase, config, policy, branch, scope, layout):
     yaml.preserve_quotes, yaml.width = True, 4096
     rows, copies = [], []
     for name, original in documents(stage, scope, layout).items():
-        data = yaml.load(worker.read_file(stage, name))
+        source = worker.read_file(stage, name)
+        data = yaml.load(source)
         decision = policy.decision(detached_data(original), detached_data(context))
         status = decision["status"]
         if status not in ("applicable", "skipped", "manual", "unresolved"):
@@ -156,9 +157,7 @@ def scan_phase(stage, phase, config, policy, branch, scope, layout):
                 raise ValueError(f"policy rejected candidate {name}: {errors}")
             row["status"] = "conformant" if candidate == data else "planned"
             if candidate != data:
-                buffer = StringIO()
-                yaml.dump(candidate, buffer)
-                serialized = buffer.getvalue()
+                serialized = localized_yaml(source, candidate)
                 if detached_data(YAML(typ="safe", pure=True).load(serialized)) != detached_data(candidate):
                     raise ValueError("serialized candidate differs")
                 copies.append((stage / name, serialized))
@@ -167,7 +166,7 @@ def scan_phase(stage, phase, config, policy, branch, scope, layout):
         raise ValueError("validation/idempotence still plans changes")
     if phase == "fix":
         for path, text in copies:
-            path.write_text(text)
+            path.write_bytes(text.encode("utf-8"))
     return {"files": rows, "counts": dict(Counter(row["status"] for row in rows))}
 
 
