@@ -206,7 +206,7 @@ def publish(root, request, run=command):
             raise ValueError("branch lacks generated commit marker")
     # Recheck after remote reads and immediately before staging the exact paths.
     verify(root, request, run)
-    git("add", "--", *(c["path"] for c in request["changes"]))
+    git("add", "-f", "--", *(c["path"] for c in request["changes"]))
     raw = git("diff", "--cached", "--no-renames", "--name-status", "-z")
     fields = raw.rstrip("\0").split("\0")
     if sorted(zip(fields[::2], fields[1::2])) != sorted((c["status"], c["path"]) for c in request["changes"]):
