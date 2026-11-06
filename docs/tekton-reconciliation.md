@@ -114,6 +114,22 @@ A PR base is not a push destination: publication still requires a distinct, vali
 or the target base. Partial/error results, stale provenance, dirty sources and
 unsafe heads remain unpublishable.
 
+## Complete PR lifecycle inventory
+
+Before any staging/push/PR write, both lifecycles cursor-paginate all open PRs
+for the exact target base using the repository GraphQL connection (not search).
+There is no fixed 1,000-PR cap. Matching still considers the generated marker
+**or** the head branch name across that whole base inventory, including forks;
+multiple matches remain a review-required error.
+
+`create-or-update` never queries historical PRs. `create-or-report` first returns
+an existing open match; otherwise it queries history narrowly by exact base and
+head name, retaining closed/merged same-head disposition safeguards. Historical
+absence requires completed pagination. API errors, malformed nodes/page metadata,
+repeated/nonadvancing cursors and incomplete pagination fail closed before writes.
+This does not change automation-head safety, marker ownership, append-only update
+history, remote-base freshness or non-force push requirements.
+
 ## Partial previews for malformed files
 
 Strict reconciliation profiles (template selection or legacy document policy)

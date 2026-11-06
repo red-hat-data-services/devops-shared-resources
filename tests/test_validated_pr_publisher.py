@@ -61,8 +61,22 @@ class Remote:
             if self.fail_push:
                 raise RuntimeError('concurrent update rejected')
             return ''
-        if args[:3] == ['gh', 'pr', 'list']:
-            return json.dumps(self.prs)
+        if args[:3] == ['gh', 'api', 'graphql']:
+            fields = dict(value.split('=', 1) for value in args[4::2])
+            assert fields['owner'] + '/' + fields['name'] == self.request['repository']
+            assert fields['base'] == self.request['base']
+            history = 'head' in fields
+            assert ('states: [OPEN]' in fields['query']) != history
+            rows = [{**pr, 'baseRefName': pr.get('baseRefName', self.request['base']),
+                     'url': pr.get('url', 'https://example.com/pr/' + str(pr['number']))}
+                    for pr in self.prs
+                    if pr.get('baseRefName', self.request['base']) == fields['base']
+                    and (pr['headRefName'] == fields['head'] if history else pr['state'] == 'OPEN')]
+            start = int(fields.get('after', 'cursor:0').split(':')[1])
+            page = rows[start:start + 100]
+            return json.dumps({'data': {'repository': {'pullRequests': {
+                'nodes': page, 'pageInfo': {'hasNextPage': start + 100 < len(rows),
+                                           'endCursor': 'cursor:' + str(start + len(page)) if page else None}}}}})
         if args[:2] == ['gh', 'pr']:
             assert args[2] in ('create', 'edit')
             return 'https://example.com/pr/1'
@@ -232,8 +246,8 @@ def test_index_transformation_cannot_change_published_bytes(case):
 
 
 @pytest.mark.parametrize('count', [2, 1000])
-def test_ambiguous_or_truncated_pr_inventory_blocks_publication(case, count):
-    """Do not choose a PR arbitrarily or silently accept incomplete pagination."""
+def test_ambiguous_or_malformed_pr_inventory_blocks_publication(case, count):
+    """Do not choose a PR arbitrarily or accept duplicate inventory identities."""
     root, request = case
     pr = {'state': 'OPEN', 'headRefName': request['head'], 'body': request['marker'], 'number': 1, 'url': 'https://example.com/pr'}
     with pytest.raises(ValueError):
