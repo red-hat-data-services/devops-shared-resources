@@ -310,10 +310,13 @@ filters = {}
 def decision(data, context):
     assert context["branch"] == "rhoai-3.6"
     assert context["documents"]["pipelines/allowed.yaml"]["kind"] == "Pipeline"
+    context["documents"]["pipelines/allowed.yaml"]["kind"] = "mutated callback copy"
     if data["metadata"]["name"] == "manual-on-push":
         return {"status": "manual", "reason": "task budget", "variables": {}}
     return {"status": "applicable", "reason": "", "variables": {}}
 def check(original, candidate, context):
+    assert context["documents"]["pipelines/allowed.yaml"]["kind"] == "Pipeline"
+    context["documents"].clear()
     assert "reconciled" not in original["metadata"].get("labels", {}) or original == candidate
     return REJECT is False
 '''.replace("REJECT", repr(reject)))
@@ -335,6 +338,9 @@ def check(original, candidate, context):
         assert result.returncode == 0, result.stderr
         data = json.loads(result.stdout)
         assert data["diagnostics"]["counts"] == {"planned": 1, "manual": 1}
+        context_record = data["provenance"]["context"]["pipelines/allowed.yaml"]
+        assert context_record["mode"] == "100644"
+        assert context_record["sha256"] == __import__("hashlib").sha256(b"kind: Pipeline\n").hexdigest()
     assert not git(target, "status", "--porcelain")
 
 

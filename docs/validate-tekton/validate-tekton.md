@@ -132,6 +132,24 @@ For params and steps (lists keyed by `name`), merge is by name. For `taskRunSpec
 
 When `inherit_params: true` is set in the config, all parent params not explicitly declared in the template are automatically inherited. Semantically identical values with different formatting are preserved as-is (no cosmetic normalization).
 
+## Optional per-file selection
+
+Configs may declare `selection_template: selection.json.j2` and a list of fixed
+repository-relative `context_paths`. The ordinary validator/fixer uses this
+Jinja sidecar before rendering a file. It must emit exactly
+`{"status":"applicable|skipped|manual|unresolved","reason":"..."}`; only
+`applicable` files are rendered/fixed. Other statuses are reported with their
+reason. Existing configs without selection retain their current behavior.
+
+The sidecar receives ordinary template variables and detached
+`context = {branch, documents}`. Each declared context path maps to parsed YAML
+or `None`. It can use the generic `unique_item` filter for duplicate-safe keyed
+lookup and `fail(message)` for explicit errors. Context cannot be overwritten
+by `--var`. See [strict reconciliation](../tekton-reconciliation.md) for JSON
+limits, read-only context/provenance, optional post-merge guards and strict
+localized output. The standalone CLI keeps its existing whole-document writer;
+strict reconciliation invokes the same fix engine with a different writer profile.
+
 ## Config File
 
 The config file (`config.yaml`) declares templates, pipeline matchers, parent-child relationships, and optional settings for cross-branch parenting and directory layout.
