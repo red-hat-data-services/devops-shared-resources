@@ -193,6 +193,25 @@ def test_format_build_failure_reason_matches_links() -> None:
     assert fr.format_build_failure_reason("acme/r", 9, ()) == "acme/r#9 build-failure"
 
 
+def test_humanize_merge_failure_reason_rewrites_unexpanded_feasibility_skip() -> None:
+    raw = (
+        "merge-failure: main-release-feasibility "
+        "(${{ matrix.downstream_branch }}) concluded skipped"
+    )
+    out = fr.humanize_merge_failure_reason(raw)
+    assert out.startswith("merge-failure:")
+    assert "main-to-release feasibility failed" in out
+    assert "automerge disabled" in out
+    assert "${{" not in out
+    # Non-feasibility / already-clear reasons stay untouched.
+    assert fr.humanize_merge_failure_reason("merge-failure: conflict") == (
+        "merge-failure: conflict"
+    )
+    assert fr.humanize_merge_failure_reason(
+        "merge-failure: main-release-feasibility (rhoai-2.25) concluded failure"
+    ).endswith("concluded failure")
+
+
 def test_check_run_link_falls_back_to_github_html_url() -> None:
     url = fr._check_run_link(
         {

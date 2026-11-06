@@ -335,6 +335,41 @@ def format_build_failure_reason(
     return text
 
 
+# Unexpanded Actions matrix placeholder — appears when main-release-feasibility
+# skips the job (if: false), typically because main-to-release automerge is off.
+_UNEXPANDED_MATRIX_PLACEHOLDER = re.compile(r"\$\{\{\s*matrix\.")
+
+# Comment-only rewrite: keep merge-failure, make the reason human-readable.
+_FEASIBILITY_AUTOMERGE_DISABLED_REASON = (
+    "main-to-release feasibility failed — automerge disabled for this component "
+    "(enable main-to-release automerge; feasibility job was skipped)"
+)
+
+
+def humanize_merge_failure_reason(reason: str) -> str:
+    """Rewrite unexpanded feasibility skip noise for the Leader failure comment.
+
+    When automerge is disabled, GitHub reports the skipped job name as
+    ``main-release-feasibility (${{ matrix.downstream_branch }}) concluded skipped``.
+    Keep ``merge-failure`` and state clearly that main-to-release feasibility
+    failed because automerge is disabled (Chris / Deepak policy: mandatory).
+    """
+    text = (reason or "").strip()
+    if not text:
+        return text
+    lower = text.lower()
+    if "feasibility" not in lower:
+        return text
+    if not (
+        _UNEXPANDED_MATRIX_PLACEHOLDER.search(text)
+        or "matrix.downstream_branch" in lower
+    ):
+        return text
+    if lower.startswith("merge-failure"):
+        return f"merge-failure: {_FEASIBILITY_AUTOMERGE_DISABLED_REASON}"
+    return _FEASIBILITY_AUTOMERGE_DISABLED_REASON
+
+
 def fetch_failed_build_check_links(
     owner: str,
     repo: str,
@@ -506,7 +541,9 @@ def build_child_row(
     if status_key in {"build-pending", "new"}:
         reason_parts.append(evidence_reason or "builds pending")
     elif status_key == "merge-failure":
-        reason_parts.append(gap_desc or f"{repo}#{number} merge-failure")
+        reason_parts.append(
+            humanize_merge_failure_reason(gap_desc or f"{repo}#{number} merge-failure")
+        )
     elif status_key == "build-failure" or (
         pr_state == "closed"
         and status_key not in {"merge-failure", "build-pending", "new"}
