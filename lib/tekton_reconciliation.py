@@ -417,6 +417,23 @@ def summary(result, *, policy_source, config_dir, environ=None):
     return "\n".join(lines)
 
 
+def validate_publication_scope(config, branch, allowed_branches):
+    """Trusted config scope and caller's exact run scope are independent gates."""
+    patterns = config.publication_branches
+    if allowed_branches and branch not in allowed_branches.split(","):
+        raise ValueError("release not allowed")
+    if patterns is None:
+        if branch in ("main", "master"):
+            raise ValueError("release publication cannot target main/master without configured policy")
+        return
+    if not allowed_branches or branch not in allowed_branches.split(","):
+        raise ValueError("configured publication requires exact target in --allowed-branches")
+    if not any((branch.startswith(p[:-1]) and len(branch) > len(p) - 1)
+               if p.endswith("*") else branch == p for p in patterns):
+        raise ValueError("publication base denied by trusted publication_branches policy")
+    subprocess.run(["git", "check-ref-format", f"refs/heads/{branch}"], check=True, capture_output=True)
+
+
 def publish_candidate(args, result, report):
     """Publish only this invocation's fully checked candidate, never a saved report."""
     if result.get("status") == "partial" or result.get("diagnostics", {}).get("errors"):
@@ -435,8 +452,7 @@ def publish_candidate(args, result, report):
                     policy_python=str(Path(args.policy_python).resolve().relative_to(source)) if args.policy_python else None)
     if expected != result["provenance"] or (args.source_sha and args.source_sha != policy_revision):
         raise ValueError("stale policy/source receipt")
-    if args.branch in ("main", "master"):
-        raise ValueError("release publication cannot target main/master")
+    validate_publication_scope(load_config(str(config_dir)), args.branch, args.allowed_branches)
     head = args.head_prefix + result["policy_digest_short"] if args.head_prefix else args.head
     if not head:
         raise ValueError("publication requires --head or --head-prefix")
@@ -542,6 +558,12 @@ def main(argv=None):
             root, report = args.path.resolve(), args.report_dir.resolve()
             if report.is_relative_to(root) or root.is_relative_to(report):
                 raise ValueError("report and target must be disjoint")
+            if args.publish:
+                source_identity(ROOT)
+                _, policy_revision = source_identity(args.config_dir.resolve())
+                if args.source_sha and args.source_sha != policy_revision:
+                    raise ValueError("policy source differs from expected source SHA")
+                validate_publication_scope(load_config(str(args.config_dir.resolve())), args.branch, args.allowed_branches)
             report.mkdir(parents=True, exist_ok=False)
             with tempfile.TemporaryDirectory(prefix="tekton-reconcile-") as temp:
                 internal = Path(temp) / "plan"
