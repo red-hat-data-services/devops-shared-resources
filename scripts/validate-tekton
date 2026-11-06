@@ -22,6 +22,7 @@ sys.path.insert(0, str(_repo_root))
 from ruamel.yaml import YAML
 from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
 from lib.tekton_config import load_config
+from lib.tekton_children import plan_children
 from lib.tekton_filters import DELETE_FILE_PREFIX
 from lib.tekton_matchers import make_parent_matchers
 from lib.tekton_validation import write_candidate, selection
@@ -104,6 +105,10 @@ def _load_pipelines(
     yaml_errors = {}
     skipped_ns = 0
     for filepath in _glob_tekton_files(tekton_dir, layout, pipeline_dir):
+        if config and any(t.generate for t in config.templates):
+            if filepath.is_symlink() or not filepath.resolve().is_relative_to(tekton_dir.resolve()):
+                yaml_errors[filepath] = "symlink or escaped PipelineRun path"
+                continue
         try:
             with open(filepath) as f:
                 data = ruamel.load(f)
@@ -260,6 +265,12 @@ def validate_tekton_dir(
     layout: str = "flat",
     pipeline_dir: Path | None = None,
 ) -> dict:
+    """Validate files against templates, including missing/drifted generated children.
+
+    Generated-child configurations plan expected files without writes and report
+    orphan children as warnings. Ordinary templates are validated too, even when
+    generation mode keeps their files read-only.
+    """
     if config is None:
         config = load_config(DEFAULT_CONFIG_DIR)
 
@@ -282,25 +293,52 @@ def validate_tekton_dir(
     context = _selection_context(tekton_dir, layout, config, branch)
     render_and_merge = _configured_renderer(globals()["render_and_merge"], context)
 
+    generation_mode = any(t.generate for t in config.templates)
+    results = {}
+
+    def result_key(path):
+        """Keep full paths in mixed generation runs to avoid basename collisions."""
+        return str(path) if generation_mode else path.name
+
+    if generation_mode:
+        if external_parent_indexes is not None:
+            raise ValueError("generated children require working-tree parents, not parent_ref")
+        if not yaml_errors:
+            try:
+                expected, orphans = plan_children(pipelines, config, branch, cli_vars)
+            except ValueError as exc:
+                results["generation"] = {"errors": [str(exc)], "warnings": []}
+            else:
+                for path, data in expected.items():
+                    results[str(path)] = {
+                        "errors": [] if pipelines.get(path) == data else ["generated child missing or differs from parent/template"],
+                        "warnings": [],
+                    }
+                for path in orphans:
+                    results[str(path)] = {"errors": [], "warnings": ["orphan child: no matching parent; left unchanged"]}
+        # Continue with ordinary template validation; generation only controls writes.
+
     # Use external parent indexes if provided (cross-branch parenting)
     if external_parent_indexes is not None:
         parent_indexes = external_parent_indexes
 
-    results = {}
     for filepath, msg in sorted(yaml_errors.items()):
-        results[filepath.name] = {"errors": [msg], "warnings": []}
+        results[result_key(filepath)] = {"errors": [msg], "warnings": []}
 
     for filepath, data in sorted(pipelines.items()):
         if context is not None:
             decision = selection(config, data, filepath.name, branch, context)
             if decision["status"] != "applicable":
-                results[filepath.name] = {"errors": [], "warnings": [], **decision}
+                results[result_key(filepath)] = {"errors": [], "warnings": [], **decision}
                 continue
         pipeline_type = classify_pipeline(filepath.name, data, config=config)
         tmpl_config = config.get_template(pipeline_type)
         if not tmpl_config:
             log(f"  {filepath.name}: unknown pipeline type '{pipeline_type}', skipping")
             continue
+
+        if tmpl_config.generate:
+            continue  # Already reconciled above, including orphan handling.
 
         template_path = str(Path(config.config_dir) / tmpl_config.file)
 
@@ -325,7 +363,7 @@ def validate_tekton_dir(
                 )
                 delete_signals = [e for e in check_errors if e.startswith(DELETE_FILE_PREFIX)]
                 if delete_signals:
-                    results[filepath.name] = {
+                    results[result_key(filepath)] = {
                         "errors": [e.removeprefix(DELETE_FILE_PREFIX) for e in delete_signals],
                         "warnings": [],
                         "pipeline_type": pipeline_type,
@@ -342,7 +380,7 @@ def validate_tekton_dir(
             )
             delete_signals = [e for e in check_errors if e.startswith(DELETE_FILE_PREFIX)]
             if delete_signals:
-                results[filepath.name] = {
+                results[result_key(filepath)] = {
                     "errors": [e.removeprefix(DELETE_FILE_PREFIX) for e in delete_signals],
                     "warnings": [],
                     "pipeline_type": pipeline_type,
@@ -359,7 +397,7 @@ def validate_tekton_dir(
             )
             if parent_data is None:
                 prefix = extract_component_prefix(filepath.name, data)
-                results[filepath.name] = {
+                results[result_key(filepath)] = {
                     "errors": [f"no matching {tmpl_config.parent.template} pipeline found (expected prefix '{prefix}')"],
                     "warnings": [],
                     "pipeline_type": pipeline_type,
@@ -377,7 +415,7 @@ def validate_tekton_dir(
             cli_vars=cli_vars, inherit_params=inherit, overlay_path=overlay,
         )
 
-        results[filepath.name] = {
+        results[result_key(filepath)] = {
             "errors": errors,
             "warnings": warnings,
             "pipeline_type": pipeline_type,
@@ -416,7 +454,7 @@ def fix_tekton_dir(
     ruamel.preserve_quotes = True
     ruamel.width = 4096
 
-    pipelines, parent_indexes, _, _ = profile.load() if profile else _load_pipelines(
+    pipelines, parent_indexes, yaml_errors, _ = profile.load() if profile else _load_pipelines(
         tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
     )
     context = None if profile else _selection_context(tekton_dir, layout, config, branch)
@@ -424,6 +462,25 @@ def fix_tekton_dir(
     if context is not None:
         pipelines = {path: data for path, data in pipelines.items()
                      if selection(config, data, path.name, branch, context)["status"] == "applicable"}
+
+    if any(t.generate for t in config.templates):
+        if yaml_errors or external_parent_indexes is not None:
+            return [], {str(path): data for path, data in pipelines.items()}
+        try:
+            expected, _ = plan_children(pipelines, config, branch, cli_vars)
+        except ValueError as exc:
+            warn(str(exc))
+            return [], {str(path): data for path, data in pipelines.items()}
+        fixed = []
+        for path, data in expected.items():
+            if pipelines.get(path) != data:
+                if not dry_run:
+                    with open(path, "w") as stream:
+                        ruamel.dump(data, stream)
+                info(f"  {path}: {'would generate' if dry_run else 'generated'} via template")
+                fixed.append(str(path))
+            pipelines[path] = data
+        return fixed, {str(path): data for path, data in pipelines.items()}
 
     # Use external parent indexes if provided (cross-branch parenting)
     if external_parent_indexes is not None:

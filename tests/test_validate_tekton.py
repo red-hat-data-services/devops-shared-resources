@@ -203,6 +203,22 @@ def test_component_prefix_no_match():
     assert extract_component_prefix("random-file.yaml") is None
 
 
+@pytest.mark.parametrize("placeholder", ["{{target_branch}}", "{{ target_branch }}"])
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_component_prefix_legacy_target_branch_placeholder(placeholder, with_metadata):
+    """Strip only the exact terminal release placeholder in legacy PR identities."""
+    name = f"odh-llm-d-kv-cache-{placeholder}-on-pull-request-43048"
+    data = {"metadata": {"name": name}} if with_metadata else None
+    assert extract_component_prefix(name + ".yaml", data) == "odh-llm-d-kv-cache"
+
+
+@pytest.mark.parametrize("placeholder", ["{{source_branch}}", "{{target_branch}}-extra"])
+def test_component_prefix_preserves_other_placeholders(placeholder):
+    """Do not broaden matching by stripping arbitrary template fragments."""
+    name = f"widget-{placeholder}-on-pull-request-123"
+    assert extract_component_prefix("", {"metadata": {"name": name}}) == f"widget-{placeholder}"
+
+
 # --- get_param ---
 
 
