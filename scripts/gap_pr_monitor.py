@@ -195,6 +195,8 @@ class MonitorResult:
     pending_urls: list[str] = field(default_factory=list)
     reports: tuple[str, ...] = ()
     child_head_changed: bool = False
+    notification_urls: tuple[str, ...] = ()
+    notification_result: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -1374,6 +1376,7 @@ def run_monitor_publish_and_signal(
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     git_runner: Callable[..., str] | None = None,
+    notification_config=None,
 ) -> MonitorResult:
     """Coordinator: monitor → publish state → EG comment and/or Leader green.
 
@@ -1422,6 +1425,20 @@ def run_monitor_publish_and_signal(
         dry_run=dry_run,
         git_runner=git_runner,
     )
+
+    notification_result = None
+    if notification_config is not None and notification_config.mode != "disabled":
+        try:
+            from lib.gap_notification_monitor import notify_after_publish
+            notification_result = notify_after_publish(
+                load_state(result.state_path), accepted_urls=result.notification_urls,
+                config=notification_config, leader_url=leader_pr_url,
+                published_sha=published.sha, state_path=result.state_path,
+                repo_root=repo_root, dry_run=dry_run,
+            )
+        except Exception as exc:
+            notification_result = {"status": "error", "error_type": type(exc).__name__}
+            print("WARNING: GAP staging notification hook failed: " + type(exc).__name__, file=sys.stderr)
 
     leader_url = (leader_pr_url or "").strip() or None
     leader_status_posted = False
@@ -1528,6 +1545,8 @@ def run_monitor_publish_and_signal(
         build_failure_urls=result.build_failure_urls,
         pending_urls=result.pending_urls,
         reports=result.reports,
+        notification_urls=result.notification_urls,
+        notification_result=notification_result,
     )
 
 
@@ -1581,6 +1600,7 @@ def run_scheduled_monitors(
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     git_runner: Callable[..., str] | None = None,
     updater_factory: Callable[..., PRStatusUpdater] | None = None,
+    notification_config=None,
 ) -> int:
     """Discover open Leaders and run gate evaluation, then publish-and-signal.
 
@@ -1636,6 +1656,7 @@ def run_scheduled_monitors(
             result = run_monitor_publish_and_signal(
                 state_path,
                 **rollover_args,
+                **({"notification_config": notification_config} if notification_config is not None else {}),
                 repo_root=root,
                 head_ref=leader.head_ref,
                 leader_pr_url=leader.url,
@@ -2281,6 +2302,8 @@ def _publish_decisions(
         pending_urls=pending,
         reports=tuple(reports),
         child_head_changed=child_head_changed,
+        # Exclude old persisted receipts from head-move deferral/post failures.
+        notification_urls=tuple(d.url for d in evaluated_decisions),
     )
 
 
@@ -2404,12 +2427,30 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: {ENV_LEADER_LABEL} or {DEFAULT_LEADER_LABEL!r})."
         ),
     )
+    notifications = parser.add_argument_group("opt-in staging notifications (disabled by default)")
+    notifications.add_argument("--notification-mode", choices=("disabled", "preview", "write"), default="disabled")
+    notifications.add_argument("--notification-ledger", help="Isolated schema2 journal OUTSIDE monitored checkout")
+    notifications.add_argument("--notification-trial-id", default="default")
+    notifications.add_argument("--notification-transition-id", help="Explicit verified staging done transition")
+    notifications.add_argument("--notification-transition-fields", default="{}", help="JSON fields for recovery transition")
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     repo_root = Path(args.repo_root)
+    notification_config = None
+    if args.notification_mode != "disabled":
+        try:
+            from lib.gap_notification_monitor import NotificationConfig
+            notification_config = NotificationConfig(
+                mode=args.notification_mode, ledger=args.notification_ledger,
+                trial_id=args.notification_trial_id,
+                transition_id=args.notification_transition_id,
+                transition_fields=json.loads(args.notification_transition_fields),
+            )
+        except Exception as exc:
+            print("WARNING: Invalid staging notification configuration: " + type(exc).__name__, file=sys.stderr)
 
     if should_run_schedule_mode(schedule_flag=args.schedule):
         label = (
@@ -2423,6 +2464,7 @@ def main(argv: list[str] | None = None) -> int:
                 repo_root,
                 leader_repo=leader_repo,
                 label=label,
+                **({"notification_config": notification_config} if notification_config is not None else {}),
                 check_name=args.check_name,
                 dry_run=args.dry_run,
                 # Schedule should not stop the whole batch on one Leader failure.
@@ -2468,6 +2510,7 @@ def main(argv: list[str] | None = None) -> int:
             state_path,
             repo_root=repo_root,
             leader_pr_url=leader_pr_url,
+            **({"notification_config": notification_config} if notification_config is not None else {}),
             publish=args.publish_state,
             check_name=args.check_name,
             dry_run=args.dry_run,
