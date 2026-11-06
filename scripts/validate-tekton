@@ -7,7 +7,7 @@
 
 Run from the root of a cloned git repo. Reads .tekton/ files from the
 working tree and validates them against a security policy. Fix mode
-writes corrected files, optionally committing and creating an MR.
+writes corrected files. Use reconcile-tekton for preview and PR publication.
 """
 
 import argparse
@@ -16,15 +16,16 @@ import subprocess
 import sys
 from pathlib import Path
 
-from ruamel.yaml import YAML
-
 _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
+
+from ruamel.yaml import YAML
 from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
 from lib.tekton_config import load_config
 from lib.tekton_children import plan_children
 from lib.tekton_filters import DELETE_FILE_PREFIX
 from lib.tekton_matchers import make_parent_matchers
+from lib.tekton_validation import write_candidate, selection
 
 DEFAULT_CONFIG_DIR = str(_repo_root / "tekton-templates" / "embargo")
 
@@ -71,10 +72,13 @@ def _glob_tekton_files(base_dir: Path, layout: str = "flat", pipeline_dir: Path 
     if layout == "nested":
         if pipeline_dir is not None:
             yield from sorted((base_dir / pipeline_dir).glob(".tekton/*.yaml"))
+            yield from sorted((base_dir / pipeline_dir).glob(".tekton/*.yml"))
         else:
             yield from sorted(base_dir.glob("pipelineruns/*/.tekton/*.yaml"))
+            yield from sorted(base_dir.glob("pipelineruns/*/.tekton/*.yml"))
     else:
         yield from sorted(base_dir.glob("*.yaml"))
+        yield from sorted(base_dir.glob("*.yml"))
 
 
 def _load_pipelines(
@@ -169,7 +173,7 @@ def _load_parent_pipelines_from_ref(ref: str, repo_root: Path, config, layout: s
         warn(f"failed to list files from {ref}: {r.stderr.strip()}")
         return parent_indexes
 
-    yaml_files = [line for line in r.stdout.strip().split("\n") if line.endswith(".yaml")]
+    yaml_files = [line for line in r.stdout.strip().split("\n") if line.endswith((".yaml", ".yml"))]
     log(f"  loading {len(yaml_files)} files from {ref}")
 
     for filepath_str in yaml_files:
@@ -227,9 +231,24 @@ def _find_parent_pipeline(child_data: dict, candidate_pipelines: dict, match_fn_
 def _resolve_pipeline_overlay(config, tmpl_config, filepath, data):
     """Resolve a template overlay for a pipeline file."""
     prefix = extract_component_prefix(filepath.name, data)
-    label = data.get("metadata", {}).get("labels", {}).get(
+    label = (data.get("metadata", {}).get("labels") or {}).get(
         "appstudio.openshift.io/component")
     return resolve_overlay(config.config_dir, tmpl_config.file, prefix, label)
+
+
+def _selection_context(tekton_dir, layout, config, branch):
+    if not config.selection_template:
+        return None
+    from lib.tekton_reconciliation import context_for
+    root = tekton_dir if layout == "nested" else tekton_dir.parent
+    return context_for(root, None, branch, config)
+
+
+def _configured_renderer(renderer, context):
+    if context is None:
+        return renderer
+    from functools import partial
+    return partial(renderer, template_context=context)
 
 
 # --- Validate ---
@@ -271,6 +290,9 @@ def validate_tekton_dir(
             tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
         )
 
+    context = _selection_context(tekton_dir, layout, config, branch)
+    render_and_merge = _configured_renderer(globals()["render_and_merge"], context)
+
     generation_mode = any(t.generate for t in config.templates)
     results = {}
 
@@ -304,6 +326,11 @@ def validate_tekton_dir(
         results[result_key(filepath)] = {"errors": [msg], "warnings": []}
 
     for filepath, data in sorted(pipelines.items()):
+        if context is not None:
+            decision = selection(config, data, filepath.name, branch, context)
+            if decision["status"] != "applicable":
+                results[result_key(filepath)] = {"errors": [], "warnings": [], **decision}
+                continue
         pipeline_type = classify_pipeline(filepath.name, data, config=config)
         tmpl_config = config.get_template(pipeline_type)
         if not tmpl_config:
@@ -409,6 +436,7 @@ def fix_tekton_dir(
     external_parent_indexes: dict | None = None,
     layout: str = "flat",
     pipeline_dir: Path | None = None,
+    profile=None,
 ) -> tuple[list[str], dict]:
     """Fix tekton files. Returns (fixed_filenames, post_fix_data).
 
@@ -426,9 +454,14 @@ def fix_tekton_dir(
     ruamel.preserve_quotes = True
     ruamel.width = 4096
 
-    pipelines, parent_indexes, yaml_errors, _ = _load_pipelines(
+    pipelines, parent_indexes, yaml_errors, _ = profile.load() if profile else _load_pipelines(
         tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
     )
+    context = None if profile else _selection_context(tekton_dir, layout, config, branch)
+    render = profile.render if profile else _configured_renderer(render_and_merge, context)
+    if context is not None:
+        pipelines = {path: data for path, data in pipelines.items()
+                     if selection(config, data, path.name, branch, context)["status"] == "applicable"}
 
     if any(t.generate for t in config.templates):
         if yaml_errors or external_parent_indexes is not None:
@@ -461,6 +494,8 @@ def fix_tekton_dir(
     # Skip when using external parents — parents are read-only.
     if external_parent_indexes is None:
         for filepath, data in sorted(pipelines.items()):
+            if profile:
+                profile.current_path = filepath
             pipeline_type = classify_pipeline(filepath.name, data, config=config)
             tmpl_config = config.get_template(pipeline_type)
 
@@ -480,7 +515,7 @@ def fix_tekton_dir(
             template_dir = config.config_dir
             template_name = tmpl_config.file
             errors = []
-            result = render_and_merge(template_dir, template_name, data, filepath.name, branch, mode="fix", errors=errors, cli_vars=cli_vars, overlay_path=overlay)
+            result = render(template_dir, template_name, data, filepath.name, branch, mode="fix", errors=errors, cli_vars=cli_vars, overlay_path=overlay)
 
             if any(e.startswith(DELETE_FILE_PREFIX) for e in errors):
                 if not dry_run:
@@ -494,9 +529,7 @@ def fix_tekton_dir(
                 continue
 
             if result != data:
-                if not dry_run:
-                    with open(filepath, "w") as f:
-                        ruamel.dump(result, f)
+                write_candidate(filepath, result, ruamel, dry_run, profile)
                 info(f"  {filepath.name}: {'fixed' if not dry_run else 'would fix'} via template")
                 fixed_files.append(filepath.name)
                 prefix = extract_component_prefix(filepath.name, data)
@@ -534,7 +567,7 @@ def fix_tekton_dir(
                 render_and_merge(
                     config.config_dir, parent_tmpl.file, data, filepath.name, branch,
                     mode="fix", errors=check_errors, cli_vars=cli_vars,
-                    overlay_path=check_overlay,
+                    overlay_path=check_overlay, template_context=context,
                 )
                 if any(e.startswith(DELETE_FILE_PREFIX) for e in check_errors):
                     if not dry_run:
@@ -557,7 +590,7 @@ def fix_tekton_dir(
 
         inherit = tmpl_config.parent.inherit_params if tmpl_config.parent else False
         errors = []
-        result = render_and_merge(
+        result = render(
             config.config_dir, tmpl_config.file, data, filepath.name, branch,
             parent_data=parent_data, mode="fix", errors=errors, warnings=[],
             cli_vars=cli_vars, inherit_params=inherit, overlay_path=overlay,
@@ -573,9 +606,7 @@ def fix_tekton_dir(
             continue
 
         if result != data:
-            if not dry_run:
-                with open(filepath, "w") as f:
-                    ruamel.dump(result, f)
+            write_candidate(filepath, result, ruamel, dry_run, profile)
             info(f"  {filepath.name}: {'fixed' if not dry_run else 'would fix'} via template")
             fixed_files.append(filepath.name)
 
@@ -777,7 +808,13 @@ def main():
                 config=config,
                 pipelines_data=post_fix_data,
                 external_parent_indexes=external_parent_indexes,
+                layout=layout,
             )
+            # Selection-excluded files are absent from post_fix_data, but their
+            # original diagnostics still belong in the complete final report.
+            for filename, result in results.items():
+                if result.get("status") in {"skipped", "manual", "unresolved"}:
+                    final_results.setdefault(filename, result)
             final_totals = {"ok": 0, "errors": 0, "warnings": 0}
             for result in final_results.values():
                 errs = result.get("errors", [])

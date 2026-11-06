@@ -3,11 +3,15 @@
 
 Read leader state.json, evaluate each child PR's component builds and
 main-to-release feasibility checks, post the gated artifacts promoter commit
-status, and update pr-status. Good children are greened only after every
-sibling has concluded (RHAI-8261) — same as before when the child gate passes.
-All-success batches set ``overall-status=early-gate-triggered`` and comment
-``/early-gate`` on the Leader (RHAI-10942); child GitHub success posting is
-unchanged.
+status, and update pr-status.
+
+Good children stay GitHub ``pending`` while siblings are still open (RHAI-8261)
+and again while builds succeeded but Early Gate has not concluded (so the final
+green can include a short EG status note). All-success batches set
+``component-builds`` to success and comment ``/early-gate`` (RHAI-10942).
+``overall-status`` is legacy and is stripped; ``promotion-gates`` is SoT.
+EG gates stay ``required: false`` so EG *failure* still greens children once
+EG has concluded; flip ``required`` later to demand EG success.
 
 State path (RHOAIENG-93564 / sync layout):
 GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json
@@ -41,13 +45,29 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+from lib.gap_promotion_gates import (
+    apply_component_builds_from_children,
+    early_gate_concluded,
+    children_ready_for_success_status,
+    derive_legacy_overall_status,
+    ensure_promotion_gates,
+    migrate_legacy_overall_status,
+    should_green_leader_for_build_failure,
+    should_trigger_early_gate,
+    strip_legacy_overall_status,
+    waiting_for_early_gate,
+)
 from lib.gap_check_selection import (
     FeasibilityRun,
+    TriggerParseError,
     default_build_producer,
-    fetch_changed_files,
+    fetch_file_collections,
     fetch_feasibility_run,
     fetch_tekton_documents,
 )
+from lib.konflux_builds import build_status_source
+from lib.konflux_gate import evaluate_konflux_gate
+from lib.gap_component_map import fetch_component_repo_map, repository_components
 from lib.gap_pr_gates import (
     PR_STATUS_BUILD_FAILURE,
     PR_STATUS_BUILD_PENDING,
@@ -56,6 +76,7 @@ from lib.gap_pr_gates import (
     RepositoryGateDecision,
     RepositoryPullRequest,
     decide_repository_pr,
+    expected_builds_for_pr,
 )
 from lib.github_check_runs import CheckQueryError, github_api_json, list_check_runs
 from lib.pr_status_updater import (
@@ -65,6 +86,7 @@ from lib.pr_status_updater import (
     StatusUpdateResult,
     parse_pr_url,
 )
+from lib.leader_history import prepare_leader_history_merge, write_history_snapshot
 from lib.state_file import (
     OVERALL_STATUS_EARLY_GATE_TRIGGERED,
     OVERALL_STATUS_FAILURE,
@@ -96,6 +118,10 @@ CHILD_PASS_PR_STATUSES = frozenset({SUCCESS_PR_STATUS, BUILD_SUCCESS_PR_STATUS})
 # RHAI-8261: hold green on good children until every sibling has concluded.
 DEFERRED_CHILD_GREEN_DESCRIPTION = (
     "GAP: waiting for other component PRs to conclude (RHAI-8261)"
+)
+# Hold child green after all-success until Early Gate concludes (EG status note).
+WAITING_FOR_EARLY_GATE_DESCRIPTION = (
+    "GAP: waiting for Early Gate (auto-merge held)"
 )
 # PaC on-comment in gated-artifacts-promoter: ^/early-gate(-build)?$
 EARLY_GATE_COMMENT_BODY = "/early-gate"
@@ -402,51 +428,53 @@ def apply_success_statuses(payload: dict[str, Any], urls: Sequence[str]) -> None
 
 
 def compute_overall_status(payload: dict[str, Any]) -> str | None:
-    """Derive overall-status once every child PR has a final gate status.
+    """Derive a legacy overall string from ``promotion-gates`` (not persisted).
 
-    Finals: ``success``, ``merge-failure``, and ``build-failure``.
-    ``build-pending`` and ``new`` stay in progress.
-
-    - all ``success`` / ``build-success`` → ``early-gate-triggered``
-      (RHAI-10942; child GitHub status stays the existing success path)
-    - any ``merge-failure`` or ``build-failure`` → ``failure``
-    - any non-terminal child → ``None`` (do not conclude yet)
-
-    Existing ``success`` / ``failure`` (written by a future EG monitor) are
-    preserved so this monitor never overwrites a final conclusion.
+    Applies ``component-builds`` from children first when gates are missing/stale.
+    Prefer reading ``promotion-gates`` directly; this exists for MonitorResult /
+    older call sites.
     """
-    entries = payload.get("pull-requests") or []
-    if not entries:
-        return None
-    statuses: list[str] = []
-    for index, entry in enumerate(entries):
-        if not isinstance(entry, dict):
-            raise GapPrMonitorError(f"pull-requests[{index}] must be an object.")
-        status = str(entry.get("pr-status") or "").strip()
-        if status not in STAGE1_TERMINAL_PR_STATUSES:
-            return None
-        statuses.append(status)
-
-    existing = str(payload.get("overall-status") or "").strip()
-    if existing in FINAL_OVERALL_STATUSES:
-        return existing
-
-    if any(status not in CHILD_PASS_PR_STATUSES for status in statuses):
-        return OVERALL_STATUS_FAILURE
-    return OVERALL_STATUS_EARLY_GATE_TRIGGERED
+    ensure_promotion_gates(payload)
+    migrate_legacy_overall_status(payload)
+    apply_component_builds_from_children(payload)
+    # Preserve EG-final conclusions already recorded on gates.
+    return derive_legacy_overall_status(payload)
 
 
 def apply_overall_status(payload: dict[str, Any], overall_status: str | None) -> None:
-    """Set or clear top-level overall-status on the state payload."""
+    """Legacy helper: map overall into gates when set; always strip overall-status.
+
+    New code should call ``apply_component_builds_from_children`` /
+    ``set_gate_status`` instead. Kept so older tests that call this still
+    leave state consistent with the gates SoT.
+    """
+    from lib.gap_promotion_gates import (
+        GATE_COMPONENT_BUILDS,
+        GATE_EARLY_GATE_BUILD,
+        GATE_EARLY_GATE_TEST,
+        GATE_STATUS_FAILURE,
+        GATE_STATUS_SUCCESS,
+        set_gate_status,
+    )
+
+    ensure_promotion_gates(payload)
     if overall_status is None:
-        payload.pop("overall-status", None)
+        strip_legacy_overall_status(payload)
         return
     if overall_status not in OVERALL_STATUSES:
         raise GapPrMonitorError(
             f"Invalid overall-status {overall_status!r}; "
             f"expected one of {sorted(OVERALL_STATUSES)}."
         )
-    payload["overall-status"] = overall_status
+    if overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED:
+        set_gate_status(payload, GATE_COMPONENT_BUILDS, GATE_STATUS_SUCCESS)
+    elif overall_status == OVERALL_STATUS_SUCCESS:
+        set_gate_status(payload, GATE_COMPONENT_BUILDS, GATE_STATUS_SUCCESS)
+        set_gate_status(payload, GATE_EARLY_GATE_BUILD, GATE_STATUS_SUCCESS)
+        set_gate_status(payload, GATE_EARLY_GATE_TEST, GATE_STATUS_SUCCESS)
+    elif overall_status == OVERALL_STATUS_FAILURE:
+        set_gate_status(payload, GATE_COMPONENT_BUILDS, GATE_STATUS_FAILURE)
+    strip_legacy_overall_status(payload)
 
 
 def children_batch_concluded(pr_statuses: Sequence[str]) -> bool:
@@ -461,17 +489,37 @@ def should_defer_child_success_status(
     pr_status: str,
     batch_concluded: bool,
     overall_status: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> bool:
-    """Defer green on a good child until every sibling has concluded (RHAI-8261).
+    """Defer GitHub green on a good child until it is safe to auto-merge.
 
-    ``overall_status`` is accepted for call-site compatibility but does not
-    change child greening: when the child gate passes and the batch is done,
-    we still post GitHub ``success`` as before.
+    - Batch still open → pending (RHAI-8261).
+    - Builds success but EG not concluded → pending (final green carries EG note).
+    - ``payload`` preferred; ``overall_status`` is legacy fallback only.
     """
-    del overall_status
     if pr_status not in CHILD_PASS_PR_STATUSES:
         return False
-    return not batch_concluded
+    if payload is not None:
+        return not children_ready_for_success_status(payload)
+    if not batch_concluded:
+        return True
+    if overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED:
+        return True
+    return False
+
+
+def child_success_defer_description(
+    *,
+    batch_concluded: bool,
+    overall_status: str | None = None,
+    payload: dict[str, Any] | None = None,
+) -> str:
+    """Human-readable pending description while child success is deferred."""
+    if payload is not None and waiting_for_early_gate(payload):
+        return WAITING_FOR_EARLY_GATE_DESCRIPTION
+    if batch_concluded and overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED:
+        return WAITING_FOR_EARLY_GATE_DESCRIPTION
+    return DEFERRED_CHILD_GREEN_DESCRIPTION
 
 
 def status_decision_for_post(
@@ -479,12 +527,13 @@ def status_decision_for_post(
     *,
     batch_concluded: bool,
     overall_status: str | None = None,
+    payload: dict[str, Any] | None = None,
 ) -> RepositoryGateDecision | PrDecision:
-    """Return the decision to POST; may downgrade success→pending (RHAI-8261).
+    """Return the decision to POST; may downgrade success→pending.
 
     ``pr-status`` in state.json still records the evaluated outcome; only the
-    GitHub commit status is deferred so good children cannot auto-merge before
-    siblings conclude.
+    GitHub commit status is deferred until siblings conclude and (on all-success)
+    Early Gate has concluded so the green can include an EG note.
     """
     if getattr(decision, "skip_status_post", False):
         return decision
@@ -492,13 +541,41 @@ def status_decision_for_post(
         pr_status=decision.pr_status,
         batch_concluded=batch_concluded,
         overall_status=overall_status,
+        payload=payload,
     ):
         return decision
     return replace(
         decision,
         cli_status="pending",
-        description=DEFERRED_CHILD_GREEN_DESCRIPTION,
+        description=child_success_defer_description(
+            batch_concluded=batch_concluded,
+            overall_status=overall_status,
+            payload=payload,
+        ),
     )
+
+
+def provisional_overall_status(
+    payload: dict[str, Any],
+    status_updates: dict[str, str],
+) -> str | None:
+    """Derive legacy overall from a probe with ``status_updates`` applied."""
+    probe = json.loads(json.dumps(payload))
+    apply_pr_statuses(probe, status_updates)
+    return compute_overall_status(probe)
+
+
+def provisional_payload_with_updates(
+    payload: dict[str, Any],
+    status_updates: dict[str, str],
+) -> dict[str, Any]:
+    """Copy payload, apply PR statuses + component-builds gate (for defer)."""
+    probe = json.loads(json.dumps(payload))
+    ensure_promotion_gates(probe)
+    migrate_legacy_overall_status(probe)
+    apply_pr_statuses(probe, status_updates)
+    apply_component_builds_from_children(probe)
+    return probe
 
 
 def early_gate_comment_already_present(
@@ -709,11 +786,6 @@ def run_stage1_monitor(
     merge_failures: list[str] = []
     successes: list[str] = []
     post_errors: list[tuple[str, str]] = []
-    # RHAI-8261: evaluate the whole batch before greening any success child.
-    batch_concluded = children_batch_concluded(
-        [decision.pr_status for decision in decisions]
-    )
-
     for decision in decisions:
         status_updates[decision.url] = decision.pr_status
         if decision.pr_status == MERGE_FAILURE_PR_STATUS:
@@ -721,12 +793,25 @@ def run_stage1_monitor(
         else:
             successes.append(decision.url)
 
+    # Evaluate batch + required promotion-gates before posting (8261).
+    batch_concluded = children_batch_concluded(
+        [decision.pr_status for decision in decisions]
+    )
+    ensure_promotion_gates(payload)
+    migrate_legacy_overall_status(payload)
+    probe = provisional_payload_with_updates(payload, status_updates)
+    overall_status = derive_legacy_overall_status(probe)
+
+    for decision in decisions:
         if decision.skip_status_post:
             skipped.append(decision.url)
             continue
 
         to_post = status_decision_for_post(
-            decision, batch_concluded=batch_concluded
+            decision,
+            batch_concluded=batch_concluded,
+            overall_status=overall_status,
+            payload=probe,
         )
         desc = description if description is not None else to_post.description
         try:
@@ -744,8 +829,8 @@ def run_stage1_monitor(
             if not continue_on_error:
                 if status_updates and not dry_run:
                     apply_pr_statuses(payload, status_updates)
-                    # Invalidate any stale overall success from a prior run.
-                    apply_overall_status(payload, None)
+                    apply_component_builds_from_children(payload)
+                    strip_legacy_overall_status(payload)
                     save_state(path, payload)
                 raise GapPrMonitorError(
                     f"Failed to post status for {decision.url}: {exc}"
@@ -754,8 +839,8 @@ def run_stage1_monitor(
     if classify_errors or post_errors:
         if status_updates and not dry_run:
             apply_pr_statuses(payload, status_updates)
-            # Partial runs stay in progress — clear stale overall-status.
-            apply_overall_status(payload, None)
+            apply_component_builds_from_children(payload)
+            strip_legacy_overall_status(payload)
             save_state(path, payload)
         details = classify_errors + post_errors
         lines = [f"  - {u}: {e}" for u, e in details]
@@ -764,10 +849,9 @@ def run_stage1_monitor(
         )
 
     apply_pr_statuses(payload, status_updates)
-
-    # RHOAIENG-97052 / RHAI-10942: conclude only when every child is final.
-    overall_status = compute_overall_status(payload)
-    apply_overall_status(payload, overall_status)
+    apply_component_builds_from_children(payload)
+    strip_legacy_overall_status(payload)
+    overall_status = derive_legacy_overall_status(payload)
 
     if not dry_run:
         save_state(path, payload)
@@ -961,7 +1045,11 @@ def publish_state(
         ["config", "user.email", "github-actions[bot]@users.noreply.github.com"],
         cwd=repo_root,
     )
-    run(["add", "--", rel], cwd=repo_root)
+    snapshot = write_history_snapshot(repo_root, state_path)
+    paths = [rel]
+    if snapshot is not None:
+        paths.append(state_path_for_output(snapshot, repo_root=repo_root))
+    run(["add", "--", *paths], cwd=repo_root)
     staged = run(["diff", "--cached", "--name-only"], cwd=repo_root)
     committed = False
     if staged.strip():
@@ -1040,6 +1128,7 @@ def post_leader_conclusion(
     *,
     overall_status: str,
     updater: PRStatusUpdater,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> StatusUpdateResult:
     """Post Leader green on the published SHA once overall-status is set (RHAI-8079).
 
@@ -1055,6 +1144,10 @@ def post_leader_conclusion(
         raise GapPrMonitorError(
             f"Cannot post Leader conclusion for overall-status={overall_status!r}"
         )
+    prepare_leader_history_merge(
+        leader_pr_url, published_sha, overall_status=overall_status,
+        dry_run=updater.dry_run, gh_runner=gh_runner,
+    )
     return updater.post_status_for_pr(
         leader_pr_url,
         "completed",
@@ -1079,6 +1172,41 @@ def post_leader_success(
     )
 
 
+def _post_leader_failure_summary(
+    *,
+    leader_pr_url: str,
+    repo_root: Path,
+    state_path: Path,
+    head_ref: str,
+    dry_run: bool,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> None:
+    """Upsert the Leader failure/pending/closed summary comment (best-effort).
+
+    Lazy-imports ``gap_failure_reporter`` to avoid an import cycle: that module
+    reuses helpers from this file.
+    """
+    from scripts import gap_failure_reporter as gfr
+
+    # State was just written on this checkout; pass the path explicitly and skip
+    # a redundant branch checkout.
+    summary = gfr.report_for_leader(
+        leader_pr_url=leader_pr_url,
+        repo_root=repo_root,
+        head_ref=None,
+        state_file=str(state_path),
+        dry_run=dry_run,
+        gh_runner=gh_runner,
+        reuse_monitor_evidence=build_status_source() == "konflux",
+    )
+    prefix = "[dry-run] " if dry_run else ""
+    action = "create" if summary.created else ("update" if summary.updated else "noop")
+    print(
+        f"{prefix}Leader failure summary: {action} "
+        f"rows={len(summary.rows)} comment_id={summary.comment_id}"
+    )
+
+
 def run_monitor_publish_and_signal(
     state_path: Path,
     *,
@@ -1098,9 +1226,10 @@ def run_monitor_publish_and_signal(
     """Coordinator: monitor → publish state → EG comment and/or Leader green.
 
     Ordering (RHOAIENG-97052 / RHAI-8079 / RHAI-10942):
-      evaluate children → save state → commit/push →
-      if ``early-gate-triggered``: comment ``/early-gate`` on the Leader once;
-      if ``success`` or ``failure``: post Leader green on the published SHA.
+      evaluate children → write ``promotion-gates`` → commit/push →
+      if ``component-builds`` success: comment ``/early-gate`` on the Leader once;
+      if required builds failed: post Leader green on the published SHA;
+      always (when Leader URL known): upsert failure/pending/closed summary comment.
     """
     result = run_monitor(
         state_path,
@@ -1132,8 +1261,18 @@ def run_monitor_publish_and_signal(
     early_gate_comment_posted = False
     updated = list(result.updated_urls)
     skipped = list(result.skipped_urls)
-    concluded = result.overall_status in FINAL_OVERALL_STATUSES
-    early_gate = result.overall_status == OVERALL_STATUS_EARLY_GATE_TRIGGERED
+    # Gate-driven: /early-gate only when all builds passed; Leader green on
+    # Stage-1 only when required builds failed (EG path finishes Leader later).
+    state_payload = load_state(result.state_path)
+    ensure_promotion_gates(state_payload)
+    migrate_legacy_overall_status(state_payload)
+    # /early-gate only while builds passed and EG has not finished yet.
+    early_gate = should_trigger_early_gate(
+        state_payload
+    ) and not early_gate_concluded(state_payload)
+    concluded = should_green_leader_for_build_failure(state_payload)
+    # Keep MonitorResult.overall_status aligned with gates for callers/tests.
+    result_overall = derive_legacy_overall_status(state_payload)
 
     if early_gate and leader_url:
         try:
@@ -1148,7 +1287,7 @@ def run_monitor_publish_and_signal(
             ) from exc
     elif early_gate and not leader_url:
         print(
-            f"WARNING: overall-status={result.overall_status} but no Leader PR URL "
+            f"WARNING: component-builds=success but no Leader PR URL "
             f"was provided (--leader-pr-url / {ENV_LEADER_PR_URL}); "
             "skipped Early Gate trigger comment.",
             file=sys.stderr,
@@ -1163,8 +1302,9 @@ def run_monitor_publish_and_signal(
             leader_result = post_leader_conclusion(
                 leader_url,
                 published.sha,
-                overall_status=result.overall_status or "",
+                overall_status=OVERALL_STATUS_FAILURE,
                 updater=updater,
+                gh_runner=gh_runner,
             )
             leader_status_posted = not leader_result.skipped
             if leader_status_posted:
@@ -1178,11 +1318,30 @@ def run_monitor_publish_and_signal(
             ) from exc
     elif concluded and not leader_url:
         print(
-            f"WARNING: overall-status={result.overall_status} but no Leader PR URL "
+            f"WARNING: component-builds=failure but no Leader PR URL "
             f"was provided (--leader-pr-url / {ENV_LEADER_PR_URL}); "
             "skipped Leader self-status.",
             file=sys.stderr,
         )
+
+    # After state is published, refresh the single Leader failure/pending/closed
+    # summary comment so the table matches this run's state.json.
+    # Best-effort — never fail the gate run.
+    if leader_url:
+        try:
+            _post_leader_failure_summary(
+                leader_pr_url=leader_url,
+                repo_root=repo_root,
+                state_path=result.state_path,
+                head_ref=branch,
+                dry_run=dry_run,
+                gh_runner=gh_runner,
+            )
+        except Exception as exc:  # noqa: BLE001 — summary must not fail the gate
+            print(
+                f"WARNING: Leader failure summary comment failed for {leader_url}: {exc}",
+                file=sys.stderr,
+            )
 
     return MonitorResult(
         state_path=result.state_path,
@@ -1191,7 +1350,7 @@ def run_monitor_publish_and_signal(
         merge_failure_urls=result.merge_failure_urls,
         success_urls=result.success_urls,
         dry_run=result.dry_run,
-        overall_status=result.overall_status,
+        overall_status=result_overall if result_overall is not None else result.overall_status,
         leader_status_posted=leader_status_posted,
         early_gate_comment_posted=early_gate_comment_posted,
         published_sha=published.sha,
@@ -1390,7 +1549,20 @@ def fetch_repository_pull_request(
         labels=_label_names(data.get("labels")),
         changed_files=(),
         committer_at=committer_at,
+        source_branch=str(data.get("headRefName") or "") or None,
+        base_sha=str(data.get("baseRefOid") or "") or None,
+        title=data.get("title"),
+        target_url=f"https://github.com/{pr.owner}/{pr.repo}",
+        source_url=_source_repository_url(data),
+
     )
+
+
+def _source_repository_url(data: dict) -> str | None:
+    repository = data.get("headRepository") or {}
+    owner = data.get("headRepositoryOwner") or {}
+    name, login = repository.get("name"), owner.get("login")
+    return f"https://github.com/{login}/{name}" if name and login else None
 
 
 def _load_pr_view(
@@ -1406,7 +1578,7 @@ def _load_pr_view(
             "-R",
             pr.slug,
             "--json",
-            "state,mergeable,mergeStateStatus,baseRefName,headRefOid,labels,url",
+            "state,mergeable,mergeStateStatus,baseRefName,baseRefOid,headRefName,headRefOid,labels,url,title,headRepository,headRepositoryOwner",
         ]
     )
     try:
@@ -1497,6 +1669,10 @@ def run_monitor(
             build_app_id = env_app_id
     moment = now or datetime.now().astimezone()
     runner = gh_runner or _run_gh
+    try:
+        component_repo_map = fetch_component_repo_map(runner)
+    except (GhCommandError, CheckQueryError) as exc:
+        raise GapPrMonitorError(f"Could not load component repository mapping: {exc}") from exc
     factory = updater_factory or PRStatusUpdater
     updater = factory(check_name=check_name, dry_run=dry_run)
 
@@ -1512,6 +1688,7 @@ def run_monitor(
                     build_app_slug=build_app_slug,
                     build_app_id=build_app_id,
                     retry_unknown=gh_runner is None,
+                    component_repo_map=component_repo_map,
                 )
             )
         except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
@@ -1533,6 +1710,7 @@ def run_monitor(
         build_app_slug=build_app_slug,
         build_app_id=build_app_id,
         retry_unknown=gh_runner is None,
+        component_repo_map=component_repo_map,
     )
 
 
@@ -1544,6 +1722,7 @@ def _decide_url(
     build_app_slug: str,
     build_app_id: int | None,
     retry_unknown: bool,
+    component_repo_map: dict[str, frozenset[str]],
 ) -> RepositoryGateDecision:
     pull_request = fetch_repository_pull_request(
         url, gh_runner=runner, retry_unknown=retry_unknown
@@ -1566,11 +1745,16 @@ def _decide_url(
         )
     else:
         try:
+            if not pull_request.base_sha:
+                raise CheckQueryError("PR snapshot has no pinned base SHA")
+            file_collections = fetch_file_collections(
+                pull_request.owner, pull_request.repo, pull_request.number, runner,
+                base_sha=pull_request.base_sha, head_sha=pull_request.head_sha,
+            )
             pull_request = replace(
                 pull_request,
-                changed_files=fetch_changed_files(
-                    pull_request.owner, pull_request.repo, pull_request.number, runner
-                ),
+                changed_files=file_collections["all"],
+                file_collections=file_collections,
             )
         except CheckQueryError as exc:
             tekton_error = str(exc)
@@ -1601,7 +1785,25 @@ def _decide_url(
             runner,
         )
 
-    return decide_repository_pr(
+    build_gate_override, observations = None, None
+    if not blocking_merge and build_status_source() == "konflux":
+        configuration_error = None
+        try:
+            if tekton_error is not None:
+                raise TriggerParseError(tekton_error)
+            expected = expected_builds_for_pr(
+                pull_request, tekton_documents, app_slug=build_app_slug, app_id=build_app_id,
+                allowed_components=repository_components(component_repo_map, pull_request.repo),
+            )
+        except TriggerParseError as exc:
+            expected, configuration_error = (), str(exc) or "Expected Konflux build configuration could not be verified"
+        build_gate_override, observations = evaluate_konflux_gate(
+            repo=f"{pull_request.owner}/{pull_request.repo}",
+            number=pull_request.number, sha=pull_request.head_sha, expected=expected,
+            query_error=configuration_error,
+        )
+
+    decision = decide_repository_pr(
         pull_request,
         tekton_documents=tekton_documents,
         tekton_error=tekton_error,
@@ -1611,7 +1813,22 @@ def _decide_url(
         now=now,
         build_app_slug=build_app_slug,
         build_app_id=build_app_id,
+        allowed_components=repository_components(component_repo_map, pull_request.repo),
+        build_gate_override=build_gate_override,
     )
+    if observations is None and build_status_source() == "konflux":
+        # Merge/conflict decisions need no build query, but the immediately
+        # following comment can still reuse their freshly evaluated PR facts.
+        observations = {
+            "source": "konflux", "repository": f"{pull_request.owner}/{pull_request.repo}",
+            "pr": pull_request.number, "head-sha": pull_request.head_sha,
+            "observed-at": now.isoformat(), "runs": [], "expected-components": [],
+            "query-skipped": "PR already merged or has a merge conflict",
+        }
+    if observations is not None:
+        observations["pr-state"] = pull_request.state
+        observations["gate-reason"] = decision.reason
+    return replace(decision, build_observations=observations)
 
 
 def _post_gate_status(
@@ -1641,15 +1858,17 @@ def _publish_gate_decision(
     build_app_slug: str,
     build_app_id: int | None,
     retry_unknown: bool,
+    component_repo_map: dict[str, frozenset[str]],
     batch_concluded: bool,
     overall_status: str | None,
+    payload: dict[str, Any] | None = None,
 ) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
     """Publish a decision, or re-evaluate once when the head has moved.
 
     A second move is left for the next poll. The stale decision is not posted
-    to the untested commit. Success greens are deferred until the batch has a
-    final overall-status (RHAI-8261 / RHAI-10942); ``pr_status`` on the returned
-    decision stays evaluated.
+    to the untested commit. Success greens are deferred while required
+    ``promotion-gates`` are not ready (RHAI-8261 + required checklist);
+    ``pr_status`` on the returned decision stays evaluated.
     """
     if decision.skip_status_post:
         return decision, None
@@ -1657,6 +1876,7 @@ def _publish_gate_decision(
         decision,
         batch_concluded=batch_concluded,
         overall_status=overall_status,
+        payload=payload,
     )
     assert isinstance(to_post, RepositoryGateDecision)
     result = _post_gate_status(updater, to_post, description)
@@ -1669,6 +1889,7 @@ def _publish_gate_decision(
         build_app_slug=build_app_slug,
         build_app_id=build_app_id,
         retry_unknown=retry_unknown,
+        component_repo_map=component_repo_map,
     )
     if fresh.skip_status_post:
         return fresh, None
@@ -1676,6 +1897,7 @@ def _publish_gate_decision(
         fresh,
         batch_concluded=batch_concluded,
         overall_status=overall_status,
+        payload=payload,
     )
     assert isinstance(to_post, RepositoryGateDecision)
     result = _post_gate_status(updater, to_post, description)
@@ -1699,6 +1921,7 @@ def _publish_decisions(
     build_app_slug: str,
     build_app_id: int | None,
     retry_unknown: bool,
+    component_repo_map: dict[str, frozenset[str]],
 ) -> MonitorResult:
     status_updates: dict[str, str] = {}
     updated: list[str] = []
@@ -1709,9 +1932,31 @@ def _publish_decisions(
     successes: list[str] = []
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
-    batch_concluded = children_batch_concluded(
-        [decision.pr_status for decision in decisions]
-    )
+    if build_status_source() == "konflux":
+        # Refresh the whole batch before deriving the child-green hold. A retry
+        # can turn a terminal failure into pending/success; mixing fresh child
+        # decisions with the old batch outcome could release a green before EG.
+        # This is the existing second observation, moved ahead of all POSTs.
+        try:
+            decisions = tuple(
+                decision if decision.skip_status_post else _decide_url(
+                    decision.url, runner=runner, now=now, build_app_slug=build_app_slug,
+                    build_app_id=build_app_id, retry_unknown=retry_unknown,
+                    component_repo_map=component_repo_map,
+                )
+                for decision in decisions
+            )
+        except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
+            # No status or state writes have happened: retain the prior batch
+            # rather than publishing a mix of refreshed and stale decisions.
+            raise GapPrMonitorError(f"Could not refresh child batch before publication: {exc}") from exc
+    # One coherent batch decides both persisted outcomes and the child-green hold.
+    provisional_updates = {d.url: d.pr_status for d in decisions}
+    batch_concluded = children_batch_concluded(list(provisional_updates.values()))
+    ensure_promotion_gates(payload)
+    migrate_legacy_overall_status(payload)
+    probe = provisional_payload_with_updates(payload, provisional_updates)
+    overall_status = derive_legacy_overall_status(probe)
 
     for original in decisions:
         url = original.url
@@ -1725,15 +1970,18 @@ def _publish_decisions(
                 build_app_slug=build_app_slug,
                 build_app_id=build_app_id,
                 retry_unknown=retry_unknown,
+                component_repo_map=component_repo_map,
                 batch_concluded=batch_concluded,
-                overall_status=None,
+                overall_status=overall_status,
+                payload=probe,
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))
             if not continue_on_error:
                 if status_updates and not dry_run:
                     apply_pr_statuses(payload, status_updates)
-                    apply_overall_status(payload, None)
+                    apply_component_builds_from_children(payload)
+                    strip_legacy_overall_status(payload)
                     save_state(path, payload)
                 raise GapPrMonitorError(f"Failed to post status for {url}: {exc}") from exc
             continue
@@ -1743,6 +1991,14 @@ def _publish_decisions(
             continue
 
         status_updates[url] = decision.pr_status
+        for entry in payload.get("pull-requests", []):
+            if (entry.get("pr-url") or entry.get("pr_url")) == url:
+                if decision.build_observations is not None:
+                    entry["build-observations"] = decision.build_observations
+                elif build_status_source() == "github":
+                    # An explicit rollback must not leave obsolete Konflux
+                    # receipts attached to newly evaluated GitHub statuses.
+                    entry.pop("build-observations", None)
         reports.extend(decision.reports)
         if decision.pr_status == MERGE_FAILURE_PR_STATUS:
             merge_failures.append(url)
@@ -1761,7 +2017,8 @@ def _publish_decisions(
     if classify_errors or post_errors:
         if status_updates and not dry_run:
             apply_pr_statuses(payload, status_updates)
-            apply_overall_status(payload, None)
+            apply_component_builds_from_children(payload)
+            strip_legacy_overall_status(payload)
             save_state(path, payload)
         details = classify_errors + post_errors
         lines = [f"  - {u}: {e}" for u, e in details]
@@ -1770,8 +2027,9 @@ def _publish_decisions(
         )
 
     apply_pr_statuses(payload, status_updates)
-    overall_status = compute_overall_status(payload)
-    apply_overall_status(payload, overall_status)
+    apply_component_builds_from_children(payload)
+    strip_legacy_overall_status(payload)
+    overall_status = derive_legacy_overall_status(payload)
     if not dry_run:
         save_state(path, payload)
 

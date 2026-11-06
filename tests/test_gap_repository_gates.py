@@ -12,6 +12,7 @@ from lib.gap_check_selection import (
     FEASIBILITY_SETUP_JOB,
     FeasibilityRun,
     PullRequestContext,
+    TriggerParseError,
     WorkflowJob,
     cel_matches,
     fetch_feasibility_run,
@@ -24,7 +25,9 @@ from lib.gap_pr_gates import decide_repository_pr, RepositoryPullRequest
 from lib.github_check_runs import CheckRun, evaluate_checks, revision_deadline
 from lib.github_cli import GhCommandError
 from lib.pr_status_updater import PRStatusUpdater, PullRequestRef, StatusUpdateResult
-from scripts.gap_pr_monitor import run_monitor
+from scripts.gap_pr_monitor import WAITING_FOR_EARLY_GATE_DESCRIPTION, run_monitor
+
+pytestmark = pytest.mark.usefixtures("pac_cel_binary")
 
 SHA = "a" * 40
 OTHER_SHA = "b" * 40
@@ -104,6 +107,16 @@ def _context(**overrides: Any) -> PullRequestContext:
     )
     base.update(overrides)
     return PullRequestContext(**base)
+
+
+def test_fetch_preserves_cel_metadata() -> None:
+    from scripts.gap_pr_monitor import fetch_repository_pull_request
+    pr = fetch_repository_pull_request(URL, gh_runner=_GitHub())
+    assert pr.source_branch == "feature/build"
+    assert pr.base_sha == OTHER_SHA
+    assert pr.title == "Build update"
+    assert pr.source_url == "https://github.com/fork-owner/eval-hub"
+    assert pr.target_url == "https://github.com/red-hat-data-services/eval-hub"
 
 
 def test_component_label_is_not_used_as_the_check_name() -> None:
@@ -413,6 +426,21 @@ class _Updater:
         )
 
 
+def test_missing_base_sha_is_unresolved_not_live_pr_files(tmp_path):
+    github = _GitHub()
+    def runner(args):
+        raw = github(args)
+        if args[0] == "pr":
+            data = json.loads(raw)
+            data.pop("baseRefOid", None)
+            return json.dumps(data)
+        return raw
+    result, _ = _run(_state(tmp_path), runner)
+    assert result.pending_urls == [URL]
+    assert result.success_urls == []
+    assert any("no pinned base SHA" in report for report in result.reports)
+
+
 class _GitHub:
     def __init__(self) -> None:
         self.files = ["README.md"]
@@ -447,13 +475,21 @@ class _GitHub:
                     "mergeable": self.mergeable,
                     "mergeStateStatus": self.merge_state,
                     "baseRefName": "stable",
+                    "baseRefOid": OTHER_SHA,
+                    "headRefName": "feature/build",
                     "headRefOid": self.head_sha,
+                    "title": "Build update",
+                    "headRepository": {"name": "eval-hub"},
+                    "headRepositoryOwner": {"login": "fork-owner"},
                     "labels": [],
                     "commits": self._listed_commits(),
                     "url": URL,
                 }
             )
         endpoint = args[1]
+        if "component_repo_map.json" in endpoint:
+            mapping = {"eval-hub": {"odh-eval-hub": "rhoai/eval", "odh-core-bff": "rhoai/bff"}}
+            return json.dumps({"encoding": "base64", "content": base64.b64encode(json.dumps(mapping).encode()).decode()})
         if "check-runs" in endpoint:
             if self.fail_checks:
                 raise GhCommandError(["gh", *args], 1, "check API unavailable")
@@ -471,8 +507,15 @@ class _GitHub:
                     },
                 }
             )
+        if "/compare/" in endpoint:
+            assert f"{OTHER_SHA}...{self.head_sha}" in endpoint
+            return json.dumps({
+                "base_commit": {"sha": OTHER_SHA},
+                "merge_base_commit": {"sha": OTHER_SHA},
+                "files": [{"filename": name, "status": "modified"} for name in self.files],
+            })
         if "/pulls/" in endpoint and "/files" in endpoint:
-            return json.dumps([{"filename": name} for name in self.files])
+            raise AssertionError("pinned monitor must not query live PR files")
         if "contents/.tekton/" in endpoint:
             name = endpoint.split("contents/.tekton/", 1)[1].split("?", 1)[0]
             text = self.tekton[name]
@@ -655,10 +698,17 @@ def test_all_current_checks_pass_and_preserve_image_uri(tmp_path: Path) -> None:
     path = _state(tmp_path)
     result, updater = _run(path, github)
     assert result.success_urls == [URL]
-    assert updater.posts[0][1] == "success"
+    assert result.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
     assert updater.posts[0][2]["head_sha"] == SHA
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
     saved = _saved(path)
     assert saved["pull-requests"][0]["pr-status"] == "success"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
+    assert gates["early-gate-build"] == "pending"
+    assert gates["early-gate-test"] == "pending"
     assert saved["pull-requests"][0]["builds"] == [
         {"component": "existing", "image": "quay.io/example/existing:1"}
     ]
@@ -675,7 +725,9 @@ def test_bare_feasibility_job_names_pass(tmp_path: Path) -> None:
     path = _state(tmp_path, builds=[])
     result, updater = _run(path, github)
     assert result.success_urls == [URL]
-    assert updater.posts[0][1] == "success"
+    assert result.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
 
 
 def test_mixed_component_results_fail_the_repository(tmp_path: Path) -> None:
@@ -730,7 +782,9 @@ def test_unfinished_build_stays_pending_past_the_revision_deadline(tmp_path: Pat
     passed, updater = _run(path, github, now=COMMITTER + timedelta(hours=7))
     assert passed.success_urls == [URL]
     assert passed.build_failure_urls == []
-    assert updater.posts[0][1] == "success"
+    assert passed.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
     assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
 
 
@@ -854,8 +908,15 @@ def test_undiscovered_feasibility_workflow_stays_unresolved_until_jobs_are_known
     ]
     passed, updater = _run(path, github)
     assert passed.success_urls == [URL]
-    assert updater.posts[0][1] == "success"
-    assert _saved(path)["pull-requests"][0]["pr-status"] == "success"
+    # Gates SoT: child recovered to success → component-builds success, hold for EG.
+    assert passed.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
+    saved = _saved(path)
+    assert saved["pull-requests"][0]["pr-status"] == "success"
+    assert "overall-status" not in saved
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["component-builds"] == "success"
 
 
 def test_unfinished_workflow_uses_the_revision_deadline(tmp_path: Path) -> None:
@@ -956,7 +1017,10 @@ def test_no_build_change_still_requires_feasibility(tmp_path: Path) -> None:
     path = _state(tmp_path, builds=[])
     result, updater = _run(path, github)
     assert result.success_urls == [URL]
-    assert "no component builds expected" in updater.posts[0][2]["description"]
+    assert result.overall_status == "early-gate-triggered"
+    assert updater.posts[0][1] == "pending"
+    assert updater.posts[0][2]["description"] == WAITING_FOR_EARLY_GATE_DESCRIPTION
+    assert any("no component builds expected" in line for line in result.reports)
 
     github.jobs[1] = _job("main-release-feasibility (rhoai-2.25)", "failure")
     github.check_runs = [*_feasibility_success_payloads()]
@@ -1334,11 +1398,13 @@ def test_current_head_is_published_and_an_unchanged_status_is_skipped(tmp_path: 
         build_app_id=906404,
     )
     assert first.success_urls == [URL]
+    assert first.overall_status == "early-gate-triggered"
     assert first.updated_urls == [URL]
     assert len(posts) == 1
     posted = " ".join(posts[0])
     assert f"statuses/{SHA}" in posted
-    assert "state=success" in posted
+    assert "state=pending" in posted
+    assert "waiting for Early Gate" in posted
 
     second = run_monitor(
         path,
@@ -1352,3 +1418,94 @@ def test_current_head_is_published_and_an_unchanged_status_is_skipped(tmp_path: 
     assert second.skipped_urls == [URL]
     assert second.updated_urls == []
     assert len(posts) == 1
+
+
+@pytest.mark.parametrize("status, conclusion", [("completed", "failure"), ("queued", None), ("missing", None)])
+def test_unmapped_build_does_not_fail_or_block_gap(tmp_path, caplog, status, conclusion):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    github.tekton["unrelated.yaml"] = SECOND_PIPELINE.replace("odh-core-bff", "unmapped-component")
+    github.check_runs.append(_build_check("unmapped-component-on-pull-request-20", conclusion, status=status))
+    if status == "missing":
+        github.check_runs.pop()
+    result, _ = _run(_state(tmp_path), github)
+    assert result.success_urls == [URL]
+    assert result.build_failure_urls == []
+    assert "Ignoring Konflux build" in caplog.text
+
+
+def test_mapped_build_failure_still_blocks_gap(tmp_path):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    github.check_runs = [run for run in github.check_runs if run["app"]["slug"] != "konflux-internal-p02"]
+    github.check_runs.append(_build_check("odh-eval-hub-on-pull-request-65317", "failure"))
+    result, _ = _run(_state(tmp_path), github)
+    assert result.build_failure_urls == [URL]
+
+
+def test_component_from_other_repository_is_ignored(tmp_path):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    def runner(args):
+        if "component_repo_map.json" in args[-1]:
+            mapping = {"eval-hub": {}, "other": {"odh-eval-hub": "rhoai/eval"}}
+            return json.dumps({"encoding": "base64", "content": base64.b64encode(json.dumps(mapping).encode()).decode()})
+        return github(args)
+    github.check_runs.append(_build_check("odh-eval-hub-on-pull-request-65317", "failure", run_id=999))
+    result, _ = _run(_state(tmp_path), runner)
+    assert result.success_urls == [URL]
+
+
+def test_mapping_is_fetched_once_for_multiple_children(tmp_path):
+    path = _state(tmp_path)
+    data = _saved(path)
+    data["pull-requests"].append({**data["pull-requests"][0], "pr-url": URL.replace("/20", "/21")})
+    path.write_text(json.dumps(data))
+    github = _GitHub()
+    calls = []
+    def runner(args):
+        if "component_repo_map.json" in args[-1]:
+            calls.append(args)
+        return github(args)
+    _run(path, runner)
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize("response", ["not json", "{}", None])
+def test_mapping_failure_leaves_state_and_statuses_untouched(tmp_path, response):
+    from scripts.gap_pr_monitor import GapPrMonitorError
+    path = _state(tmp_path)
+    before = path.read_bytes()
+    def runner(args):
+        if response is None:
+            raise GhCommandError(["gh", *args], 1, "unavailable")
+        return response
+    def factory(**kwargs):
+        pytest.fail("must not create a status updater when mapping retrieval fails")
+    with pytest.raises(GapPrMonitorError, match="component repository mapping"):
+        run_monitor(path, gh_runner=runner, updater_factory=factory, now=NOW)
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("label", ["", "    appstudio.openshift.io/component: null", '    appstudio.openshift.io/component: ""', '    appstudio.openshift.io/component: "   "', "    appstudio.openshift.io/component: 123"])
+@pytest.mark.parametrize("allowed", [None, frozenset(), frozenset({"odh-core-bff"})])
+def test_selected_pipeline_requires_component_label(label, allowed):
+    document = SECOND_PIPELINE.replace("    appstudio.openshift.io/component: odh-core-bff", label)
+    with pytest.raises(TriggerParseError, match="nonempty appstudio.openshift.io/component label"):
+        select_build_checks([document], _context(), app_slug="konflux-internal-p02", allowed_components=allowed)
+
+
+def test_missing_component_label_cannot_pass_gap(tmp_path):
+    github = _GitHub()
+    github.check_runs = _passing_check_runs()
+    github.tekton["unlabeled.yaml"] = SECOND_PIPELINE.replace("    appstudio.openshift.io/component: odh-core-bff", "")
+    result, _ = _run(_state(tmp_path), github)
+    assert result.pending_urls == [URL]
+    assert result.success_urls == []
+    assert result.overall_status is None
+    assert any("nonempty appstudio.openshift.io/component label" in report for report in result.reports)
+
+
+def test_unselected_pipeline_does_not_require_component_label():
+    document = LABEL_PIPELINE.replace("    appstudio.openshift.io/component: manual-component", "")
+    assert select_build_checks([document], _context(), app_slug="konflux-internal-p02", allowed_components=frozenset()) == []

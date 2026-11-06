@@ -97,7 +97,7 @@ def plan_children(pipelines, config, branch, cli_vars=None):
             if len({p["name"] for p in params}) != len(params):
                 raise ValueError(f"duplicate parent params: {parent_path}")
             overlay = resolve_overlay(config.config_dir, tmpl.file, prefix,
-                                      parent.get("metadata", {}).get("labels", {}).get("appstudio.openshift.io/component"))
+                                      (parent.get("metadata", {}).get("labels") or {}).get("appstudio.openshift.io/component"))
             errors = []
             result = render_and_merge(config.config_dir, tmpl.file, seed, path.name, branch,
                                       parent_data=parent, cli_vars=cli_vars, mode="fix", errors=errors,

@@ -7,7 +7,7 @@ import os
 import shutil
 import subprocess
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable, Sequence
 
@@ -15,10 +15,14 @@ from lib.git_utils import authenticated_clone_url
 from lib.state_file import (
     DEFAULT_LEADER_REPO,
     PromoterState,
+    StatePullRequest,
     find_existing_state_path,
     state_path_for_trigger,
     write_state_file,
+    load_state_file,
 )
+
+from lib.creator_outcomes import ERROR_OUTCOMES, PR, merge_outcomes
 
 GAP_LABEL = "gated-artifacts-promoter"
 LEADER_BRANCH_PREFIX = "gap-leader"
@@ -236,27 +240,6 @@ class LeaderPRManager:
             mutate=True,
         )
 
-    def close_previous_leader_prs(self, *, keep_number: int | None = None) -> list[int]:
-        """Close superseded GAP Leader PRs.
-
-        ``keep_number``, when set, is left open (the current run's Leader PR).
-        """
-        closed: list[int] = []
-        for pull in self.list_open_prs_by_label(GAP_LABEL):
-            number = int(pull["number"])
-            if keep_number is not None and number == keep_number:
-                continue
-            self.close_pr(
-                number,
-                comment=(
-                    "Closing this Leader PR because a newer Gated Artifacts "
-                    "Promoter run is opening a replacement."
-                ),
-            )
-            closed.append(number)
-            print(f"Closed previous Leader PR #{number} ({pull.get('url')})")
-        return closed
-
     def create_or_update(
         self,
         state: PromoterState,
@@ -278,12 +261,6 @@ class LeaderPRManager:
         preview_state_rel = state_path_for_trigger(trigger_id)
 
         if self.dry_run:
-            if existing is None:
-                for pull in self.list_open_prs_by_label(GAP_LABEL):
-                    print(
-                        f"[dry-run] would close previous Leader PR "
-                        f"#{pull['number']} ({pull.get('url')})"
-                    )
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=preview_state_rel
             )
@@ -320,11 +297,8 @@ class LeaderPRManager:
                 dry_run=True,
             )
 
-        # New run: close prior open Leader PRs before opening the replacement.
-        # Each trigger has a unique head branch, so deleting a prior branch
-        # cannot affect this PR.
-        if existing is None:
-            self.close_previous_leader_prs()
+        # Other triggers retain their PRs and branches until their own monitors
+        # conclude and merge their records. A new daily run must not erase them.
 
         workdir = Path(tempfile.mkdtemp(prefix="gap-leader-"))
         try:
@@ -364,6 +338,39 @@ class LeaderPRManager:
             else:
                 self.run_git(["checkout", "-B", branch], cwd=workdir, mutate=True)
                 state_rel = state_path_for_trigger(trigger_id)
+
+            if existing and (workdir / state_rel).exists():
+                previous_state = load_state_file(workdir / state_rel)
+                previous_children = {
+                    child["pr-url"]: child for child in previous_state["pull-requests"]
+                }
+                # Creator retries can return the same PR without new build data.
+                # Preserve its receipt, but never transfer evidence to another PR.
+                state.pull_requests[:] = [
+                    replace(child, build_observations=previous_children[child.pr_url].get("build-observations"))
+                    if child.build_observations is None and child.pr_url in previous_children
+                    else child
+                    for child in state.pull_requests
+                ]
+                attempted = {item["repo"].lower() for item in state.creator_outcomes}
+                failed_without_pr = {
+                    item["repo"].lower() for item in state.creator_outcomes
+                    if item["outcome"] in ERROR_OUTCOMES and not item.get("pr-url")
+                }
+                known_pr_urls = {child.pr_url for child in state.pull_requests}
+                if attempted:
+                    # Keep untouched children and failed retries with no fresh PR
+                    # identity. Successful no-change attempts still clear old children.
+                    for index, child in enumerate(previous_state["pull-requests"]):
+                        match = PR.fullmatch(child["pr-url"])
+                        if (match and child["pr-url"] not in known_pr_urls and (
+                                match[1].lower() not in attempted
+                                or match[1].lower() in failed_without_pr)):
+                            state.pull_requests.append(StatePullRequest.from_mapping(child, index=index))
+                            known_pr_urls.add(child["pr-url"])
+                state.creator_outcomes = merge_outcomes(
+                    previous_state.get("creator-outcomes", []), state.creator_outcomes
+                )
 
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=state_rel
@@ -455,6 +462,16 @@ class LeaderPRManager:
             )
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
+
+    def publish_creator_outcomes(self, result: LeaderPRResult, state: PromoterState) -> None:
+        """Use the reporter's existing summary marker, never a second comment."""
+        if not result.pr_url:
+            return
+        from scripts.gap_failure_reporter import publish_creator_outcomes
+        publish_creator_outcomes(
+            result.pr_url, state.creator_outcomes,
+            dry_run=self.dry_run, gh_runner=lambda args: self.run_gh(args),
+        )
 
     def _default_body(
         self,

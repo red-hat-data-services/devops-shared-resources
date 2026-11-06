@@ -284,7 +284,9 @@ def test_run_promoter_collects_prs(tmp_path: Path) -> None:
     assert result.state_prs[0].pr_status == PR_STATUS_NEW
     state_arg = leader.create_or_update.call_args.args[0]
     assert state_arg.pull_requests[0].pr_url.endswith("/pull/2")
-    assert state_arg.to_dict() == {
+    assert state_arg.creator_outcomes[0]["outcome"] == "manual-merge"
+    assert state_arg.creator_outcomes[0]["pr-url"].endswith("/pull/2")
+    assert {"pull-requests": state_arg.to_dict()["pull-requests"]} == {
         "pull-requests": [
             {
                 "repo": "kserve",

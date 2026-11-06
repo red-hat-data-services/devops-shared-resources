@@ -8,12 +8,15 @@ return ``ExpectedCheck`` values; they do not interpret check conclusions.
 from __future__ import annotations
 
 import base64
+import logging
 import os
 import re
 from dataclasses import dataclass
-from typing import Any, Callable, Sequence
+from typing import Any, Sequence
 
 import yaml
+
+from lib.pac_cel import TriggerParseError, evaluate_expressions
 
 from lib.github_check_runs import (
     CheckQueryError,
@@ -23,6 +26,8 @@ from lib.github_check_runs import (
     github_api_json,
 )
 from lib.github_cli import GhCommandError
+from lib.github_diff import fetch_comparison_files
+from lib.gap_component_map import component_is_allowed
 
 PAC_PREFIX = "pipelinesascode.tekton.dev/"
 COMPONENT_LABEL = "appstudio.openshift.io/component"
@@ -38,15 +43,7 @@ FEASIBILITY_WORKFLOW_FILE = "main-release-feasibility.yml"
 FEASIBILITY_SETUP_JOB = "Select release sync inputs"
 FEASIBILITY_APP_SLUG = "github-actions"
 
-_TOKEN_RE = re.compile(
-    r"""\s+|(?P<string>'(?:\\.|[^'])*'|"(?:\\.|[^"])*")"""
-    r"""|(?P<op>==|&&|\|\|)|(?P<sym>[().,!])|(?P<ident>[A-Za-z_][A-Za-z0-9_]*)"""
-    r"""|(?P<bad>\S)"""
-)
-
-
-class TriggerParseError(ValueError):
-    """A PipelineRun trigger could not be evaluated."""
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -58,6 +55,30 @@ class PullRequestContext:
     head_sha: str
     labels: frozenset[str]
     changed_files: tuple[str, ...]
+    source_branch: str | None = None
+    base_sha: str | None = None
+    title: str | None = None
+    source_url: str | None = None
+    target_url: str | None = None
+    file_collections: dict[str, tuple[str, ...]] | None = None
+
+    def cel_variables(self) -> dict[str, Any]:
+        # This is a PR-state snapshot, not a reconstructed webhook. In
+        # particular do not synthesize body, headers, or an event_type.
+        values: dict[str, Any] = {
+            "event": "pull_request",
+            "files": {"all": list(self.changed_files)},
+        }
+        for name, value in (
+            ("target_branch", self.base_ref), ("source_branch", self.source_branch),
+            ("event_title", self.title), ("source_url", self.source_url),
+            ("target_url", self.target_url),
+        ):
+            if value is not None:
+                values[name] = value
+        if self.file_collections is not None:
+            values["files"].update({k: list(v) for k, v in self.file_collections.items()})
+        return values
 
 
 @dataclass(frozen=True)
@@ -130,16 +151,32 @@ def select_build_checks(
     *,
     app_slug: str,
     app_id: int | None = None,
+    allowed_components: frozenset[str] | None = None,
 ) -> list[ExpectedCheck]:
     """Return one expected check per PipelineRun this pull request will run.
 
     A repository with several components produces several checks. Pipelines
-    that the trigger configuration will not run are omitted. That omission is
-    the only no-build signal; a missing GitHub check is not.
+    that the trigger configuration will not run or the repository allowlist
+    excludes are omitted. A missing GitHub check is never a no-build signal.
+    None preserves unfiltered selection for callers without an allowlist;
+    the GAP monitor always supplies a repository-scoped set. Every selected
+    PipelineRun must declare a nonempty component label; names are not inferred.
     """
     checks: list[ExpectedCheck] = []
-    for pipeline in load_pipelineruns(documents):
-        if not pipeline_is_expected(pipeline, context):
+    pipelines = load_pipelineruns(documents)
+    expressions: list[str] = []
+    for pipeline in pipelines:
+        metadata = pipeline.get("metadata")
+        annotations = metadata.get("annotations") if isinstance(metadata, dict) else None
+        expression = annotations.get(f"{PAC_PREFIX}on-cel-expression") if isinstance(annotations, dict) else None
+        if isinstance(expression, str) and expression.strip():
+            expressions.append(expression)
+    expressions = list(dict.fromkeys(expressions))
+    cel_results = dict(zip(
+        expressions, evaluate_expressions(expressions, context.cel_variables()),
+    ))
+    for pipeline in pipelines:
+        if not pipeline_is_expected(pipeline, context, cel_results=cel_results):
             continue
         metadata = pipeline.get("metadata") if isinstance(pipeline.get("metadata"), dict) else {}
         raw_name = str(metadata.get("generateName") or metadata.get("name") or "").strip()
@@ -150,7 +187,18 @@ def select_build_checks(
         # name still comes from metadata.name.
         pipeline_name = resolved_pipeline_name(raw_name, context.number)
         labels = metadata.get("labels") if isinstance(metadata.get("labels"), dict) else {}
-        component = str(labels.get(COMPONENT_LABEL) or pipeline_name).strip() or pipeline_name
+        component = labels.get(COMPONENT_LABEL)
+        if not isinstance(component, str) or not component.strip():
+            raise TriggerParseError(
+                f"PipelineRun {pipeline_name} is missing a nonempty {COMPONENT_LABEL} label"
+            )
+        component = component.strip()
+        if allowed_components is not None and not component_is_allowed(component, allowed_components):
+            logging.getLogger(__name__).warning(
+                "Ignoring Konflux build %s (component %s): not mapped for this repository",
+                pipeline_name, component,
+            )
+            continue
         checks.append(
             ExpectedCheck(
                 key=component,
@@ -162,7 +210,10 @@ def select_build_checks(
     return checks
 
 
-def pipeline_is_expected(pipeline: dict[str, Any], context: PullRequestContext) -> bool:
+def pipeline_is_expected(
+    pipeline: dict[str, Any], context: PullRequestContext, *,
+    cel_results: dict[str, bool | TriggerParseError] | None = None,
+) -> bool:
     """Return whether Pipelines-as-Code will run this PipelineRun.
 
     ``on-cel-expression`` takes precedence over ``on-event``, ``on-label``, and
@@ -170,8 +221,9 @@ def pipeline_is_expected(pipeline: dict[str, Any], context: PullRequestContext) 
     as a match so an unrecognized trigger cannot become a no-build pass.
     """
     try:
-        return _pipeline_is_expected(pipeline, context)
-    except TriggerParseError:
+        return _pipeline_is_expected(pipeline, context, cel_results=cel_results)
+    except TriggerParseError as exc:
+        logger.warning("Cannot evaluate PipelineRun trigger; retaining expected check: %s", exc)
         return True
 
 
@@ -239,6 +291,16 @@ def fetch_tekton_documents(owner: str, repo: str, sha: str, runner: GhRunner) ->
 
 
 def fetch_changed_files(owner: str, repo: str, number: int, runner: GhRunner) -> tuple[str, ...]:
+    return fetch_file_collections(owner, repo, number, runner)["all"]
+
+
+def fetch_file_collections(
+    owner: str, repo: str, number: int, runner: GhRunner,
+    *, base_sha: str | None = None, head_sha: str | None = None,
+) -> dict[str, tuple[str, ...]]:
+    """Collect file statuses; pinned snapshots never use the live PR endpoint."""
+    if base_sha is not None or head_sha is not None:
+        return fetch_comparison_files(owner, repo, base_sha, head_sha, runner)
     endpoint = f"repos/{owner}/{repo}/pulls/{number}/files"
     try:
         payload = collect_github_pages(runner, endpoint, None, 100)
@@ -246,12 +308,28 @@ def fetch_changed_files(owner: str, repo: str, number: int, runner: GhRunner) ->
         raise CheckQueryError(
             f"failed to list files for {owner}/{repo}#{number}: {exc}"
         ) from exc
-    names: list[str] = []
+    collections: dict[str, list[str]] = {
+        name: [] for name in ("all", "added", "deleted", "modified", "renamed")
+    }
+    statuses = {"added": "added", "removed": "deleted", "modified": "modified", "renamed": "renamed"}
+    complete_statuses = True
     for item in payload:
         if not isinstance(item, dict) or not item.get("filename"):
             raise CheckQueryError(f"pull file listing for {owner}/{repo}#{number} is incomplete")
-        names.append(str(item["filename"]))
-    return tuple(names)
+        name = str(item["filename"])
+        collections["all"].append(name)
+        status = item.get("status")
+        if status in statuses:
+            collections[statuses[status]].append(name)
+        elif not isinstance(status, str):
+            complete_statuses = False
+    # GitHub caps this endpoint at 3000 files. Never trust a possibly
+    # truncated response as evidence that a path-scoped pipeline can be skipped.
+    if len(collections["all"]) >= 3000:
+        raise CheckQueryError("PR file listing may be truncated at GitHub's 3000-file limit")
+    if not complete_statuses:
+        return {"all": tuple(collections["all"])}
+    return {key: tuple(names) for key, names in collections.items()}
 
 
 def _workflow_execution_key(run: dict[str, Any]) -> tuple[str, int]:
@@ -354,12 +432,20 @@ def fetch_feasibility_run(owner: str, repo: str, sha: str, runner: GhRunner) -> 
     )
 
 
-def _pipeline_is_expected(pipeline: dict[str, Any], context: PullRequestContext) -> bool:
+def _pipeline_is_expected(
+    pipeline: dict[str, Any], context: PullRequestContext, *,
+    cel_results: dict[str, bool | TriggerParseError] | None = None,
+) -> bool:
     metadata = pipeline.get("metadata") if isinstance(pipeline.get("metadata"), dict) else {}
     annotations = metadata.get("annotations") if isinstance(metadata.get("annotations"), dict) else {}
     cel = annotations.get(f"{PAC_PREFIX}on-cel-expression")
     if isinstance(cel, str) and cel.strip():
-        return cel_matches(cel, context)
+        if cel_results is None:
+            return cel_matches(cel, context)
+        result = cel_results[cel]
+        if isinstance(result, TriggerParseError):
+            raise result
+        return result
 
     on_event = annotations.get(f"{PAC_PREFIX}on-event")
     on_target = annotations.get(f"{PAC_PREFIX}on-target-branch")
@@ -391,12 +477,10 @@ def _pipeline_is_expected(pipeline: dict[str, Any], context: PullRequestContext)
 
 
 def cel_matches(expression: str, context: PullRequestContext) -> bool:
-    tokens = _tokenize(expression)
-    parser = _CelParser(tokens, context)
-    value = parser.parse_or()
-    if parser.peek() is not None:
-        raise TriggerParseError(f"unexpected token in CEL expression: {parser.peek()}")
-    return value
+    result = evaluate_expressions([expression], context.cel_variables())[0]
+    if isinstance(result, TriggerParseError):
+        raise result
+    return result
 
 
 def _annotation_matches(raw: str, candidates: Sequence[str], *, branch: bool) -> bool:
@@ -459,170 +543,6 @@ def _glob_to_regex(pattern: str) -> str:
             index += 1
     parts.append("$")
     return "".join(parts)
-
-
-def _tokenize(expression: str) -> list[tuple[str, str]]:
-    tokens: list[tuple[str, str]] = []
-    for match in _TOKEN_RE.finditer(expression):
-        if match.group("bad"):
-            raise TriggerParseError(f"unsupported CEL token {match.group('bad')!r}")
-        if match.group("string") is not None:
-            tokens.append(("string", match.group("string")))
-        elif match.group("op") is not None:
-            tokens.append(("op", match.group("op")))
-        elif match.group("sym") is not None:
-            tokens.append(("sym", match.group("sym")))
-        elif match.group("ident") is not None:
-            tokens.append(("ident", match.group("ident")))
-    return tokens
-
-
-class _CelParser:
-    def __init__(self, tokens: list[tuple[str, str]], context: PullRequestContext) -> None:
-        self.tokens = tokens
-        self.context = context
-        self.index = 0
-
-    def peek(self) -> tuple[str, str] | None:
-        if self.index >= len(self.tokens):
-            return None
-        return self.tokens[self.index]
-
-    def pop(self) -> tuple[str, str]:
-        token = self.peek()
-        if token is None:
-            raise TriggerParseError("unexpected end of CEL expression")
-        self.index += 1
-        return token
-
-    def expect(self, kind: str, value: str) -> None:
-        token = self.pop()
-        if token != (kind, value):
-            raise TriggerParseError(f"expected {value}, got {token[1]}")
-
-    def parse_or(self) -> bool:
-        value = self.parse_and()
-        while self.peek() == ("op", "||"):
-            self.pop()
-            value = self.parse_and() or value
-        return value
-
-    def parse_and(self) -> bool:
-        value = self.parse_unary()
-        while self.peek() == ("op", "&&"):
-            self.pop()
-            value = self.parse_unary() and value
-        return value
-
-    def parse_unary(self) -> bool:
-        if self.peek() == ("sym", "!"):
-            self.pop()
-            return not self.parse_unary()
-        return self.parse_primary()
-
-    def parse_primary(self) -> bool:
-        if self.peek() == ("sym", "("):
-            self.pop()
-            value = self.parse_or()
-            self.expect("sym", ")")
-            return value
-        token = self.peek()
-        if token is None:
-            raise TriggerParseError("unexpected end of CEL expression")
-        if token[0] == "string":
-            return self._parse_path_changed()
-        if token == ("ident", "files"):
-            return self._parse_files()
-        if token[0] == "ident":
-            return self._parse_comparison()
-        raise TriggerParseError(f"unsupported CEL expression starting at {token[1]}")
-
-    def _parse_path_changed(self) -> bool:
-        pattern = _cel_string(self.pop()[1])
-        self.expect("sym", ".")
-        self.expect("ident", "pathChanged")
-        self.expect("sym", "(")
-        self.expect("sym", ")")
-        return _path_changed(pattern, self.context.changed_files)
-
-    def _parse_comparison(self) -> bool:
-        name = self.pop()[1]
-        if self.peek() == ("sym", "."):
-            self.expect("sym", ".")
-            self.expect("ident", "matches")
-            self.expect("sym", "(")
-            pattern = _cel_string(self.pop()[1])
-            self.expect("sym", ")")
-            if name != "target_branch":
-                raise TriggerParseError(f"unsupported .matches() receiver {name}")
-            return re.search(pattern, self.context.base_ref) is not None
-        self.expect("op", "==")
-        raw = self.pop()
-        if raw[0] != "string":
-            raise TriggerParseError("CEL comparison must be against a string")
-        value = _cel_string(raw[1])
-        if name == "event":
-            return value == "pull_request"
-        if name == "target_branch":
-            return value == self.context.base_ref
-        raise TriggerParseError(f"unsupported CEL comparison on {name}")
-
-    def _parse_files(self) -> bool:
-        """Evaluate ``files.<collection>.<macro>(variable, predicate)``.
-
-        ``files.all`` is the changed-file collection. ``.exists`` is CEL's
-        existential macro and matches when any file satisfies the predicate.
-        ``.all`` is the universal macro and matches only when every file does,
-        including an empty collection.
-        """
-        self.expect("ident", "files")
-        self.expect("sym", ".")
-        collection = self.pop()
-        if collection != ("ident", "all"):
-            raise TriggerParseError("unsupported files collection")
-        self.expect("sym", ".")
-        macro = self.pop()
-        if macro[0] != "ident" or macro[1] not in {"exists", "all"}:
-            raise TriggerParseError("unsupported files macro")
-        self.expect("sym", "(")
-        variable = self.pop()
-        if variable[0] != "ident":
-            raise TriggerParseError("files macro is missing a variable")
-        self.expect("sym", ",")
-        predicate = self._parse_file_predicate(variable[1])
-        self.expect("sym", ")")
-        results = [predicate(path) for path in self.context.changed_files]
-        if macro[1] == "all":
-            return all(results)
-        return any(results)
-
-    def _parse_file_predicate(self, variable: str) -> Callable[[str], bool]:
-        negate = False
-        if self.peek() == ("sym", "!"):
-            self.pop()
-            negate = True
-        name = self.pop()
-        if name != ("ident", variable):
-            raise TriggerParseError("files predicate must use its bound variable")
-        self.expect("sym", ".")
-        self.expect("ident", "matches")
-        self.expect("sym", "(")
-        pattern = _cel_string(self.pop()[1])
-        self.expect("sym", ")")
-
-        def matches(path: str) -> bool:
-            found = re.search(pattern, path) is not None
-            return (not found) if negate else found
-
-        return matches
-
-
-def _cel_string(token: str) -> str:
-    body = token[1:-1]
-    try:
-        return body.encode("utf-8").decode("unicode_escape")
-    except UnicodeError as exc:
-        raise TriggerParseError(f"invalid CEL string {token}") from exc
 
 
 def _read_contents_file(

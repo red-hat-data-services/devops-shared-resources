@@ -123,7 +123,7 @@ jobs:
           edit-mode: replace
           body: |
             <!-- post-codefreeze-gatekeeper -->
-            ## Post-Codefreeze Gatekeeper ${{ steps.validate.outputs.pass == 'true' && '— PASSED' || '— FAILED' }} _(evaluation)_
+            ## Post-Codefreeze Gatekeeper ${{ steps.validate.outputs.pass == 'true' && '— PASSED' || '— FAILED' }}
 
             **Target branch:** `${{ github.event.pull_request.base.ref }}`
             **Required Jira version:** `${{ steps.branch-info.outputs.jira_version }}`

@@ -38,7 +38,7 @@ layout RHOAIENG-93564).
 
 - `scripts/gap_pr_monitor.py` — CLI (uses `lib/pr_status_updater.py`)
 - `docs/gap-pr-monitor/README.md` — usage
-- Workflow wrapper: `gated-artifacts-promoter` (`.github/workflows/gap-pr-monitor.yml`)
+- Workflow wrapper: `gated-artifacts-promoter` (`.github/workflows/gap-pr-monitor-trigger.yml`), calling `gap-pr-monitor.yml@main` for the internal-runner job
 
 ## Repository auto-merge manager
 

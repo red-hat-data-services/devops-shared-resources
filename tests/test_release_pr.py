@@ -419,3 +419,33 @@ def test_generate_rejects_empty_mapping(setup):
     write(config / "config.yaml", data)
     with pytest.raises(ValueError, match="requires filename"):
         load_config(str(config))
+
+
+@pytest.mark.parametrize("parent_labels,child_labels", [(None, {}), ({}, None), (None, None)])
+def test_component_label_match_null_labels(parent_labels, child_labels):
+    """Missing component labels allow the next matcher rather than crashing."""
+    from lib.tekton_matchers import component_label_match
+    assert not component_label_match(
+        {"metadata": {"labels": parent_labels}},
+        {"metadata": {"labels": child_labels}},
+    )
+
+
+@pytest.mark.parametrize("existing_child", [False, True])
+def test_generate_null_labels_validate_fix_idempotence(setup, existing_child):
+    """Null parent/child labels survive planning/rendering and matcher fallback."""
+    root, directory, config, push, path = setup
+    policy = YAML(typ="safe").load((config / "config.yaml").read_text())
+    policy["templates"][1]["parent"]["match_fn"].insert(0, "component_label_match")
+    write(config / "config.yaml", policy)
+    push["metadata"]["labels"] = None
+    write(path, push)
+    if existing_child:
+        child = copy.deepcopy(push)
+        child["metadata"]["name"] = "widget-on-pull-request"
+        write(directory / "widget-pull-request.yaml", child)
+    before = path.read_bytes()
+    assert fix(root, config)[0]
+    assert not any(row["errors"] for row in validate(root, config).values())
+    assert not fix(root, config)[0]
+    assert path.read_bytes() == before

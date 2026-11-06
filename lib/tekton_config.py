@@ -55,6 +55,9 @@ class PipelineConfig:
     component_aliases: dict[str, str] = None
     parent_ref: str | None = None
     tekton_layout: str = "flat"
+    selection_template: str | None = None
+    context_paths: tuple[str, ...] = ()
+    publication_branches: tuple[str, ...] | None = None
 
     def get_template(self, name: str) -> TemplateConfig | None:
         for t in self.templates:
@@ -214,6 +217,35 @@ def load_config(config_dir: str, config_file: str | None = None) -> PipelineConf
         parent_ref=parent_ref,
         tekton_layout=tekton_layout,
     )
+    selection = raw.get("selection_template")
+    if selection is not None:
+        if (not isinstance(selection, str) or not selection or Path(selection).is_absolute()
+                or ".." in Path(selection).parts or Path(selection).as_posix() != selection):
+            raise ValueError("selection_template must be a contained relative file")
+        path = Path(config_dir).resolve() / selection
+        if not path.is_file() or path.resolve() != path.absolute():
+            raise ValueError("selection_template must not traverse symlinks")
+    paths = raw.get("context_paths", [])
+    if (not isinstance(paths, list) or any(not isinstance(p, str) or not p or Path(p).is_absolute()
+            or ".." in Path(p).parts or Path(p).as_posix() != p for p in paths)
+            or len(set(paths)) != len(paths)):
+        raise ValueError("context_paths must be unique contained relative paths")
+    if "publication_branches" in raw:
+        import re
+        patterns = raw["publication_branches"]
+        if (not isinstance(patterns, list) or not patterns
+                or any(not isinstance(p, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*\*?", p)
+                       or ".." in p or "//" in p or p.rstrip("*").endswith(".") for p in patterns)
+                or len(set(patterns)) != len(patterns)):
+            raise ValueError("publication_branches must be a nonempty unique list of exact names or literal prefixes with one trailing '*'")
+        import subprocess
+        for pattern in patterns:
+            example = pattern[:-1] + "x" if pattern.endswith("*") else pattern
+            if subprocess.run(["git", "check-ref-format", f"refs/heads/{example}"], capture_output=True).returncode:
+                raise ValueError("publication_branches contains an invalid branch name or prefix")
+        config.publication_branches = tuple(patterns)
+    config.selection_template = selection
+    config.context_paths = tuple(paths)
     _validate_config(config)
     return config
 

@@ -45,6 +45,12 @@ def parent_matcher(fn):
 
 
 @pipeline_matcher
+def is_pipeline_run(name, data):
+    """Match every PipelineRun, independently of event, namespace, or naming."""
+    return isinstance(data, dict) and data.get("kind") == "PipelineRun"
+
+
+@pipeline_matcher
 def is_push_pipeline(name, data):
     """Match push pipelines by metadata.name ending with '-on-push'."""
     return name.endswith("-on-push")
@@ -97,8 +103,8 @@ def is_scheduled_pipeline(name, data):
 def component_label_match(parent_data, child_data):
     """Match exact nonempty component labels independently of metadata name length."""
     key = "appstudio.openshift.io/component"
-    parent = parent_data.get("metadata", {}).get("labels", {}).get(key)
-    child = child_data.get("metadata", {}).get("labels", {}).get(key)
+    parent = (parent_data.get("metadata", {}).get("labels") or {}).get(key)
+    child = (child_data.get("metadata", {}).get("labels") or {}).get(key)
     return isinstance(parent, str) and bool(parent) and parent == child
 
 

@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+from lib.creator_outcomes import validate_outcomes
+
 DEFAULT_LEADER_REPO = "red-hat-data-services/gated-artifacts-promoter"
 
 # Stage 1 initial status written by the PR sync workflow (RHOAIENG-93524).
@@ -75,6 +77,7 @@ class StatePullRequest:
     pr_url: str
     pr_status: str = PR_STATUS_NEW
     builds: tuple[StateBuild, ...] = ()
+    build_observations: dict[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], *, index: int) -> "StatePullRequest":
@@ -113,15 +116,25 @@ class StatePullRequest:
                 for i, item in enumerate(raw_builds)
             )
 
-        return cls(repo=repo, pr_url=pr_url, pr_status=pr_status, builds=builds)
+        observations = data.get("build-observations")
+        if observations is not None and (
+            not isinstance(observations, dict) or observations.get("source") != "konflux"
+            or not isinstance(observations.get("runs"), list)
+        ):
+            raise StateFileError(f"{path}.build-observations must be Konflux evidence")
+        return cls(repo=repo, pr_url=pr_url, pr_status=pr_status, builds=builds,
+                   build_observations=observations)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        result = {
             "repo": self.repo,
             "pr-url": self.pr_url,
             "pr-status": self.pr_status,
             "builds": [build.to_dict() for build in self.builds],
         }
+        if self.build_observations is not None:
+            result["build-observations"] = self.build_observations
+        return result
 
 
 @dataclass
@@ -131,11 +144,14 @@ class PromoterState:
     pull_requests: list[StatePullRequest] = field(default_factory=list)
     # Set when the GAP run has concluded; omitted from JSON while unset.
     overall_status: str | None = None
+    creator_outcomes: list[dict[str, str]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {
             "pull-requests": [pr.to_dict() for pr in self.pull_requests]
         }
+        if self.creator_outcomes:
+            payload["creator-outcomes"] = validate_outcomes(self.creator_outcomes)
         if self.overall_status is not None:
             payload["overall-status"] = self.overall_status
         return payload
@@ -199,6 +215,7 @@ def build_state(
     pull_requests: list[StatePullRequest] | list[dict[str, Any]] | None = None,
     prs: list[StatePullRequest] | list[dict[str, Any]] | None = None,
     overall_status: str | None = None,
+    creator_outcomes: list[dict[str, str]] | None = None,
 ) -> PromoterState:
     """Build a validated PromoterState from PR records.
 
@@ -229,6 +246,7 @@ def build_state(
     state = PromoterState(
         pull_requests=normalized,
         overall_status=_normalize_overall_status(overall_status),
+        creator_outcomes=validate_outcomes(creator_outcomes or []),
     )
     validate_state(state.to_dict())
     return state
@@ -256,6 +274,11 @@ def validate_state(data: Any) -> dict[str, Any]:
     normalized: dict[str, Any] = {
         "pull-requests": [pr.to_dict() for pr in prs]
     }
+    if "creator-outcomes" in data:
+        try:
+            normalized["creator-outcomes"] = validate_outcomes(data["creator-outcomes"])
+        except ValueError as exc:
+            raise StateFileError(str(exc)) from exc
     # Accept either wire key or pythonic alias from callers.
     overall = _normalize_overall_status(
         data.get("overall-status", data.get("overall_status"))

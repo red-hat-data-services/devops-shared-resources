@@ -133,9 +133,29 @@ some-optional-annotation: "{{ _? }}"
 
 Fields defined in the template override the existing file. Fields in the existing file but not in the template are preserved (component-specific params like `dockerfile`, `prefetch-input`, `build-platforms`, etc.).
 
-For params (named lists), merge is by name: template params override matching existing params, non-matching existing params are kept in their original position, new template params are appended.
+For params and steps (lists keyed by `name`), merge is by name. For `taskRunSpecs`, merge is by `pipelineTaskName`. Template entries update matching existing entries, unrelated entries remain in their original positions, and new entries are appended. Nested self-references (`_`) resolve within the matching task and step, not by list position.
+
+`ABSENT` fields are omitted even when their containing task or step override is newly added. An omitted field does not necessarily remove a default from a resolved Task: resource-override precedence and the admitted pod must still be checked before rollout.
 
 When `inherit_params: true` is set in the config, all parent params not explicitly declared in the template are automatically inherited. Semantically identical values with different formatting are preserved as-is (no cosmetic normalization).
+
+## Optional per-file selection
+
+Configs may declare `selection_template: selection.json.j2` and a list of fixed
+repository-relative `context_paths`. The ordinary validator/fixer uses this
+Jinja sidecar before rendering a file. It must emit exactly
+`{"status":"applicable|skipped|manual|unresolved","reason":"..."}`; only
+`applicable` files are rendered/fixed. Other statuses are reported with their
+reason. Existing configs without selection retain their current behavior.
+
+The sidecar receives ordinary template variables and detached
+`context = {branch, documents}`. Each declared context path maps to parsed YAML
+or `None`. It can use the generic `unique_item` filter for duplicate-safe keyed
+lookup and `fail(message)` for explicit errors. Context cannot be overwritten
+by `--var`. See [strict reconciliation](../tekton-reconciliation.md) for JSON
+limits, read-only context/provenance, optional post-merge guards and strict
+localized output. The standalone CLI keeps its existing whole-document writer;
+strict reconciliation invokes the same fix engine with a different writer profile.
 
 ## Config File
 
@@ -192,6 +212,7 @@ Defined in `lib/tekton_matchers.py` with `@pipeline_matcher`. Each receives `(na
 
 | Matcher | Description |
 |---------|-------------|
+| `is_pipeline_run` | Every `kind: PipelineRun`, independent of event/name/namespace (use in dedicated template sets) |
 | `is_push_pipeline` | Name ends with `-on-push` |
 | `is_push_pipeline_by_cel` | CEL expression contains `event == "push"` (for repos where push PLRs don't use `-on-push` naming) |
 | `is_pr_pipeline` | Annotation contains `pull_request` or name contains `pull-request` |

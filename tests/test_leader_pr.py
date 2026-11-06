@@ -140,7 +140,7 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
                 / "2026-09-20_gap-existing"
             )
             existing.mkdir(parents=True, exist_ok=True)
-            (existing / "state.json").write_text("{}", encoding="utf-8")
+            (existing / "state.json").write_text('{"pull-requests": []}', encoding="utf-8")
             return _completed("")
         if command[0] == "git" and command[1] == "status":
             return _completed("M  GAP Leaders/2026-09-20_gap-existing/state.json\n")
@@ -168,8 +168,8 @@ def test_update_existing_leader_pr(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     assert "--force" not in push_cmd
 
 
-def test_new_trigger_closes_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A new trigger closes prior open Leader PRs, then opens a new one."""
+def test_new_trigger_preserves_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A new trigger must not close or delete an unfinished run record."""
     monkeypatch.setenv("GITHUB_TOKEN", "test-token")
     listed_labels: list[str] = []
     close_calls: list[list[str]] = []
@@ -221,12 +221,13 @@ def test_new_trigger_closes_previous_leader_pr(monkeypatch: pytest.MonkeyPatch) 
     )
     result = manager.create_or_update(build_state(pull_requests=[]), trigger_id="gap-newrun")
     assert listed_labels[0] == "gap-newrun"
-    assert GAP_LABEL in listed_labels
+    assert GAP_LABEL not in listed_labels
     assert result.updated is False
     assert result.pr_number == 12
     assert result.branch == _leader_branch("gap-newrun")
     _assert_dated_state_path(result.state_path, "gap-newrun")
-    assert any(cmd[3] == "5" for cmd in close_calls)
+    assert close_calls == []
+    assert not any(cmd[:3] == ["gh", "pr", "comment"] for cmd in calls)
     push_cmd = next(cmd for cmd in calls if cmd[:2] == ["git", "push"])
     assert "--force" in push_cmd
 
@@ -263,7 +264,7 @@ def test_update_existing_does_not_close_current_leader(
             assert cwd is not None
             existing = Path(cwd) / "GAP Leaders" / "2026-09-20_gap-existing"
             existing.mkdir(parents=True, exist_ok=True)
-            (existing / "state.json").write_text("{}", encoding="utf-8")
+            (existing / "state.json").write_text('{"pull-requests": []}', encoding="utf-8")
             return _completed("")
         if command[0] == "git" and command[1] == "status":
             return _completed("M  GAP Leaders/2026-09-20_gap-existing/state.json\n")

@@ -57,6 +57,12 @@ class RepositoryPullRequest:
     labels: frozenset[str]
     changed_files: tuple[str, ...]
     committer_at: datetime
+    source_branch: str | None = None
+    base_sha: str | None = None
+    title: str | None = None
+    source_url: str | None = None
+    target_url: str | None = None
+    file_collections: dict[str, tuple[str, ...]] | None = None
 
 
 @dataclass(frozen=True)
@@ -76,6 +82,7 @@ class RepositoryGateDecision:
     target_url: str | None = None
     skip_status_post: bool = False
     reports: tuple[str, ...] = ()
+    build_observations: dict | None = None
 
 
 def decide_repository_pr(
@@ -89,6 +96,8 @@ def decide_repository_pr(
     now: datetime,
     build_app_slug: str,
     build_app_id: int | None = None,
+    allowed_components: frozenset[str] | None = None,
+    build_gate_override: GateResult | None = None,
 ) -> RepositoryGateDecision:
     """Decide the repository PR from mergeability, builds, and feasibility."""
     if pull_request.state == "MERGED":
@@ -118,7 +127,7 @@ def decide_repository_pr(
         )
 
     deadline = revision_deadline(pull_request.committer_at)
-    build_gate = _evaluate_builds(
+    build_gate = build_gate_override if build_gate_override is not None else _evaluate_builds(
         pull_request,
         tekton_documents=tekton_documents,
         tekton_error=tekton_error,
@@ -128,6 +137,7 @@ def decide_repository_pr(
         deadline=deadline,
         app_slug=build_app_slug,
         app_id=build_app_id,
+        allowed_components=allowed_components,
     )
     feasibility_gate = _evaluate_feasibility(
         feasibility,
@@ -137,6 +147,29 @@ def decide_repository_pr(
         deadline=deadline,
     )
     return _combine(pull_request, build_gate, feasibility_gate)
+
+
+def expected_builds_for_pr(pull_request, tekton_documents, *, app_slug, app_id=None, allowed_components=None):
+    """Use the same revision-pinned trigger/component selection for either source."""
+    return select_build_checks(
+        tekton_documents or (),
+        PullRequestContext(
+            number=pull_request.number,
+            base_ref=pull_request.base_ref,
+            head_sha=pull_request.head_sha,
+            labels=pull_request.labels,
+            changed_files=pull_request.changed_files,
+            source_branch=pull_request.source_branch,
+            base_sha=pull_request.base_sha,
+            title=pull_request.title,
+            source_url=pull_request.source_url,
+            target_url=pull_request.target_url,
+            file_collections=pull_request.file_collections,
+        ),
+        app_slug=app_slug,
+        app_id=app_id,
+        allowed_components=allowed_components,
+    )
 
 
 def _evaluate_builds(
@@ -150,6 +183,7 @@ def _evaluate_builds(
     deadline: datetime,
     app_slug: str,
     app_id: int | None,
+    allowed_components: frozenset[str] | None,
 ) -> GateResult:
     if check_query_error or tekton_error:
         return evaluate_checks(
@@ -161,17 +195,9 @@ def _evaluate_builds(
             revision=pull_request.head_sha,
         )
     try:
-        expected = select_build_checks(
-            tekton_documents or (),
-            PullRequestContext(
-                number=pull_request.number,
-                base_ref=pull_request.base_ref,
-                head_sha=pull_request.head_sha,
-                labels=pull_request.labels,
-                changed_files=pull_request.changed_files,
-            ),
-            app_slug=app_slug,
-            app_id=app_id,
+        expected = expected_builds_for_pr(
+            pull_request, tekton_documents, app_slug=app_slug, app_id=app_id,
+            allowed_components=allowed_components,
         )
     except TriggerParseError as exc:
         return evaluate_checks(

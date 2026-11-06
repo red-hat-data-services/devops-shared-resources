@@ -14,6 +14,14 @@ MAX_COMMITS_IN_BODY = 100
 AUTOMERGE_NOT_ALLOWED = "auto merge is not allowed for this repository"
 
 
+class PullRequestOperationError(RuntimeError):
+    """An operation failed after a child PR was created or found."""
+
+    def __init__(self, message: str, pr_url: str):
+        super().__init__(message)
+        self.pr_url = pr_url
+
+
 class AutomergeNotAllowed(RuntimeError):
     """The repository does not allow auto-merge.
 
@@ -162,16 +170,19 @@ class PRCreator:
         number = pull["number"]
         url = pull["html_url"]
 
-        if labels:
-            self.add_labels(repo_url, number=number, labels=labels)
-        if reviewers:
-            self.request_reviewers(repo_url, number=number, reviewers=reviewers)
-        merged, automerge_skipped = self._apply_automerge(
-            repo_url,
-            number=number,
-            enabled=automerge,
-            merge_when_ready=merge_when_ready,
-        )
+        try:
+            if labels:
+                self.add_labels(repo_url, number=number, labels=labels)
+            if reviewers:
+                self.request_reviewers(repo_url, number=number, reviewers=reviewers)
+            merged, automerge_skipped = self._apply_automerge(
+                repo_url,
+                number=number,
+                enabled=automerge,
+                merge_when_ready=merge_when_ready,
+            )
+        except Exception as exc:
+            raise PullRequestOperationError(str(exc), url) from exc
 
         return PRResult(
             number=number,
@@ -348,17 +359,21 @@ class PRCreator:
         if existing:
             number = existing["number"]
             existing_branch = existing["head"]["ref"]
-            self.update_pull_request(repo_url, number=number, title=title, body=body)
-            if labels:
-                self.add_labels(repo_url, number=number, labels=labels)
-            if reviewers:
-                self.request_reviewers(repo_url, number=number, reviewers=reviewers)
-            merged, automerge_skipped = self._apply_automerge(
-                repo_url,
-                number=number,
-                enabled=automerge,
-                merge_when_ready=merge_when_ready,
-            )
+            try:
+                self.update_pull_request(repo_url, number=number, title=title, body=body)
+                if labels:
+                    self.add_labels(repo_url, number=number, labels=labels)
+                if reviewers:
+                    self.request_reviewers(repo_url, number=number, reviewers=reviewers)
+                merged, automerge_skipped = self._apply_automerge(
+                    repo_url,
+                    number=number,
+                    enabled=automerge,
+                    merge_when_ready=merge_when_ready,
+                )
+            except Exception as exc:
+                raise PullRequestOperationError(str(exc), existing["html_url"]) from exc
+
             return PRResult(
                 number=number,
                 url=existing["html_url"],
@@ -394,17 +409,21 @@ class PRCreator:
             if existing is None:
                 raise
             number = existing["number"]
-            self.update_pull_request(repo_url, number=number, title=title, body=body)
-            if labels:
-                self.add_labels(repo_url, number=number, labels=labels)
-            if reviewers:
-                self.request_reviewers(repo_url, number=number, reviewers=reviewers)
-            merged, automerge_skipped = self._apply_automerge(
-                repo_url,
-                number=number,
-                enabled=automerge,
-                merge_when_ready=merge_when_ready,
-            )
+            try:
+                self.update_pull_request(repo_url, number=number, title=title, body=body)
+                if labels:
+                    self.add_labels(repo_url, number=number, labels=labels)
+                if reviewers:
+                    self.request_reviewers(repo_url, number=number, reviewers=reviewers)
+                merged, automerge_skipped = self._apply_automerge(
+                    repo_url,
+                    number=number,
+                    enabled=automerge,
+                    merge_when_ready=merge_when_ready,
+                )
+            except Exception as exc:
+                raise PullRequestOperationError(str(exc), existing["html_url"]) from exc
+
             return PRResult(
                 number=number,
                 url=existing["html_url"],

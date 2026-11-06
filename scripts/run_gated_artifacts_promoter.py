@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 import copy
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -27,7 +27,9 @@ from lib.state_file import (  # noqa: E402
     StatePullRequest,
     build_state,
     short_repo_name,
+    repo_slug_from_url,
 )
+from lib.creator_outcomes import ERROR_OUTCOMES, PR, merge_outcomes, observation, safe_reason
 from lib.trigger_id import normalize_trigger_id  # noqa: E402
 from scripts.sync_branches import SyncOutcome, resolve_github_token, run_sync_entry  # noqa: E402
 
@@ -38,6 +40,7 @@ class PromoterRunResult:
     outcomes: list[tuple[dict[str, Any], SyncOutcome]]
     state_prs: list[StatePullRequest]
     leader: LeaderPRResult | None
+    failures: list[dict[str, str]] = field(default_factory=list)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -149,6 +152,7 @@ def run_promoter(
 
     outcomes: list[tuple[dict[str, Any], SyncOutcome]] = []
     state_prs: list[StatePullRequest] = []
+    creator_outcomes: list[dict[str, str]] = []
     entry_count = len(entries)
     entry_label = "entry" if entry_count == 1 else "entries"
     mode = " (dry run)" if dry_run else ""
@@ -183,8 +187,30 @@ def run_promoter(
                 verbose=verbose,
             )
         except Exception as exc:
-            report(f"[{index}/{entry_count}] Failed {name}: {exc}")
-            raise
+            reason = safe_reason(exc, resolved_token)
+            repo = repo_slug_from_url(target["url"])
+            known_url = str(getattr(exc, "pr_url", "") or "")
+            match = PR.fullmatch(known_url)
+            if not match or match[1].lower() != repo.lower():
+                known_url = ""
+            creator_outcomes = merge_outcomes(creator_outcomes, [observation(
+                repo, source["branch"], target["branch"],
+                "pr-operation-failure" if known_url else "creation-failure",
+                reason, pr_url=known_url, token=resolved_token,
+            )])
+            if known_url:
+                state_prs.append(StatePullRequest(repo=short_repo_name(repo), pr_url=known_url))
+            report(f"[{index}/{entry_count}] Failed {name}: {reason}")
+            continue
+        status, reason = "success", outcome.message
+        if outcome.automerge_skipped:
+            status, reason = "automerge-unavailable", outcome.automerge_skipped
+        elif outcome.pr_url and not outcome.merged and not prepared["pr"]["automerge"]:
+            status, reason = "manual-merge", "Source map has automerge: no; manual merging is required"
+        creator_outcomes = merge_outcomes(creator_outcomes, [observation(
+            repo_slug_from_url(target["url"]), source["branch"], target["branch"],
+            status, reason, pr_url=outcome.pr_url or "", token=resolved_token,
+        )])
         outcomes.append((prepared, outcome))
         state_pr = outcome_to_state_pr(prepared, outcome)
         if state_pr is not None:
@@ -196,7 +222,7 @@ def run_promoter(
         if outcome.automerge_skipped:
             report(f"::warning::{name}: {outcome.automerge_skipped}")
 
-    state = build_state(pull_requests=state_prs)
+    state = build_state(pull_requests=state_prs, creator_outcomes=creator_outcomes)
 
     manager = leader_manager or LeaderPRManager(repo=leader_repo, dry_run=dry_run)
     report(
@@ -206,8 +232,14 @@ def run_promoter(
     try:
         leader_result = manager.create_or_update(state, trigger_id=resolved_trigger)
     except Exception as exc:
-        report(f"[leader] Failed {leader_repo}: {exc}")
-        raise
+        reason = safe_reason(exc, resolved_token)
+        report(f"[leader] Failed {leader_repo}: {reason}")
+        raise RuntimeError(reason) from None
+    try:
+        manager.publish_creator_outcomes(leader_result, state)
+    except Exception as exc:
+        raise RuntimeError("Leader state saved, but summary publication failed: " + safe_reason(exc, resolved_token)) from None
+    state_prs = state.pull_requests
     leader_location = leader_result.pr_url or leader_result.state_path
     report(f"[leader] Completed {leader_repo}: {leader_location}")
     report(
@@ -220,6 +252,7 @@ def run_promoter(
         outcomes=outcomes,
         state_prs=state_prs,
         leader=leader_result,
+        failures=[item for item in state.creator_outcomes if item["outcome"] in ERROR_OUTCOMES],
     )
 
 
@@ -262,6 +295,9 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"{action} leader pull request for {result.leader.repo}")
 
+    if result.failures:
+        print(f"error: {len(result.failures)} repository sync operation(s) failed; details saved on the Leader", file=sys.stderr)
+        return 1
     return 0
 
 

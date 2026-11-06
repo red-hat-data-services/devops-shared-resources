@@ -3,6 +3,9 @@
 Child creation/reconciliation is opt-in through a template's `generate` block.
 Existing configurations are unchanged. There is no separate maintenance CLI:
 use the normal validator in fix mode, then validate independently from disk.
+Generation remains separate from `reconcile-tekton`'s existing-file preview and
+publication flow: that flow rejects `generate` configurations and external
+parents. Integrating the validator does not authorize generation publication.
 
 ```sh
 uv run scripts/validate-tekton --path ../release-checkout \

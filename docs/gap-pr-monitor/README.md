@@ -8,6 +8,22 @@ Stage 2 requires two gates before a repository PR can pass:
 - every component build selected from that repository's `.tekton` PipelineRuns
 - every job in the main-to-release feasibility workflow
 
+Component builds are restricted to the repository-scoped allowlist in
+[component_repo_map.json](https://github.com/red-hat-data-services/konflux-central/blob/main/config/component_repo_map.json).
+The monitor fetches one validated snapshot from `main` per Leader evaluation,
+including any head-change recheck. A fetch or validation error stops evaluation
+before state or commit statuses are updated.
+
+Only components listed under the child PR's exact repository name are gated;
+a missing repository entry means no allowed components (repository aliases are
+not inferred). PipelineRun component labels match exact mapping keys or numeric
+release variants such as `odh-eval-hub-v3-6` for `odh-eval-hub`. Every selected
+PipelineRun must have a nonempty `appstudio.openshift.io/component` label;
+a missing or invalid label is a configuration error, not an ignored build.
+Component names are never inferred from PipelineRun names. Unmapped builds are logged and ignored,
+including failed, pending, or missing checks. Mapped builds still have to pass;
+feasibility and merge-conflict checks are unaffected.
+
 Both gates use the same check-run retrieval and conclusion rules. A query
 error, or any completed conclusion other than `success`, does not pass.
 Unresolved feasibility checks fail six hours after the head commit's committer
@@ -27,27 +43,90 @@ check name.
 | Any expected component build completed without success | `build-failure` | `failure` |
 | A required build or feasibility check is queued, running, or missing | `build-pending` | `pending` |
 | Good child, but a sibling is still pending | `success` | `pending` (deferred; RHAI-8261) |
-| No component build is triggered, and feasibility succeeded | `success` | `success` (after all siblings conclude) |
-| All expected builds and feasibility jobs succeeded | `success` | `success` (after all siblings conclude) |
+| All children build/gate success (EG not done) | `success` | `pending` (waiting for Early Gate) |
+| All children build/gate success + EG passed | `success` | `success` (posted by EG-results) |
+| Build-OK child + EG failed | `success` | `failure` (posted by EG-results; note held) |
+| Mixed batch: good child + sibling build/merge failure | `success` | `success` after batch concludes (no EG) |
 | Already merged | `success` | skip post |
 
 A failed repository gate posts a failing promoter status on that PR immediately.
 A **successful** child does **not** get a green `gated artifacts promoter` check
-until **every** child in the Leader state has a terminal `pr-status` (RHAI-8261).
-Until then the good child stays `pending` on GitHub so it cannot auto-merge early;
-`pr-status` in `state.json` still records `success`. When the batch has concluded,
-children are greened with GitHub ``success`` as before. Separately, an all-success
-batch sets ``overall-status=early-gate-triggered`` and comments ``/early-gate`` on
-the Leader (RHAI-10942). Merging the leader PR to keep run history does not mark a
+while siblings are still open (RHAI-8261), and — when the whole batch is
+all-success — stays `pending` until the **combined Leader Early Gate** finishes
+(`gap_early_gate_results` posts child `success` or `failure`). `pr-status` in
+`state.json` still records the Stage-1 build/gate outcome. An all-success batch
+sets ``overall-status=early-gate-triggered`` and comments ``/early-gate`` on the
+Leader (RHAI-10942). Merging the leader PR to keep run history does not mark a
 failed repository PR successful. `builds[].image` is left unchanged; image URIs are
 not required for the gate.
 
 When every child has a final gate status, the monitor sets `overall-status`.
 All-success batches become `early-gate-triggered` and the monitor comments
-`/early-gate` on the **Leader** once (RHAI-10942). Final `success` / `failure`
-(and Leader green for auto-merge) are written later by the Early Gate monitor,
-or immediately as `failure` when any child failed (RHOAIENG-97052 / RHAI-8079).
-Pending children never conclude the Leader.
+`/early-gate` on the **Leader** once (RHAI-10942). Final overall `success` /
+`failure`, Leader green, and child check conclusion for build-passing PRs are
+written by the Early Gate results monitor; overall `failure` is set immediately
+when any child failed without EG (RHOAIENG-97052 / RHAI-8079). Pending children
+never conclude the Leader.
+
+## CEL trigger evaluator setup
+
+Build the Go helper before running the monitor (Go 1.27 or newer):
+
+```bash
+mkdir -p bin
+(cd tools/pac-cel && go build -o ../../bin/pac-cel-evaluate .)
+```
+
+The monitor looks for `bin/pac-cel-evaluate` relative to this checkout.
+Set `PAC_CEL_EVALUATOR=/absolute/path/to/pac-cel-evaluate` to use a separately
+built binary, including when installing the Python package elsewhere. The binary
+must be built for the runtime's OS/architecture. No build or download occurs at
+monitor runtime; Go is needed only to build the helper.
+
+The helper batches each PR's distinct `on-cel-expression` annotations in one
+JSON request. It uses pinned CEL-Go and `gobwas/glob` versions, not a Python
+approximation. See [the helper documentation](../../tools/pac-cel/README.md)
+for the protocol, upstream baseline, and compatibility limits.
+
+Evaluation uses current PR facts: source/target branches and repository URLs,
+title, and revision-pinned file collections (`all`, `added`, `deleted`,
+`modified`, `renamed`). Renames use the new path, as PaC does.
+SHAs are retained as context, not invented top-level CEL variables.
+
+This is **PR-state selection, not webhook replay**. The monitor does not invent
+`body`, `headers`, `event_type`, or Repository custom parameters. Expressions
+requiring unavailable facts, invalid/non-boolean expressions, and helper failures
+retain the pipeline's expected check and produce a warning; they never establish
+that no build is required. A possibly truncated GitHub file listing is a query
+error rather than a no-build signal.
+
+### Revision-pinned changed files
+
+The reusable `lib/github_diff.py` collector is independent of CEL and GAP state.
+The monitor supplies the base/head commit SHAs captured with the PR snapshot;
+it never substitutes the live PR-files endpoint for that pinned comparison.
+GitHub's compare API is the fast path. Its first response includes the changed
+files, independently of commit pagination. A file list at the 300-file cap,
+missing/invalid file data, or an API error triggers a local Git fallback.
+
+The fallback creates a temporary bare repository (no working-tree checkout),
+fetches the pinned revisions with `--filter=blob:none`, and diffs the merge base
+to the head. With a merge base from the API it fetches only the required commit
+tips; otherwise it fetches history to compute the merge base locally. NUL-delimited
+output preserves tabs/newlines in paths. Rename detection can download blobs,
+and its classifications may differ from GitHub's rename heuristics.
+
+Git must be installed. Git operations share a 120-second budget and their captured
+output is limited to 32 MiB. No credential helpers, interactive authentication,
+external diff/textconv programs, or checkout hooks are used. A private repository
+requiring Git credentials cannot use this fallback and remains unresolved; the
+collector does not discover or access credentials. Temporary repositories are
+removed after evaluation. Fetch, timeout, invalid-path-encoding, or diff errors
+are unresolved query errors, never empty changed-file lists. These limits bound
+time and captured output, not total downloaded repository size.
+
+The standalone legacy PR-file helpers remain available for callers without a
+pinned revision pair; the monitor always requires both SHAs.
 
 ## How merge conflicts are detected
 
@@ -74,7 +153,7 @@ component PR has a final gate status (`success`, `merge-failure`, or
 |----------|--------------------------|---------------|------------------|
 | Any still `new` or `build-pending` | omitted | none | no (stay pending) |
 | All final, any `merge-failure` or `build-failure` | `failure` | green Leader (history, RHAI-8079) | yes — only `success` children |
-| All `success` (or existing `build-success`) | `early-gate-triggered` | comment `/early-gate` once (RHAI-10942); children still greened per RHAI-8261 | yes — child GitHub success unchanged |
+| All `success` (or existing `build-success`) | `early-gate-triggered` | comment `/early-gate` once (RHAI-10942); children stay pending until EG-results | no — EG-results posts child success/failure |
 | Existing final `success` / `failure` (EG monitor) | preserved | green Leader | yes |
 
 All-success does **not** set `overall-status=success` in this monitor. That final
@@ -192,3 +271,8 @@ Resolution order (`resolve_state_file`, after merging CLI + `GAP_*` env):
 python scripts/gap_pr_monitor.py --trigger-id gap-e2e20260923133000
 python scripts/gap_pr_monitor.py --state-file GAP Leaders/2026-09-25_gap-e2e…/state.json --dry-run
 ```
+
+## Direct Konflux build status
+
+See [Konflux build status](konflux-build-status.md) for the shared client,
+current-head evidence, credentials and staged rollout for RHAI-19805.
