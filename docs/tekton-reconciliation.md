@@ -94,6 +94,46 @@ completed operation, not a gate for a second command. Publication details are
 saved separately in diagnostic `publication.json`. Publication to main/master is
 rejected. Caller-provided `--allowed-branches` restricts releases further.
 
+## Partial previews for malformed files
+
+Strict reconciliation profiles (template selection or legacy document policy)
+isolate individual malformed YAML files instead of losing every valid-file
+preview. The ordinary standalone validator and the legacy no-policy subprocess
+reconciliation path retain their existing fail-closed behavior and schemas.
+
+Only these exact ruamel exceptions from safe per-file parsing are isolated:
+`DuplicateKeyError`, `ParserError`, `ScannerError`, and `ReaderError`. Invalid
+UTF-8 is included. An unparseable YAML candidate is reported as an error, never
+silently classified as an unrelated resource. Valid resource-only streams and
+the existing rejection of bundled PipelineRun streams are unchanged.
+
+Each diagnostic contains `path`, `error_class`, and a fixed-category `reason`
+with location where available. Raw parser messages/source snippets are not
+copied into diagnostics. `diagnostics.errors`, `counts.error`, and file rows
+with `status: error` remain distinct from unresolved/manual eligibility cases.
+The root excluded-file classifications and byte/mode identities are immutable;
+the initial stage and every phase must match them before and after processing.
+No newly malformed file, changed error classification, repaired excluded file,
+or excluded-byte/mode change is silently absorbed during a run.
+
+With any file error, the result is **`partial`**, including when there are no
+valid-file changes or every candidate is malformed. Exit code **2** accompanies
+useful stdout JSON, `result.json`, all phase diagnostics and `enforcement.patch`.
+The preview job summary lists bounded/escaped error paths and prominently marks
+the result **PARTIAL / INCOMPLETE / NOT PUBLISHABLE**. The patch includes only
+valid-file changes and is diagnostic, not resumable publication authority.
+
+`--publish` with any partial result is blocked **before** the publisher or the
+no-change publication branch: `publication.status` is `blocked`, diagnostics
+and JSON are retained, stderr explains the block, and exit code is 2. Publish
+invocations still do not append the preview job summary. There is no flag to
+allow partial publication. Complete operations return 0; fatal failures return 1.
+
+Inventory/path/mode/symlink/source/context failures, unknown YAML tags, alias
+composition/policy failures, graph/depth/type/security budgets, memory/recursion
+errors, guard rejection and unsupported serialization remain fatal, not partial.
+This does not relax parsing, repair malformed files or authorize rollout.
+
 ## Template selection and optional guards
 
 An optional `selection_template` config key names a contained Jinja sidecar.

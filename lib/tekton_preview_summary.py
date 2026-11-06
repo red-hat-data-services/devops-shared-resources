@@ -1,4 +1,4 @@
-"""Bounded, data-only GitHub Actions presentation for successful previews."""
+"""Bounded, data-only GitHub Actions presentation for complete or partial previews."""
 from collections import Counter
 import html
 from pathlib import Path
@@ -34,12 +34,16 @@ def render_preview_summary(result, patch, *, limit=SUMMARY_LIMIT, patch_truncate
     counts = Counter(row["status"] for row in changes)
     status, status_cut = escaped_prefix(str(result.get("status", "unknown")), 512)
     diagnostics = result.get("diagnostics", {}).get("counts", {})
+    errors = result.get("diagnostics", {}).get("errors", [])
+    partial = result.get("status") == "partial" or bool(errors)
+    warning = (f"**PARTIAL / INCOMPLETE — NOT PUBLISHABLE. File errors: {len(errors)}.** "
+               "The patch contains only valid-file changes and is diagnostic only.\n\n") if partial else ""
     deferred, _ = escaped_prefix(
         f"Manual: {diagnostics.get('manual', 'not reported')}; "
         f"unresolved: {diagnostics.get('unresolved', 'not reported')}.", 512)
     header = (
         "\n## Tekton reconciliation preview\n\n"
-        f"Status: <code>{status}</code>{' (truncated)' if status_cut else ''}. "
+        + warning + f"Status: <code>{status}</code>{' (truncated)' if status_cut else ''}. "
         f"Planned files: **{len(changes)}** "
         f"(modified: {counts['M']}; deleted: {counts['D']}; "
         f"other: {len(changes) - counts['M'] - counts['D']}).\n\n"
@@ -57,14 +61,15 @@ def render_preview_summary(result, patch, *, limit=SUMMARY_LIMIT, patch_truncate
     paths = []
     paths_size = 0
     paths_cut = False
-    for row in changes:
+    display_rows = [*changes, *({"status": "ERROR", "path": row["path"]} for row in errors)]
+    for row in display_rows:
         line, cut = escaped_prefix(f"{row['status']}  {row['path']}\n", paths_budget - paths_size)
         paths.append(line)
         paths_size += len(line.encode("utf-8"))
         if cut:
             paths_cut = True
             break
-    paths_text = "".join(paths) if changes else "No planned file changes.\n"
+    paths_text = "".join(paths) if display_rows else "No planned file changes.\n"
     diff_budget = min(DIFF_LIMIT, max(0, available - paths_size))
     diff, diff_cut = escaped_prefix(patch, diff_budget)
     diff_cut = diff_cut or patch_truncated
@@ -72,7 +77,8 @@ def render_preview_summary(result, patch, *, limit=SUMMARY_LIMIT, patch_truncate
         diff = "No diff (no planned file changes)." if not changes else "Patch unavailable; see the report artifact."
     rendered = (
         header
-        + "<details>\n<summary>Planned paths</summary>\n\n<pre>" + paths_text + "</pre>\n\n"
+        + "<details>\n<summary>Planned paths" + (" and file errors" if errors else "")
+        + "</summary>\n\n<pre>" + paths_text + "</pre>\n\n"
         + ("**Paths truncated by UTF-8 byte limit; see result.json in the full artifact.**\n\n" if paths_cut else "")
         + "</details>\n\n<details>\n<summary>Planned diff</summary>\n\n<pre>" + diff + "</pre>\n\n"
         + ("**Diff truncated by UTF-8 byte limit; download enforcement.patch for the full diff.**\n\n" if diff_cut else "")

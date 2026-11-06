@@ -4,6 +4,11 @@ Trusted workflows choose the source, templates and optional narrow Python policy
 Exact-change plans exist only inside this invocation; saved reports are diagnostic.
 """
 from collections import Counter
+from dataclasses import dataclass
+from ruamel.yaml.constructor import DuplicateKeyError
+from ruamel.yaml.parser import ParserError
+from ruamel.yaml.reader import ReaderError
+from ruamel.yaml.scanner import ScannerError
 import argparse
 import html
 import json
@@ -94,10 +99,41 @@ def load_policy(path, source, require_decision=True):
     return module
 
 
-def documents(root, scope, layout):
+FILE_PARSE_ERRORS = {
+    DuplicateKeyError: "duplicate YAML mapping key",
+    ParserError: "invalid YAML syntax",
+    ScannerError: "invalid YAML token",
+    ReaderError: "invalid YAML encoding or character",
+}
+
+
+@dataclass(frozen=True)
+class ExcludedFiles:
+    """Immutable root classifications and byte/mode identities, never authority."""
+    errors: tuple
+    snapshots: tuple
+
+    @classmethod
+    def capture(cls, root, errors):
+        snapshot = worker.snapshot_paths(root, [row["path"] for row in errors])
+        return cls(tuple((row["path"], row["error_class"], row["reason"]) for row in errors),
+                   tuple((name, row["sha256"], row["mode"]) for name, row in snapshot.items()))
+
+    def rows(self):
+        return [{"path": path, "error_class": kind, "reason": reason}
+                for path, kind, reason in self.errors]
+
+    def inspect(self, root, scope, layout):
+        errors = []
+        runs = documents(root, scope, layout, errors=errors)
+        if ExcludedFiles.capture(root, errors) != self:
+            raise ValueError("malformed-file inventory, classification, bytes or mode changed")
+        return runs
+
+
+def documents(root, scope, layout, errors=None):
     """Strict inventory first; resource-only streams stay untouched."""
     inventory = worker.snapshot(root, scope)
-    yaml = YAML(typ="safe", pure=True)
     runs = {}
     for name in inventory:
         path = Path(name)
@@ -105,7 +141,21 @@ def documents(root, scope, layout):
             continue
         if layout == "nested" and not (len(path.parts) == 4 and path.parts[0] == "pipelineruns" and path.parts[2] == ".tekton"):
             continue
-        docs = list(yaml.load_all(worker.read_file(root, name)))
+        source = worker.read_file(root, name)
+        try:
+            docs = list(YAML(typ="safe", pure=True).load_all(source))
+        except tuple(FILE_PARSE_ERRORS) as exc:
+            if errors is None or type(exc) not in FILE_PARSE_ERRORS:
+                raise
+            # Never stringify parser errors: they can contain target secrets.
+            reason = FILE_PARSE_ERRORS[type(exc)]
+            mark = getattr(exc, "problem_mark", None)
+            if mark is not None:
+                reason += f" at line {mark.line + 1}, column {mark.column + 1}"
+            elif isinstance(exc, ReaderError):
+                reason += f" at character offset {exc.position}"
+            errors.append({"path": name, "error_class": type(exc).__name__, "reason": reason})
+            continue
         docs = [detached_data(doc) for doc in docs]
         if any(isinstance(doc, dict) and doc.get("kind") == "PipelineRun" for doc in docs):
             if len(docs) != 1:
@@ -130,7 +180,7 @@ def context_for(root, policy, branch, config=None):
     return context
 
 
-def scan_phase(stage, phase, config, policy, branch, scope, layout, context=None):
+def scan_phase(stage, phase, config, policy, branch, scope, layout, context=None, excluded=None):
     """Compatibility adapter; ordinary validate-tekton owns the only fix loop."""
     from lib.tekton_validation import StrictProfile
     path = ROOT / "scripts" / "validate-tekton"
@@ -138,12 +188,20 @@ def scan_phase(stage, phase, config, policy, branch, scope, layout, context=None
     module.__file__ = str(path)
     exec(compile(path.read_bytes(), str(path), "exec"), module.__dict__)
     module.json_mode = True
+    runs = excluded.inspect(stage, scope, layout) if excluded is not None else documents(stage, scope, layout)
     profile = StrictProfile(stage, phase, config, branch,
-                            documents(stage, scope, layout),
+                            runs,
                             context if context is not None else context_for(stage, policy, branch, config), policy)
     module.fix_tekton_dir(Path(stage), branch, None, True, config=config,
                           layout=layout, profile=profile)
-    return profile.finish()
+    output = profile.finish()
+    if excluded is not None:
+        excluded.inspect(stage, scope, layout)
+        output["errors"] = excluded.rows()
+        output["files"].extend({**row, "status": "error"} for row in excluded.rows())
+        if excluded.errors:
+            output["counts"]["error"] = len(excluded.errors)
+    return output
 
 
 def plan(args, report):
@@ -168,7 +226,9 @@ def plan(args, report):
         raise ValueError("allowed operations must be M or M,D")
     if strict_profile and allowed != ["M"]:
         raise ValueError("document policy profile is modifications only")
-    before_runs = documents(root, scope, layout)
+    file_errors = []
+    before_runs = documents(root, scope, layout, errors=file_errors if strict_profile else None)
+    excluded = ExcludedFiles.capture(root, file_errors) if strict_profile else None
     phases = {}
     selected, deletions = [], []
     def validate(stage, phase):
@@ -178,7 +238,7 @@ def plan(args, report):
                 if worker.snapshot_paths(stage, context_paths) != context_snapshot:
                     raise ValueError("staged context differs from provenance")
                 context = context_for(stage, policy, args.branch, config)
-            output = scan_phase(stage, phase, config, policy, args.branch, scope, layout, context)
+            output = scan_phase(stage, phase, config, policy, args.branch, scope, layout, context, excluded)
         else:
             flags = {"initial": [], "preview": ["--fix", "--dry-run"], "fix": ["--fix"],
                      "validation": [], "idempotence": ["--fix"]}[phase]
@@ -228,7 +288,9 @@ def plan(args, report):
                   "policy_python": str(Path(args.policy_python).resolve().relative_to(source)) if policy else None}
     manifest = worker.reconcile(root, scope=scope, report=report, provenance=provenance,
                                 validate=validate, select=select, context_paths=context_paths)
-    result = {"status": "ready" if manifest["changes"] else "no-changes", "base": manifest["base_oid"],
+    if excluded is not None:
+        excluded.inspect(root, scope, layout)
+    result = {"status": "partial" if file_errors else ("ready" if manifest["changes"] else "no-changes"), "base": manifest["base_oid"],
               "policy_digest": provenance["policy_digest"], "policy_digest_short": provenance["policy_digest"][:12],
               "provenance": provenance, "scope": scope, "allowed_operations": allowed,
               "changes": manifest["changes"], "diagnostics": phases["initial"]}
@@ -357,6 +419,8 @@ def summary(result, *, policy_source, config_dir, environ=None):
 
 def publish_candidate(args, result, report):
     """Publish only this invocation's fully checked candidate, never a saved report."""
+    if result.get("status") == "partial" or result.get("diagnostics", {}).get("errors"):
+        raise ValueError("partial reconciliation is not publishable")
     root, config_dir = args.path.resolve(), args.config_dir.resolve()
     _, revision = source_identity(ROOT)
     source, policy_revision = source_identity(config_dir)
@@ -484,9 +548,15 @@ def main(argv=None):
                 try:
                     result = plan(args, internal)
                     if args.publish:
-                        publication = publish_candidate(args, result, internal) if result["changes"] else {"status": "no-changes"}
+                        if result["status"] == "partial" or result.get("diagnostics", {}).get("errors"):
+                            result["status"] = "partial"
+                            publication = {"status": "blocked", "reason": "partial reconciliation is not publishable"}
+                            print("error: partial reconciliation is not publishable", file=sys.stderr)
+                        else:
+                            publication = publish_candidate(args, result, internal) if result["changes"] else {"status": "no-changes"}
                         (internal / "publication.json").write_text(json.dumps(publication, indent=2) + "\n")
                         result["publication"] = publication
+                        (internal / "result.json").write_text(json.dumps(result, indent=2) + "\n")
                         if publication.get("url"):
                             result["publication_url"] = publication["url"]
                 finally:
@@ -502,7 +572,7 @@ def main(argv=None):
         if not args.inventory_root and not args.publish:
             append_preview_summary(result, report, os.environ)
         print(json.dumps(result, indent=None if args.json else 2))
-        return 0
+        return 2 if result.get("status") == "partial" else 0
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 1
