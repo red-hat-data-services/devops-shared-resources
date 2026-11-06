@@ -75,6 +75,12 @@ def plan(tooling, setup, tmp_path, *extra):
     return report, result
 
 
+def publication_policy(source):
+    config = source / "templates/config.yaml"
+    config.write_text(config.read_text() + 'publication_branches: [main, "rhoai-*"]\n')
+    commit(source)
+
+
 def publication_args(tmp_path):
     body = tmp_path / "notes.md"
     body.write_text("Trusted policy review notes")
@@ -107,9 +113,12 @@ def test_actual_cli_preview_repeat_without_target_writes_or_durable_plan(tooling
         "initial", "preview", "fix", "validation", "idempotence"}
 
 
+@pytest.mark.parametrize("branch", ["rhoai-3.6", "main"])
 @pytest.mark.parametrize("tamper", ["payload", "manifest", "base", "source", "dirty-target", "index", "untracked"])
-def test_single_invocation_rechecks_candidate_before_publication(tooling, setup, tmp_path, tamper, monkeypatch):
+def test_single_invocation_rechecks_candidate_before_publication(tooling, setup, tmp_path, tamper, monkeypatch, branch):
     source, target = setup
+    if branch == "main":
+        publication_policy(source)
     monkeypatch.setattr(operation, "ROOT", tooling)
     original_plan = operation.plan
     def tamper_plan(args, internal):
@@ -131,7 +140,8 @@ def test_single_invocation_rechecks_candidate_before_publication(tooling, setup,
         return result
     monkeypatch.setattr(operation, "plan", tamper_plan)
     monkeypatch.setattr(operation.publisher, "publish", lambda *args: pytest.fail("invalid candidate reached publisher"))
-    args = [*operation_args(setup, tmp_path / "report"), *publication_args(tmp_path), "--publish"]
+    args = [*operation_args(setup, tmp_path / "report"), *publication_args(tmp_path), "--publish",
+            "--branch", branch, "--allowed-branches", branch]
     assert operation.main(list(map(str, args))) == 1
 
 
@@ -274,9 +284,12 @@ def test_missing_scope_noop(tooling, setup, tmp_path):
     assert json.loads(result.stdout)["status"] == "no-changes"
 
 
+@pytest.mark.parametrize("branch", ["rhoai-3.6", "main"])
 @pytest.mark.parametrize("deletion", [False, True])
-def test_actual_publication_boundary_is_existing_publisher(tooling, setup, tmp_path, monkeypatch, deletion):
+def test_actual_publication_boundary_is_existing_publisher(tooling, setup, tmp_path, monkeypatch, deletion, branch):
     source, target = setup
+    if branch == "main":
+        publication_policy(source)
     if deletion:
         (source / "templates/all.yaml.j2").write_text('kind: "{{ _ if (metadata.get(\'name\') | delete_if(\'example-on-push\')) else _ }}"\n')
         commit(source)
@@ -289,16 +302,73 @@ def test_actual_publication_boundary_is_existing_publisher(tooling, setup, tmp_p
         return {"status": "published", "url": "https://github.com/example/component/pull/1"}
     monkeypatch.setattr(operation.publisher, "publish", publish)
     outputs = tmp_path / "outputs"
-    args = [*operation_args(setup, report), *publication_args(tmp_path), "--publish", "--github-output", outputs]
+    args = [*operation_args(setup, report), *publication_args(tmp_path), "--publish", "--github-output", outputs,
+            "--branch", branch, "--allowed-branches", branch]
     if deletion:
         args += ["--allowed-operations", "M,D"]
     assert operation.main(list(map(str, args))) == 0
     assert len(calls) == 1
     assert calls[0]["changes"][0]["status"] == ("D" if deletion else "M")
+    assert calls[0]["base"] == branch
+    assert calls[0]["head"] == "automation/test" and calls[0]["head"] != calls[0]["base"]
+    assert calls[0]["provenance"]["branch"] == branch
     assert (report / "publication.json").exists()
     assert "publication_url=https://github.com/example/component/pull/1\n" in outputs.read_text()
     assert not (report / "bundle").exists()
     assert not (report / "stage").exists()
+
+
+@pytest.mark.parametrize("branch,allowed,head", [
+    ("main", None, "automation/test"),
+    ("main", "mainline,rhoai-3.6", "automation/test"),
+    ("master", "master", "automation/test"),
+    ("main", "main", "main"),
+    ("main", "main", "master"),
+    ("main", "main", "feature/test"),
+    ("main", "main", "automation/invalid..ref"),
+    ("main", "main", "automation/../../main"),
+    ("automation/test", "automation/test", "automation/test"),
+])
+def test_main_publication_requires_exact_allowlist_and_safe_distinct_head(tooling, setup, tmp_path, monkeypatch, branch, allowed, head):
+    publication_policy(setup[0])
+    monkeypatch.setattr(operation, "ROOT", tooling)
+    monkeypatch.setattr(operation.publisher, "publish", lambda *args: pytest.fail("unsafe publication reached publisher"))
+    metadata = publication_args(tmp_path)
+    metadata[metadata.index("--head") + 1] = head
+    args = [*operation_args(setup, tmp_path / "report"), *metadata, "--publish", "--branch", branch]
+    if allowed is not None:
+        args += ["--allowed-branches", allowed]
+    assert operation.main(list(map(str, args))) == 1
+    assert not git(setup[1], "status", "--porcelain")
+
+
+@pytest.mark.parametrize("tamper", ["partial", "diagnostic-errors", "stale-shared", "stale-policy"])
+def test_allowed_main_still_blocks_partial_and_stale_receipts(tooling, setup, tmp_path, monkeypatch, tamper):
+    publication_policy(setup[0])
+    monkeypatch.setattr(operation, "ROOT", tooling)
+    original_plan = operation.plan
+    def tamper_plan(args, report):
+        result = original_plan(args, report)
+        if tamper == "partial":
+            result["status"] = "partial"
+        elif tamper == "diagnostic-errors":
+            result["diagnostics"]["errors"] = [{"path": ".tekton/bad.yaml", "error_class": "ParserError", "reason": "invalid YAML syntax"}]
+        elif tamper == "stale-shared":
+            result["provenance"]["worker_revision"] = "0" * 40
+        else:
+            result["provenance"]["policy_revision"] = "0" * 40
+        # Also exercise the direct helper's partial/error guard for main.
+        if tamper in ("partial", "diagnostic-errors"):
+            with pytest.raises(ValueError, match="not publishable"):
+                operation.publish_candidate(args, result, report)
+        return result
+    monkeypatch.setattr(operation, "plan", tamper_plan)
+    monkeypatch.setattr(operation.publisher, "publish", lambda *args: pytest.fail("invalid main candidate reached publisher"))
+    report = tmp_path / "report"
+    args = [*operation_args(setup, report), *publication_args(tmp_path), "--publish", "--branch", "main",
+            "--allowed-branches", "rhoai-3.6,main"]
+    assert operation.main(list(map(str, args))) == (2 if tamper in ("partial", "diagnostic-errors") else 1)
+    assert not git(setup[1], "status", "--porcelain")
 
 
 @pytest.mark.parametrize("reject", [False, True])

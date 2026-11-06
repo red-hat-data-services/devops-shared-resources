@@ -6,6 +6,7 @@ import pytest
 
 from lib import tekton_preview_summary as summary
 from lib import tekton_reconciliation as operation
+from test_tekton_reconciliation import tooling, setup
 
 
 def result(changes=None):
@@ -117,8 +118,9 @@ def test_inventory_does_not_append_preview(tmp_path, monkeypatch, capsys):
 
 
 @pytest.mark.parametrize("publish", [False, True])
-def test_cli_single_plan_stdout_json_and_preview_only_summary(tmp_path, monkeypatch, capsys, publish):
-    target = tmp_path / "target"
+def test_cli_single_plan_stdout_json_and_preview_only_summary(tooling, setup, tmp_path, monkeypatch, capsys, publish):
+    source, target = setup
+    monkeypatch.setattr(operation, "ROOT", tooling)
     report = tmp_path / "report"
     destination = tmp_path / "summary.md"
     destination.write_text("Prior summary\n")
@@ -133,7 +135,7 @@ def test_cli_single_plan_stdout_json_and_preview_only_summary(tmp_path, monkeypa
         return dict(data)
     monkeypatch.setattr(operation, "plan", plan)
     monkeypatch.setattr(operation, "publish_candidate", lambda *a: {"status": "test"})
-    args = ["--path", str(target), "--config-dir", str(tmp_path), "--branch", "test",
+    args = ["--path", str(target), "--config-dir", str(source / "templates"), "--branch", "test",
             "--report-dir", str(report), "--json"] + (["--publish"] if publish else [])
     assert operation.main(args) == 0
     output = json.loads(capsys.readouterr().out)

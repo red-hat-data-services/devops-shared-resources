@@ -82,6 +82,22 @@ def test_create_real_commit_without_remote_writes(case):
     assert git(root, 'rev-parse', 'HEAD') == request['base_oid']
 
 
+def test_main_pr_base_pushes_only_distinct_automation_head(case):
+    """A main PR base is separate from the sole mocked push destination."""
+    root, request = case
+    request.update(base="main", head="automation/conformance/main")
+    remote = Remote(request)
+    receipt = publish(root, request, remote)
+    assert receipt["status"] == "published"
+    pushes = [call for call in remote.calls if call[:2] == ["git", "push"]]
+    assert pushes == [["git", "push", "origin", receipt["commit"] + ":refs/heads/automation/conformance/main"]]
+    creates = [call for call in remote.calls if call[:3] == ["gh", "pr", "create"]]
+    assert len(creates) == 1
+    assert creates[0][creates[0].index("--base") + 1] == "main"
+    assert creates[0][creates[0].index("--head") + 1] == "automation/conformance/main"
+    assert git(root, "rev-parse", "HEAD") == request["base_oid"]
+
+
 def test_explicit_deletion(case):
     """Publish a deletion only when it exactly matches the validated manifest."""
     root, request = case
