@@ -211,10 +211,13 @@ def test_collect_build_observations_observation_id_changes_when_status_changes_o
 
 
 def test_collect_build_observations_fixture_smoke():
-    fixture = Path("/Users/ckodama/projects/gap-jiras/artifacts/leader-84/state-9d3d2129.json")
+    fixture = Path(__file__).resolve().parent / "fixtures" / "gap_notifications" / "leader-build-snapshot.json"
     payload = json.loads(fixture.read_text(encoding="utf-8"))
     observations = collect_build_observations(payload, environment=ENVIRONMENT, leader_url=LEADER_URL, state_url=str(fixture))
-    assert observations
+    by_component = {item["component"]: item for item in observations}
+    assert set(by_component) == {"odh-model-controller-v3-7-ea-1", "odh-model-serving-api-v3-7-ea-1"}
+    assert by_component["odh-model-controller-v3-7-ea-1"]["status"] == "success"
+    assert by_component["odh-model-serving-api-v3-7-ea-1"]["status"] == "failure"
     assert all(item["environment"] == ENVIRONMENT for item in observations)
     assert all(item["category"] == "build" for item in observations)
     sample = observations[0]

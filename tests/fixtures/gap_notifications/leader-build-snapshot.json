@@ -1,0 +1,59 @@
+{
+  "pull-requests": [
+    {
+      "repo": "odh-model-controller",
+      "pr-url": "https://github.com/red-hat-data-services/odh-model-controller/pull/1784",
+      "pr-status": "build-failure",
+      "builds": [],
+      "build-observations": {
+        "source": "konflux",
+        "repository": "red-hat-data-services/odh-model-controller",
+        "pr": 1784,
+        "head-sha": "04741f5bedcd34e213e9cd11db57c70ca967b6fb",
+        "observed-at": "2026-11-06T15:12:46.242781+00:00",
+        "expected-components": [
+          "odh-model-controller-v3-7-ea-1",
+          "odh-model-serving-api-v3-7-ea-1"
+        ],
+        "runs": [
+          {
+            "component": "odh-model-controller-v3-7-ea-1",
+            "status": "success",
+            "reason": "Completed",
+            "head_sha": "04741f5bedcd34e213e9cd11db57c70ca967b6fb",
+            "name": "odh-model-controller-on-pull-request-38156-5jt5k",
+            "uid": "7b4262df-51e5-4196-9bc7-9ae583610216",
+            "namespace": "rhoai-tenant",
+            "created_at": "2026-11-06T14:38:29Z",
+            "url": "https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com/ns/rhoai-tenant/pipelinerun/odh-model-controller-on-pull-request-38156-5jt5k"
+          },
+          {
+            "component": "odh-model-serving-api-v3-7-ea-1",
+            "status": "failure",
+            "reason": "Failed",
+            "head_sha": "04741f5bedcd34e213e9cd11db57c70ca967b6fb",
+            "name": "odh-model-serving-api-on-pull-request-92616-582m7",
+            "uid": "3f0373e1-8606-4a72-b3de-de5eb6bd9f06",
+            "namespace": "rhoai-tenant",
+            "created_at": "2026-11-06T14:38:29Z",
+            "url": "https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com/ns/rhoai-tenant/pipelinerun/odh-model-serving-api-on-pull-request-92616-582m7"
+          }
+        ],
+        "pr-state": "OPEN",
+        "gate-reason": "odh-model-serving-api-v3-7-ea-1 Konflux failure: Failed"
+      }
+    }
+  ],
+  "creator-outcomes": [
+    {
+      "repo": "red-hat-data-services/odh-model-controller",
+      "source-branch": "main",
+      "target-branch": "stable",
+      "outcome": "success",
+      "reason": "creator snapshot",
+      "pr-url": "https://github.com/red-hat-data-services/odh-model-controller/pull/1784",
+      "workflow-url": "https://github.com/red-hat-data-services/odh-model-controller/actions/runs/1",
+      "observed-at": "2026-11-06T15:12:46.242781+00:00"
+    }
+  ]
+}
