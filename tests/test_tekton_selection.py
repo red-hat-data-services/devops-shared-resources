@@ -2,6 +2,8 @@
 from copy import deepcopy
 import json
 from pathlib import Path
+import subprocess
+import sys
 import types
 
 import pytest
@@ -142,6 +144,76 @@ def test_ordinary_optional_selection_preserves_default_output_contract(tmp_path,
     assert results[path.name] == {"errors": [], "warnings": [], "status": status, "reason": "not selected"}
     assert engine.fix_tekton_dir(target, "release", None, False, config=config, layout="nested")[0] == []
     assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize("status", ["skipped", "manual", "unresolved"])
+@pytest.mark.parametrize("dry_run", [False, True])
+def test_ordinary_fix_cli_retains_selection_excluded_rows(tmp_path, status, dry_run):
+    selector = ('{{ {"status": "applicable" if metadata.name == "example-on-push" else "'
+                + status + '", "reason": "" if metadata.name == "example-on-push" else "policy '
+                + status + '"} | tojson }}')
+    config = setup(tmp_path, selector)
+    target = tmp_path / "target"
+    applicable = document(target)
+    excluded = applicable.with_name(f"{status}-push.yaml")
+    excluded.write_text(applicable.read_text().replace("example-on-push", f"{status}-on-push"))
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    before = {path: path.read_bytes() for path in (applicable, excluded)}
+    command = [sys.executable, str(ROOT / "scripts/validate-tekton"), "--path", str(target),
+               "--config-dir", config.config_dir, "--branch", "release", "--no-checkout", "--json"]
+    original = subprocess.run(command, capture_output=True, text=True)
+    assert original.returncode == 1, original.stderr
+    original_rows = json.loads(original.stdout)["files"]
+    assert len(original_rows) == 2 and original_rows[applicable.name]["errors"]
+    assert original_rows[excluded.name]["status"] == status
+    fixed = subprocess.run([*command, "--fix", *(["--dry-run"] if dry_run else [])],
+                           capture_output=True, text=True)
+    assert fixed.returncode == 0, fixed.stderr
+    result = json.loads(fixed.stdout)
+    assert set(result["files"]) == {applicable.name, excluded.name}
+    assert result["files"][excluded.name] == original_rows[excluded.name] == {
+        "status": status, "reason": f"policy {status}", "errors": [], "warnings": []}
+    assert result["files"][applicable.name] == {
+        "pipeline_type": "push", "errors": [], "warnings": []}
+    assert result["summary"] == {"ok": 2, "errors": 0, "warnings": 0}
+    assert result["fixed"] == [applicable.name]
+    assert [row["file"] for row in result["changes"]] == [applicable.name]
+    assert excluded.read_bytes() == before[excluded]
+    if dry_run:
+        assert {path: path.read_bytes() for path in before} == before
+    else:
+        assert applicable.read_bytes() != before[applicable]
+        resources = YAML(typ="safe").load(applicable.read_bytes())["spec"]["taskRunSpecs"][0]["stepSpecs"][0]["computeResources"]
+        assert resources == {"requests": {"cpu": "500m", "memory": "1Gi"},
+                             "limits": {"cpu": "500m", "memory": "1Gi"}}
+
+
+def test_fix_reporting_never_overwrites_revalidated_row_or_restores_deletion(tmp_path, monkeypatch, capsys):
+    config = setup(tmp_path)
+    target = tmp_path / "target"
+    document(target)
+    subprocess.run(["git", "init", "-q", str(target)], check=True)
+    monkeypatch.chdir(target)
+    engine = validator()
+    initial = {
+        "example-push.yaml": {"errors": ["fix needed"], "warnings": []},
+        "excluded-push.yaml": {"status": "manual", "reason": "old reason", "errors": [], "warnings": []},
+        "delete-push.yaml": {"delete": True, "errors": ["delete requested"], "warnings": []},
+    }
+    newly_validated = {
+        "example-push.yaml": {"errors": [], "warnings": [], "pipeline_type": "push"},
+        "excluded-push.yaml": {"errors": [], "warnings": ["new diagnostic"], "pipeline_type": "push"},
+    }
+    validations = iter([initial, newly_validated.copy()])
+    monkeypatch.setattr(engine, "validate_tekton_dir", lambda *args, **kwargs: next(validations))
+    monkeypatch.setattr(engine, "fix_tekton_dir", lambda *args, **kwargs: (["example-push.yaml", "delete-push.yaml"], {}))
+    monkeypatch.setattr(sys, "argv", ["validate-tekton", "--config-dir", config.config_dir,
+                                     "--branch", "release", "--no-checkout", "--json", "--fix"])
+    engine.main()
+    result = json.loads(capsys.readouterr().out)
+    assert result["files"] == newly_validated
+    assert result["summary"] == {"ok": 2, "errors": 0, "warnings": 1}
+    assert "delete-push.yaml" not in result["files"]
 
 
 def test_context_not_overridden_by_cli_vars(tmp_path):

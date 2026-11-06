@@ -753,6 +753,11 @@ def main():
                 external_parent_indexes=external_parent_indexes,
                 layout=layout,
             )
+            # Selection-excluded files are absent from post_fix_data, but their
+            # original diagnostics still belong in the complete final report.
+            for filename, result in results.items():
+                if result.get("status") in {"skipped", "manual", "unresolved"}:
+                    final_results.setdefault(filename, result)
             final_totals = {"ok": 0, "errors": 0, "warnings": 0}
             for result in final_results.values():
                 errs = result.get("errors", [])
