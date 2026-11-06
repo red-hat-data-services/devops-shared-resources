@@ -37,6 +37,13 @@ The tool uses an Ansible-style approach: templates are valid YAML with Jinja2 ex
 - **Validate** (`default`): transforms are skipped, filters check raw values, errors collected
 - **Fix** (`--fix`): transforms run, then filters validate the result, corrected files written
 
+## Generated children
+
+Templates can opt into creating missing child PipelineRuns and reconciling them
+from read-only working-tree parents using `generate`. See
+[generated-child and release PR maintenance](release-pr-maintenance.md).
+Existing template configurations remain unchanged.
+
 ## Template Sets
 
 Template sets live under `tekton-templates/`, each in its own subdirectory with a `config.yaml`:

@@ -470,6 +470,98 @@ def to_pr_cel(value):
     return v.replace('event == "push"', 'event == "pull_request"')
 
 
+@jinja_filter
+def shorten_name(value, max_length):
+    """Bound a name with a readable prefix and stable hash; leave short names intact."""
+    import hashlib
+    if not isinstance(value, str) or not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 10:
+        raise ValidationError("shorten_name requires a string and maximum length >= 10")
+    if len(value) <= max_length:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return value[:max_length - 9].rstrip("-") + "-" + digest
+
+
+@jinja_filter
+def to_release_pr_cel(value, branch, filename):
+    """Convert exact-release push CEL to PR CEL, retaining every other clause."""
+    import json
+    import celpy
+    from celpy.celparser import tree_dump
+    from lark import Token, Tree
+    from lib.cel import flatten_and
+
+    def unwrap(node):
+        """Remove expression wrappers without crossing operators or calls."""
+        wrappers = {"expr", "conditionalor", "conditionaland", "relation",
+                    "addition", "multiplication", "unary", "member", "primary", "paren_expr"}
+        while isinstance(node, Tree) and node.data in wrappers and len(node.children) == 1:
+            node = node.children[0]
+        return node
+
+    def selector_equality(node):
+        """Recognize a direct event/branch equality, not text inside literals."""
+        from ast import literal_eval
+        node = unwrap(node)
+        if not isinstance(node, Tree) or node.data != "relation" or len(node.children) != 2:
+            return None
+        left, right = node.children
+        if not isinstance(left, Tree) or left.data != "relation_eq":
+            return None
+        left, right = unwrap(left.children[0]), unwrap(right)
+        if (isinstance(left, Tree) and left.data == "ident"
+                and str(left.children[0]) in {"event", "target_branch"}
+                and isinstance(right, Tree) and right.data == "literal"):
+            return str(left.children[0]), literal_eval(str(right.children[0]))
+        return None
+
+    def rewrite_filename(node):
+        """Rewrite only literal YAML receivers of zero-argument pathChanged calls."""
+        if not isinstance(node, Tree):
+            return
+        if (node.data == "member_dot_arg" and len(node.children) == 2
+                and str(node.children[1]) == "pathChanged"):
+            receiver = unwrap(node.children[0])
+            if isinstance(receiver, Tree) and receiver.data == "literal":
+                token = receiver.children[0]
+                text = str(token)
+                if (isinstance(token, Token) and len(text) > 2
+                        and text[0] in ('\"', "'") and text[-1] == text[0]
+                        and text[1:-1].startswith(".tekton/")
+                        and text[1:-1].endswith((".yaml", ".yml"))):
+                    receiver.children[0] = Token(token.type, json.dumps(f".tekton/{filename}"))
+        for child in node.children:
+            rewrite_filename(child)
+
+    if not re.fullmatch(r"rhoai-\d+\.\d+(?:-ea\.\d+)?", branch):
+        raise ValidationError("expected a rhoai-x.y[-ea.z] release branch")
+    try:
+        ast = celpy.Environment().compile(str(value))
+        cor = ast.children[0]
+        if cor.data != "conditionalor" or len(cor.children) != 1:
+            raise ValueError("unsupported top-level OR in push CEL")
+        clauses = []
+        events = branches = 0
+        for clause in flatten_and(cor.children[0]):
+            wrapped = Tree("expr", [Tree("conditionalor", [Tree("conditionaland", [clause])])])
+            selector = selector_equality(clause)
+            if selector == ("event", "push"):
+                events += 1
+            elif selector == ("target_branch", branch):
+                branches += 1
+            else:
+                if any(str(node.children[0]) in {"event", "target_branch"}
+                       for node in wrapped.find_data("ident")):
+                    raise ValueError("unsupported event/branch predicate in push CEL")
+                rewrite_filename(wrapped)
+                clauses.append(tree_dump(wrapped))
+        if events != 1 or branches != 1:
+            raise ValueError("push CEL must select exactly this release and the push event")
+    except Exception as exc:
+        raise ValidationError(f"cannot convert release push CEL: {exc}") from exc
+    return '\n&& '.join(['event == "pull_request"', f'target_branch == {json.dumps(branch)}'] + [f'({c})' for c in clauses])
+
+
 # =============================================================================
 # Internal — filter wrapping and registration
 # =============================================================================

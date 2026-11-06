@@ -25,6 +25,7 @@ Config format:
         match_fn: is_scheduled_pipeline
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -44,6 +45,7 @@ class TemplateConfig:
     file: str
     match_fns: list[str]
     parent: ParentConfig | None = None
+    generate: dict | None = None
 
 
 @dataclass
@@ -75,7 +77,47 @@ def _normalize_match_fn(value) -> list[str]:
     raise ValueError(f"match_fn must be a string or list, got {type(value).__name__}")
 
 
+def _validate_generate(policy, template_name):
+    """Reject malformed generation policy instead of silently disabling guards.
+
+    Optional sequence settings require lists of strings; required parent fields
+    are nonempty key paths. Reject unknown keys to catch misspelled safety rules,
+    and reserve metadata.name for the configured child identity.
+    """
+    prefix = f"template '{template_name}': generate"
+    if not isinstance(policy, Mapping):
+        raise ValueError(f"{prefix} must be a mapping")
+    supported = {
+        "filename", "name", "inherit_metadata", "preserve_annotations",
+        "allowed_spec_fields", "git_pipeline_ref", "required_parent_fields",
+    }
+    unknown = set(policy) - supported
+    if unknown:
+        raise ValueError(f"{prefix}: unknown keys {sorted(map(str, unknown))}")
+    for key in ("filename", "name"):
+        if not isinstance(policy.get(key), str) or not policy[key].strip():
+            raise ValueError(f"{prefix} requires {key} as a nonempty string")
+    for key in ("inherit_metadata", "preserve_annotations", "allowed_spec_fields"):
+        if key in policy:
+            value = policy[key]
+            if not isinstance(value, list) or any(not isinstance(item, str) or not item for item in value):
+                raise ValueError(f"{prefix}.{key} must be a list of nonempty strings")
+    if "name" in policy.get("inherit_metadata", []):
+        raise ValueError(f"{prefix}.inherit_metadata must not include 'name'; use generate.name for child identity")
+    if "git_pipeline_ref" in policy and not isinstance(policy["git_pipeline_ref"], bool):
+        raise ValueError(f"{prefix}.git_pipeline_ref must be a boolean")
+    if "required_parent_fields" in policy:
+        paths = policy["required_parent_fields"]
+        if not isinstance(paths, list) or any(
+            not isinstance(path, list) or not path
+            or any(not isinstance(key, str) or not key for key in path)
+            for path in paths
+        ):
+            raise ValueError(f"{prefix}.required_parent_fields must be a list of nonempty string key paths")
+
+
 def _validate_config(config: PipelineConfig):
+    """Check template files, matcher references, and opt-in generation policy."""
     pipeline_matchers = make_pipeline_matchers()
     parent_matchers = make_parent_matchers()
     template_names = {t.name for t in config.templates}
@@ -92,6 +134,10 @@ def _validate_config(config: PipelineConfig):
         if not template_path.exists():
             raise ValueError(f"template '{tmpl.name}': file not found: {template_path}")
 
+        if tmpl.generate is not None:
+            if not tmpl.parent:
+                raise ValueError(f"template '{tmpl.name}': generate requires a parent")
+            _validate_generate(tmpl.generate, tmpl.name)
         if tmpl.parent:
             if tmpl.parent.template not in template_names:
                 raise ValueError(
@@ -146,11 +192,17 @@ def load_config(config_dir: str, config_file: str | None = None) -> PipelineConf
                 inherit_params=bool(p.get("inherit_params", False)),
             )
 
+        generate = None
+        if "generate" in entry:
+            _validate_generate(entry["generate"], str(entry["name"]))
+            generate = dict(entry["generate"])
+
         templates.append(TemplateConfig(
             name=str(entry["name"]),
             file=str(entry["file"]),
             match_fns=_normalize_match_fn(entry["match_fn"]),
             parent=parent,
+            generate=generate,
         ))
 
     aliases = dict(raw.get("component_aliases", {})) if raw.get("component_aliases") else None
