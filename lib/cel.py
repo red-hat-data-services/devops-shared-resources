@@ -182,7 +182,7 @@ def parse_label_list(labels_str):
 
 
 def build_stable_pr_cel(path_conditions_text, negative_guards=None, labels=None,
-                        target_branch=None):
+                        target_branch=None, stable_sync_escape=None):
     """Build a PR CEL expression with pathChanged conditions, optionally scoped to a branch.
 
     Args:
@@ -193,6 +193,11 @@ def build_stable_pr_cel(path_conditions_text, negative_guards=None, labels=None,
             When provided, the CEL has two arms joined by ||: labels OR paths.
         target_branch: str | None — when set, adds a target_branch == "..." check
             to the path conditions arm.
+        stable_sync_escape: str | None -- when set, an extra || arm that bypasses
+            the negative guards and path conditions entirely. Used for
+            main->stable sync PRs in the notebooks repo, whose bumps of
+            params-latest.env would otherwise be excluded by the negative
+            guards carried over from the push trigger.
 
     Returns:
         str: The complete PR CEL expression, formatted for readability.
@@ -210,23 +215,23 @@ def build_stable_pr_cel(path_conditions_text, negative_guards=None, labels=None,
         return 'event == "pull_request"'
     path_arm = "\n&& ".join(path_parts)
 
-    if labels:
-        # Two-arm: labels || paths
-        labels_quoted = ", ".join(f'"{l}"' for l in labels)
-        label_arm = (
-            "has(body.pull_request.labels)\n"
-            f"    && body.pull_request.labels.exists(l, l.name in [{labels_quoted}])"
-        )
-        if target_branch:
-            path_arm_indented = "\n    && ".join(path_parts)
-        else:
-            path_arm_indented = "\n    && ".join(path_parts)
+    if labels or stable_sync_escape:
+        # Multi-arm: labels / escape hatch / paths
+        arms = []
+        if labels:
+            labels_quoted = ", ".join(f'"{l}"' for l in labels)
+            arms.append(
+                "has(body.pull_request.labels)\n"
+                f"    && body.pull_request.labels.exists(l, l.name in [{labels_quoted}])"
+            )
+        if stable_sync_escape:
+            arms.append(stable_sync_escape)
+        arms.append("\n    && ".join(path_parts))
+        arms_text = "\n  )\n  ||\n  (\n    ".join(arms)
         cel = (
             'event == "pull_request"\n'
             "&& (\n"
-            f"  (\n    {label_arm}\n  )\n"
-            "  ||\n"
-            f"  (\n    {path_arm_indented}\n  )\n"
+            f"  (\n    {arms_text}\n  )\n"
             ")"
         )
     else:

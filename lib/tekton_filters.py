@@ -400,6 +400,8 @@ def to_stable_pr_cel(value, filename="", labels_str=""):
     The path conditions (pathChanged, files.all.exists) are extracted from the
     push CEL, with the .tekton filename updated to the PR filename.
     Push triggers without path conditions remain unrestricted by paths.
+    The exact notebooks params-latest.env exclusion adds a main->stable sync
+    arm outside the entire path conjunction, so bump-only sync PRs also build.
 
     Args:
         value: The push pipeline's on-cel-expression string.
@@ -432,6 +434,18 @@ def to_stable_pr_cel(value, filename="", labels_str=""):
     # Parse labels from on-label annotation (optional)
     labels = parse_label_list(labels_str) or None
 
+    # Notebooks main->stable sync PRs bump manifests/rhoai/base/params-latest.env,
+    # which the push trigger's negative guard excludes. Carry an escape-hatch arm
+    # so those sync PRs still trigger builds even when the changed files do not
+    # match the per-image path filters. Match only this exact exclusion, not arbitrary
+    # negative expressions that happen to mention params-latest.env.
+    stable_sync_escape = None
+    if any(re.fullmatch(
+        r'!\s*\(\s*"manifests/rhoai/base/params-latest\.env"\.pathChanged\(\)\s*\)',
+        guard,
+    ) for guard in parts["negative_guards"]):
+        stable_sync_escape = '(source_branch == "main" && target_branch == "stable")'
+
     # Replace .tekton filename in path conditions
     path_text = ""
     if parts["path_conditions_tree"] is not None:
@@ -441,7 +455,10 @@ def to_stable_pr_cel(value, filename="", labels_str=""):
         path_text = path_conditions_to_text(path_tree)
 
     # Build the CEL expression
-    return build_stable_pr_cel(path_text, parts["negative_guards"], labels=labels)
+    return build_stable_pr_cel(
+        path_text, parts["negative_guards"], labels=labels,
+        stable_sync_escape=stable_sync_escape,
+    )
 
 
 @jinja_filter

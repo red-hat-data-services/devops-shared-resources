@@ -230,7 +230,7 @@ Filters are defined in `lib/tekton_filters.py`. Mark a function with `@jinja_fil
 | `validate_cel(branch, filename)` | CEL must reference branch and filename; auto-fixes wrong branch |
 | `validate_cel_tekton_ignore` | Replaces bad `!".tekton/**".pathChanged()` with `files.all.exists(...)` |
 | `to_pr_cel` | Replaces `event == "push"` with `event == "pull_request"` |
-| `to_stable_pr_cel(filename, labels_str)` | Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. |
+| `to_stable_pr_cel(filename, labels_str)` | Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
 
 ### Validation Filters
 

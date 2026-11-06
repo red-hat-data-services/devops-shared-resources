@@ -284,7 +284,7 @@ class TestToStablePrCelFilter:
         )
         assert 'event == "pull_request"' in result
         assert 'event == "push"' not in result
-        assert "target_branch" not in result
+        assert 'target_branch == "rhoai-3.6"' not in result
         assert "params-latest.env" in result
         celpy.Environment().compile(result)
 
@@ -352,3 +352,73 @@ class TestToStablePrCelFilter:
 
         with pytest.raises(ValidationError, match="empty"):
             to_stable_pr_cel("", "foo.yaml", "")
+
+
+@pytest.mark.parametrize("source,target,event,params,image,expected", [
+    ("main", "stable", "pull_request", True, False, True),
+    ("main", "stable", "pull_request", True, True, True),
+    ("main", "stable", "push", True, True, False),
+    ("feature", "stable", "pull_request", True, True, False),
+    ("feature", "stable", "pull_request", False, True, True),
+    ("feature", "stable", "pull_request", False, False, False),
+    ("main", "other", "pull_request", True, False, False),
+])
+@pytest.mark.parametrize("labels", ["", "[kfbuild-all]"])
+def test_notebooks_sync_trigger_semantics(source, target, event, params, image, expected, labels):
+    import celpy
+    from lib.tekton_filters import to_stable_pr_cel
+
+    expression = to_stable_pr_cel(
+        'event == "push" && target_branch == "rhoai-3.7-ea.1"'
+        ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
+        ' && ("jupyter/utils/**".pathChanged() || ".tekton/push.yaml".pathChanged())',
+        "pull-request.yaml", labels,
+    )
+    env = celpy.Environment()
+    program = env.program(env.compile(expression), functions={
+        "pathChanged": lambda path: celpy.celtypes.BoolType(
+            params if str(path) == "manifests/rhoai/base/params-latest.env" else image
+        ),
+    })
+    assert bool(program.evaluate({
+        "source_branch": celpy.celtypes.StringType(source),
+        "target_branch": celpy.celtypes.StringType(target),
+        "event": celpy.celtypes.StringType(event),
+        "body": celpy.json_to_cel({"pull_request": {"labels": []}}),
+    })) == expected
+
+
+@pytest.mark.parametrize("guard", [
+    '!skip_build',
+    '!("other/params-latest.env".pathChanged())',
+    '!("manifests/rhoai/base/params-latest.env".pathChanged() || skip_build)',
+])
+def test_unrelated_negative_guards_do_not_add_sync_escape(guard):
+    from lib.tekton_filters import to_stable_pr_cel
+
+    result = to_stable_pr_cel(
+        f'event == "push" && target_branch == "release" && {guard}'
+        ' && "src/**".pathChanged()', "pull-request.yaml",
+    )
+    assert "source_branch" not in result
+
+
+def test_notebooks_label_arm_still_bypasses_path_guard():
+    import celpy
+    from lib.tekton_filters import to_stable_pr_cel
+
+    result = to_stable_pr_cel(
+        'event == "push" && target_branch == "release"'
+        ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
+        ' && "src/**".pathChanged()', "pull-request.yaml", "[kfbuild-all]",
+    )
+    env = celpy.Environment()
+    program = env.program(env.compile(result), functions={
+        "pathChanged": lambda path: celpy.celtypes.BoolType(True),
+    })
+    assert program.evaluate({
+        "source_branch": celpy.celtypes.StringType("feature"),
+        "target_branch": celpy.celtypes.StringType("stable"),
+        "event": celpy.celtypes.StringType("pull_request"),
+        "body": celpy.json_to_cel({"pull_request": {"labels": [{"name": "kfbuild-all"}]}}),
+    })
