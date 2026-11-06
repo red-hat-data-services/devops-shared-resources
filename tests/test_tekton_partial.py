@@ -124,7 +124,8 @@ def test_nonpolicy_subprocess_profile_stays_fail_closed(tooling, setup, tmp_path
 
 @pytest.mark.parametrize("changes", [[], [{"status": "M", "path": ".tekton/good.yml"}]])
 @pytest.mark.parametrize("status", ["partial", "ready", "no-changes"])
-def test_publish_entrypoints_block_before_publisher_or_nochange(setup, tmp_path, monkeypatch, capsys, changes, status):
+def test_publish_entrypoints_block_before_publisher_or_nochange(tooling, setup, tmp_path, monkeypatch, capsys, changes, status):
+    monkeypatch.setattr(operation, "ROOT", tooling)
     def forbidden(*args, **kwargs):
         pytest.fail("publisher must not be called for partial result")
     monkeypatch.setattr(operation.publisher, "publish", forbidden)

@@ -91,8 +91,28 @@ worker and publisher revisions come from the actual clean shared checkout.
 `--github-output FILE` emits `status=ready|no-changes`, `base`,
 `policy_digest_short`, and a `publication_url` when available. These describe the
 completed operation, not a gate for a second command. Publication details are
-saved separately in diagnostic `publication.json`. Publication to main/master is
-rejected. Caller-provided `--allowed-branches` restricts releases further.
+saved separately in diagnostic `publication.json`.
+
+Trusted config may declare `publication_branches: [main, "rhoai-*"]` to restrict
+PR bases. Entries are exact names or literal prefixes with one trailing `*`;
+the wildcard must match a **nonempty** suffix (`rhoai-` does not match).
+Other wildcard forms, empty/null/non-list policies, invalid entries and duplicates
+are rejected, never treated as absence. With a configured policy, every publishing
+invocation must also include its exact target in `--allowed-branches`; this CLI
+list remains exact comma-separated tokens, not pattern matching. Thus a matched
+family without exact caller authorization is still denied.
+
+Publication scope is checked against clean trusted config before planning (even
+for no-change publication), then again at the direct publication boundary with
+the usual config digest/provenance checks. Preview and inventory do not enforce
+publication scope. Configs without the field retain legacy behavior: main/master
+PR bases are rejected; other bases retain the existing optional exact CLI scope.
+This is configurable adapter policy, not a hard-coded KC branch family.
+
+A PR base is not a push destination: publication still requires a distinct, valid
+`automation/` head and pushes only to that head, never directly to main/master
+or the target base. Partial/error results, stale provenance, dirty sources and
+unsafe heads remain unpublishable.
 
 ## Partial previews for malformed files
 
