@@ -792,7 +792,12 @@ class JiraNotifier:
         elif type_id != STAGING_JIRA_ISSUE_TYPE_ID:
             raise JiraAmbiguousError("Jira creation readback did not match", key=issue["key"])
 
-    def update_issue(self, key: str, *, description: dict | None = None, labels: list[str] | None = None) -> dict[str, Any]:
+    def update_issue(self, key: str, *, description: dict | None = None, labels: list[str] | None = None,
+                     add_labels: list[str] | None = None) -> dict[str, Any]:
+        """Replace labels when requested, or atomically add without snapshot replacement."""
+        if labels is not None and add_labels is not None:
+            raise ValueError("labels and add_labels are mutually exclusive")
+        additions = [] if add_labels is None else self._validate_labels(add_labels)
         key = self._issue_key(key)
         current = self.get_issue(key)
         current_category = self._status_category_or_error(current, key=key)
@@ -804,17 +809,22 @@ class JiraNotifier:
             payload_fields["description"] = copy.deepcopy(description)
         if labels is not None:
             payload_fields["labels"] = self._validate_labels(labels)
-        if not payload_fields:
+        if not payload_fields and not additions:
             return current
+        payload = {"fields": payload_fields}
+        if additions:
+            payload["update"] = {"labels": [{"add": label} for label in additions]}
         self._session_request(
             "put",
             self._issue_url(key),
             operation="issue update",
             write=True,
-            json_body={"fields": payload_fields},
+            json_body=payload,
         )
         updated = self._readback_written_issue(key)
         self._verify_updated_issue(updated, current, payload_fields)
+        if not set(additions).issubset(updated["fields"].get("labels", [])):
+            raise JiraAmbiguousError("Jira additive label readback did not match", key=key)
         return updated
 
     def transitions(self, key: str) -> list[dict[str, Any]]:

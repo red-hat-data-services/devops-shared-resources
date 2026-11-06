@@ -9,6 +9,129 @@ Destinations are fixed: Jira `https://stage-redhat.atlassian.net`, project `RHAI
 Bug (`10016`), Slack `C0883L8FARE`. Observation `environment` must be exactly
 `stage-redhat.atlassian.net/RHAI/C0883L8FARE`.
 
+## Readable presentation
+
+Jira descriptions use the packaged `lib/templates/gap_notification_issue.md.j2`
+with Jinja2 StrictUndefined, independent of the current directory. The restricted
+Markdown converter supports headings, one-line paragraphs, flat bullets, explicit
+HTTPS links and inline code; no HTML, emphasis, tables, nested lists or code fences.
+Unsupported markup fails clearly. Evidence is escaped literal data, never a template.
+Whitespace is normalized; fields over 2000 characters, links over 4096 characters,
+and rendered bodies over 24000 characters fail rather than silently truncate.
+URLs must be HTTPS without credentials, whitespace or Markdown delimiter characters.
+Supply percent-encoded URL delimiters when necessary. The renderer does not load
+raw-log fields or credentials; callers must supply sanitized, non-secret evidence.
+Allowlisted text fields such as reason and note are rendered literally, without
+automatic secret detection or redaction. Only allowlisted diagnostic fields and
+evidence links appear, not full JSON.
+
+Optional `evidence.affected_targets` is a list (at most 40) of objects with an
+explicit `branch` matching `rhoai-[A-Za-z0-9._-]+`, plus optional `reason`,
+`component`, `pipeline`. Each supplied branch is displayed together with its details.
+Targets are never inferred from the actual promotion destination or arbitrary prose.
+The historical fixture fields `reason`, `head_sha`, `leader_url`, `pr_url`,
+`state_url`, `build_url`, `note`, `historical_snapshot`, `synthetic` are supported;
+collector `selected-run`, `creator-outcome`, and `head-sha` fields are also used.
+Optional `workflow_url` or `creator-outcome.workflow-url` supplies the creator link.
+Absent fields are shown as unavailable or omitted, without implying recovery.
+Mandatory staging/test context is template-owned, outside supplied values.
+
+Human labels are additive: build adds `gap-build-failure`; conflict adds
+`gap-sync-failure` and `gap-merge-conflict`; feasibility adds `gap-sync-failure`
+and `gap-feasibility-failure`. Changed open failures use Jira atomic `update.labels` add operations rather than
+replacing a registry-search snapshot, preserving even concurrently added machine
+and user labels. The adapter's optional `add_labels` is mutually exclusive with its
+existing replacement `labels` API and verifies required additions on readback.
+Description rendering and adapter ADF/label validation finish before create/update
+intent is persisted, so deterministic presentation errors do not strand write intent. Identical events remain no-ops; closed tickets are not
+backfilled. Summary/registry identity and Slack lifecycle are unchanged.
+
+## Discussion projection and read-only inspection
+
+The managed **Slack discussion** section is a cosmetic projection of the confirmed
+root stored in the validated Jira `gap.notification.v1` property, not a routing
+source. Caller evidence and visible descriptions cannot supply a root. Links use
+the verified fixed workspace `https://redhat-internal.slack.com`, validated channel
+and receipt timestamp; no Slack lookup/API scope is needed.
+
+The separate managed **Notification metadata** section links directly to the
+issue's `gap.notification.v1` JSON API using the fixed staging origin, validated
+actual issue key, and fixed property name. Its label is “View notification metadata
+(JSON — source of truth)” with a Jira-permissions-required note. Opening the link
+requires the viewer's Jira authentication/permissions; no credentials are embedded.
+The property is routing/delivery authority, while Jira issue status remains status
+authority. This metadata link is independent of a confirmed Slack root: validated
+pending/failed delivery can show metadata without manufacturing a discussion link.
+Evidence and existing visible body URLs cannot redirect either trusted link.
+
+Projection runs in a `finally` around Slack delivery, so delivery exceptions can
+still expose metadata; cosmetic errors are swallowed separately and preserve the
+original core exception/hold/intents/retry deadline. Both metadata and discussion
+links survive later normal failure-description updates. Inspection additionally
+reports `metadata_url`, `metadata_note`, and `visible_metadata_link`, without
+requiring credentials beyond the existing explicit Jira authentication.
+
+For the Slack link, the root receipt must first be durably saved. Projection re-reads the issue/property,
+validates scope/trial/incident/episode identity, and skips closed issues. A failed
+fresh property read prevents projection. It appends
+an absent managed section or replaces a uniquely recognized unchanged managed
+section while preserving other current ADF nodes. Edited/duplicate sections warn
+rather than deleting arbitrary content. Cosmetic failure sets a separate
+`presentation_warning` in local task/CLI output, never changes delivery uncertainty,
+loses the root or replays Slack. Re-submit the same observation to retry projection
+idempotently without replaying notification; draining `[]` does not select confirmed
+tasks. Later normal failure descriptions retain the stored root link. There is no
+atomic protection against simultaneous human description edits: Jira uses a full
+field PUT. Closed-state races are guarded by the adapter's fresh status check.
+
+```sh
+uv run --no-project --python /Users/ckodama/code/devops-shared-resources/.venv/bin/python scripts/gap_notify.py --inspect RHAI-166
+# Optional --trial-id trial-name compares the expected trial; omission reports stored trial.
+```
+
+Inspection requires only explicitly supplied Jira environment authentication
+(`JIRA_USER_EMAIL` or `JIRA_API_EMAIL`, plus `JIRA_API_TOKEN`). It does not discover
+credentials, read observations/ledger, acquire lockfiles, construct Slack clients,
+acknowledge receipts, repair, or mutate anything. It remains staging-only. Inspect
+is exclusive with write/observation/ledger/receipt/transition options. JSON reports
+actual Jira status category, validated property scope/trial/incident identity,
+recorded outcome, confirmed root/link, actual managed visible-link match/missing,
+and Jira/Slack pending intents including a retry deadline when recorded. Missing or
+malformed properties are reported safely without dumping raw properties or errors.
+A supplied mismatched trial is reported, not silently replaced with `default`.
+Jira status is status authority; property is delivery/routing authority; the local
+ledger is cache/audit only and the visible link is only a projection.
+
+### Verified staging projection
+
+Manager verification on staging [RHAI-166](https://stage-redhat.atlassian.net/browse/RHAI-166)
+used inspection with Slack environment credentials removed: the property was valid,
+the issue was open, and the visible discussion link was initially missing. A guarded
+same-observation run permitted only the issue's description update and blocked
+creation, closure, property writes, and Slack sends. It performed exactly one
+description update and zero Slack attempts; the property remained byte-equivalent.
+Subsequent inspection reported `visible_link=match` and `open=true`, pointing to
+[the stored discussion](https://redhat-internal.slack.com/archives/C0883L8FARE/p1793984743525239).
+This verifies staging projection/inspection, not production behavior or recovery.
+Manager evidence is retained locally at
+`/Users/ckodama/projects/gap-jiras/artifacts/discussion-review/`:
+`unit-tests.log`, `inspect-before.json`, `inspect-after.json`, and
+`projection-live-verification.json`. The manager also independently verified
+175 passing tests and 11 passing subtests.
+
+The manager subsequently verified the metadata-link extension on the same open
+staging issue: the guarded same-event path made one description update and zero
+Slack attempts, retained the existing Slack link, and added the matching
+[notification metadata API link](https://stage-redhat.atlassian.net/rest/api/3/issue/RHAI-166/properties/gap.notification.v1).
+The property remained unchanged; a second run was a no-op (still one total update).
+Inspection reported both visible links matching and the issue open. Independent
+local validation passed 183 tests and 11 subtests, plus syntax and diff checks.
+Evidence is retained at
+`/Users/ckodama/projects/gap-jiras/artifacts/metadata-link-review/`:
+`unit-tests.log`, `inspect-before.json`, `inspect-after.json`, and
+`live-verification.json`. This remains staging-only verification, not a production
+or recovery claim.
+
 ## Registry and policy
 
 Jira, **not the local ledger or Leader state**, is the cross-Leader registry. A stable
@@ -51,8 +174,8 @@ The adapter writes initial property metadata atomically in the Jira create reque
 verifies readback. All registry records are validated against project/type/status,
 incident label, episode label, expected summary and exact property scope/identity.
 Metadata is capped **below 24 KiB** (Jira limit 32 KiB). Capacity exhaustion holds;
-no silent hash eviction or receipt truncation. Full observations belong in descriptions
-and supplied local inputs, not this compact property.
+no silent hash eviction or receipt truncation. Full observations remain in supplied local inputs; descriptions contain bounded
+human-readable evidence, not full JSON or this compact property.
 
 ### Partial writes and concurrency
 

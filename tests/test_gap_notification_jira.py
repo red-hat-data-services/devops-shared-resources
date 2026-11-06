@@ -329,7 +329,13 @@ class JiraNotifierTests(unittest.TestCase):
         description = self._issue()["fields"]["description"]
         create_response = FakeResponse({"key": "RHAI-20", "self": f"{STAGING_JIRA_ORIGIN}/rest/api/3/issue/RHAI-20"}, 201)
         changed = deepcopy(self._issue("RHAI-20", summary="summary", description=description, labels=["gap-staging"]))
-        changed["fields"]["description"]["content"][1]["content"][0]["marks"][0]["attrs"]["href"] = "https://changed.invalid"
+        def change_link(node):
+            for mark in node.get("marks", []):
+                if mark["type"] == "link":
+                    mark["attrs"]["href"] = "https://changed.invalid"
+                    return True
+            return any(change_link(child) for child in node.get("content", []))
+        self.assertTrue(change_link(changed["fields"]["description"]))
         session = FakeSession(responses={"post": [create_response], "get": [FakeResponse(changed, 200)]})
         notifier = self._notifier(session)
 

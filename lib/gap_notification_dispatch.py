@@ -15,6 +15,8 @@ from urllib.parse import urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from lib.gap_notification_incidents import incident_key
+from lib.gap_notification_presentation import category_labels, description
+from lib.gap_notification_jira import JiraNotifier
 
 STAGE = "https://stage-redhat.atlassian.net"
 CHANNEL = "C0883L8FARE"
@@ -147,19 +149,17 @@ def _notice(observation):
             "This staging trial does not establish production recovery.")
 
 
-def _description(observation):
-    content = [
-        {"type": "paragraph", "content": [{"type": "text", "text": "[GAP STAGING TEST] " + _notice(observation)}]},
-    ]
-    for name, url in observation["evidence"].items():
-        if isinstance(url, str) and name.endswith("_url"):
-            parsed = urlsplit(url)
-            if parsed.scheme == "https" and parsed.netloc and not parsed.username and not parsed.password:
-                content.append({"type": "paragraph", "content": [
-                    {"type": "text", "text": name, "marks": [{"type": "link", "attrs": {"href": url}}]}]})
-    content.append({"type": "codeBlock", "attrs": {"language": "json"}, "content": [
-        {"type": "text", "text": json.dumps(observation, indent=2, sort_keys=True)}]})
-    return {"type": "doc", "version": 1, "content": content}
+def _description(observation, *, discussion_url=None, metadata_url=None):
+    return description(observation, discussion_url=discussion_url, metadata_url=metadata_url)
+
+
+def _presentation(observation, existing_labels, *, discussion_url=None, metadata_url=None):
+    """Finish deterministic rendering/adapter validation before durable write intent."""
+    body = _description(observation, discussion_url=discussion_url, metadata_url=metadata_url)
+    labels = sorted(set(existing_labels) | set(category_labels(observation["category"])))
+    JiraNotifier._validate_adf(body)
+    JiraNotifier._validate_labels(labels)
+    return body, labels
 
 
 
@@ -270,7 +270,7 @@ class Dispatcher:
 
     def _create(self, task, previous):
         identity, obs = task["incident_key"], task["observation"]
-        journal = self.data.setdefault("creates", {}).get(identity)
+        journal = self.data.get("creates", {}).get(identity)
         if journal and journal["state"] != "confirmed":
             raise RegistryHold("ambiguous create; absence from search never authorizes retry")
         state = self._new_state(task, previous)
@@ -280,12 +280,12 @@ class Dispatcher:
         state["seen_event_ids"][event] = "failure"
         state.update(last_event=event, last_outcome="failure")
         label = incident_label(identity, self.trial_id)
-        self.data["creates"][identity] = {"state": "inflight", "episode_id": state["episode_id"]}
+        body, labels = _presentation(obs, [label, "gap-episode-" + uuid.UUID(state["episode_id"]).hex])
+        self.data.setdefault("creates", {})[identity] = {"state": "inflight", "episode_id": state["episode_id"]}
         task["operation"] = "create"
         self._save()  # Local intent BEFORE Jira create; property is atomic with issue.
         try:
-            result = self.jira.create_bug(_summary(obs), _description(obs),
-                [label, "gap-episode-" + uuid.UUID(state["episode_id"]).hex],
+            result = self.jira.create_bug(_summary(obs), body, labels,
                 notification_state=_bounded(state))
             key = _key(result["key"])
             self.data["creates"][identity].update(state="confirmed", key=key)
@@ -414,6 +414,12 @@ class Dispatcher:
         key = issue["key"]
         task["jira_key"] = key
         if event not in state["seen_event_ids"]:
+            if obs["status"] == "failure":
+                from lib.gap_notification_diagnostics import discussion_url, validated_property, metadata_url
+                root = state["delivery"]["root"]  # Jira registry only, never evidence.
+                validated_property(issue, state, trial=self.trial_id, identity=task["incident_key"])
+                body, labels = _presentation(obs, [], discussion_url=discussion_url(root) if root else None,
+                                             metadata_url=metadata_url(key))
             if obs["status"] == "success" and not _closed(issue) and not self.transition_id:
                 raise RegistryHold("explicit done transition required")
             state["jira_intent"] = {"event_id": event, "outcome": obs["status"]}
@@ -426,13 +432,36 @@ class Dispatcher:
                 if not _closed(issue):
                     self.jira.transition_to_done(key, self.transition_id, fields=self.transition_fields)
             else:
-                self.jira.update_issue(key, description=_description(obs))
+                self.jira.update_issue(key, description=body, add_labels=labels)
             state["seen_event_ids"][event] = obs["status"]
             state.update(last_event=event, last_outcome=obs["status"], jira_intent=None)
             self._put(key, state)
         elif state["last_event"] != event or state["last_outcome"] != obs["status"]:
             return  # Historical event cannot replace newer accepted observation.
-        self._slack(task, key, state)
+        try:
+            self._slack(task, key, state)
+        finally:
+            # Cosmetic failure is swallowed inside helper; original delivery result survives.
+            self._project_discussion(task, key)
+
+    def _project_discussion(self, task, key):
+        """Cosmetic projection is isolated from core receipt/intents and cannot cause resend."""
+        try:
+            from lib.gap_notification_diagnostics import validated_property, discussion_url, project_body, metadata_url
+            issue = self.jira.get_issue(key)
+            if _closed(issue):
+                return
+            state = validated_property(issue, self.jira.get_notification_state(key),
+                                       trial=self.trial_id, identity=task["incident_key"])
+            root = state["delivery"]["root"]
+            current = issue["fields"].get("description")
+            projected = project_body(current, discussion_url(root) if root else None, metadata=metadata_url(key))
+            if JiraNotifier._adf_signature(current) != JiraNotifier._adf_signature(projected):
+                self.jira.update_issue(key, description=projected)
+            task.pop("presentation_warning", None)
+        except Exception:
+            # No raw exception text, no core state/intent/delivery changes.
+            task["presentation_warning"] = "discussion_projection_unavailable"
 
     def _slack(self, task, key, state):
         obs, event = task["observation"], _event(task["observation"])

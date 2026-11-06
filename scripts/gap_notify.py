@@ -17,9 +17,10 @@ from lib.gap_notification_dispatch import CHANNEL, STAGE, Dispatcher, Ledger, bi
 
 def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdout=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--observations", required=True, help="JSON list; [] drains pending deliveries")
-    parser.add_argument("--ledger", required=True, help="Schema2 local uncertainty journal/cache; Jira is incident authority")
-    parser.add_argument("--trial-id", default="default", help="Stable safe test namespace; immutable per ledger")
+    parser.add_argument("--inspect", metavar="RHAI-N", help="Read-only Jira status/registry diagnostics; no ledger or Slack access")
+    parser.add_argument("--observations", help="JSON list; [] drains pending deliveries")
+    parser.add_argument("--ledger", help="Schema2 local uncertainty journal/cache; Jira is incident authority")
+    parser.add_argument("--trial-id", help="Stable safe test namespace; immutable per ledger")
     parser.add_argument("--write", action="store_true", help="Allow staging writes and ledger persistence")
     parser.add_argument("--jira-url", default=STAGE)
     parser.add_argument("--project", default="RHAI")
@@ -33,6 +34,23 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
     try:
         if args.jira_url != STAGE or args.project != "RHAI" or args.channel != CHANNEL:
             raise ValueError("only the agreed staging site/project/channel are supported")
+        if args.inspect:
+            if args.write or args.observations or args.ledger or args.resolve_receipt or args.transition_id or args.transition_fields != "{}":
+                raise ValueError("inspect is exclusive and read-only")
+            from lib.gap_notification_jira import JiraNotifier
+            from lib.gap_notification_diagnostics import inspect_issue
+            JiraNotifier._issue_key(args.inspect)
+            env = environ if environ is not None else os.environ
+            email = env.get("JIRA_USER_EMAIL") or env.get("JIRA_API_EMAIL")
+            token = env.get("JIRA_API_TOKEN")
+            if not all(isinstance(v, str) and v.strip() for v in (email, token)):
+                raise ValueError("explicit Jira environment credentials required")
+            jira = (jira_factory or JiraNotifier)(STAGE, "RHAI", args.issue_type, email, token)
+            print(json.dumps(inspect_issue(jira, args.inspect, trial=args.trial_id), indent=2), file=out)
+            return 0
+        args.trial_id = args.trial_id or "default"
+        if not args.observations or not args.ledger:
+            raise ValueError("observations and ledger required outside inspect mode")
         if args.transition_id and not args.transition_id.isdigit():
             raise ValueError("transition ID must be numeric")
         fields = json.loads(args.transition_fields)
@@ -75,7 +93,7 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
             summary = {"dry_run": False, "registry_version": 2,
                        "incidents": len({t["incident_key"] for t in result.get("outbox", [])}),
                        "deliveries": [{"id": t["id"], "system": t["system"], "state": t["state"],
-                                       "hold": t.get("hold")} for t in result.get("outbox", [])]}
+                                       "hold": t.get("hold"), "presentation_warning": t.get("presentation_warning")} for t in result.get("outbox", [])]}
         print(json.dumps(summary, indent=2), file=out)
         if args.write and any(t["state"] in {"pending", "inflight", "reconciliation_required", "rejected"} for t in result.get("outbox", [])):
             return 2

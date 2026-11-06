@@ -102,6 +102,8 @@ class FakeJira:
 
     def update_issue(self, key, **fields):
         self.calls.append(("update_issue", key))
+        additions = fields.pop("add_labels", [])
+        self.issues[key]["fields"]["labels"] = sorted(set(self.issues[key]["fields"]["labels"]) | set(additions))
         self.issues[key]["fields"].update(fields)
         return copy.deepcopy(self.issues[key])
 

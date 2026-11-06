@@ -28,3 +28,6 @@ pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 include = ["lib*"]
+
+[tool.setuptools.package-data]
+lib = ["templates/*.md.j2"]

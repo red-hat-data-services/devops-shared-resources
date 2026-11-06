@@ -52,6 +52,8 @@ class Jira:
     def update_issue(self, key, **fields):
         self.calls.append("update")
         assert not self.closed(key)
+        additions = fields.pop("add_labels", [])
+        self.issues[key]["fields"]["labels"] = sorted(set(self.issues[key]["fields"]["labels"]) | set(additions))
         self.issues[key]["fields"].update(fields)
         return self.get_issue(key)
 
@@ -262,15 +264,16 @@ def test_property_capacity_or_durable_jira_intent_holds_before_mutation(setup):
     runner, jira, slack = setup
     runner().run([observation()])
     state = jira.properties["RHAI-1"]
+    before_calls = list(jira.calls)
     state["jira_intent"] = {"event_id": "a" * 64, "outcome": "success"}
     result = runner("fresh").run([observation(oid="next")])
     assert result["outbox"][0]["state"] == "reconciliation_required"
-    assert jira.calls == ["create"] and len(slack.calls) == 1
+    assert jira.calls == before_calls and len(slack.calls) == 1
     state["jira_intent"] = None
     state["seen_event_ids"].update({f"{i:064x}": "failure" for i in range(400)})
     result = runner("capacity").run([observation(oid="next")])
     assert result["outbox"][0]["state"] != "confirmed"
-    assert jira.calls == ["create"] and len(slack.calls) == 1
+    assert jira.calls == before_calls and len(slack.calls) == 1
 
 
 def test_query_failure_does_not_create_or_post(setup):
