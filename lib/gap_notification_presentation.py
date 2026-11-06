@@ -5,8 +5,7 @@ inline code. Backslash escapes punctuation. Other markup fails closed.
 """
 from importlib.resources import files
 import re
-import string
-from urllib.parse import urlsplit
+from lib import jira_adf
 
 from jinja2 import Environment, StrictUndefined
 
@@ -17,92 +16,22 @@ def literal(value):
     text = " ".join(str(value).split())
     if len(text) > 2000:
         raise ValueError("presentation field exceeds 2000 characters")
-    return "".join("\\" + c if c in string.punctuation else c for c in text)
+    return jira_adf.escape_literal(text)
 
 
 def https_url(value):
     if not isinstance(value, str) or len(value) > 4096:
         raise ValueError("invalid evidence URL")
-    if any(c.isspace() or ord(c) < 32 or c in '<>\\`[]()\"' for c in value):
-        raise ValueError("invalid evidence URL syntax")
-    try:
-        parsed = urlsplit(value)
-        if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password:
-            raise ValueError("evidence URL must be HTTPS without credentials")
-        parsed.port
-    except ValueError:
-        raise ValueError("invalid evidence URL") from None
-    return value
+    return jira_adf.https_url(value)
 
 
 def _inline(text):
-    nodes, buf = [], ""
-    def flush():
-        nonlocal buf
-        if buf:
-            nodes.append({"type": "text", "text": buf})
-            buf = ""
-    i = 0
-    while i < len(text):
-        c = text[i]
-        if c == "\\":
-            if i + 1 >= len(text) or text[i + 1] not in string.punctuation:
-                raise ValueError("invalid Markdown escape")
-            buf += text[i + 1]
-            i += 2
-            continue
-        if c == "[":
-            match = re.match(r"\[([^\[\]\\]+)\]\(([^)]+)\)", text[i:])
-            if not match:
-                raise ValueError("unsupported Markdown link")
-            flush()
-            nodes.append({"type": "text", "text": match[1], "marks": [
-                {"type": "link", "attrs": {"href": https_url(match[2])}}]})
-            i += match.end()
-            continue
-        if c == "`":
-            end = i + 1
-            while end < len(text) and text[end] != "`":
-                # An escaped punctuation character is literal, including a backtick.
-                if text[end] == "\\" and end + 1 < len(text):
-                    end += 2
-                else:
-                    end += 1
-            if end >= len(text) or end <= i + 1:
-                raise ValueError("invalid inline code")
-            flush()
-            code = _inline(text[i + 1:end])
-            if any(n.get("marks") for n in code):
-                raise ValueError("unsupported nested markup")
-            nodes.append({"type": "text", "text": "".join(n["text"] for n in code), "marks": [{"type": "code"}]})
-            i = end + 1
-            continue
-        if c in "*_[]<>#!|~" or text[i:i+3] == "---":
-            raise ValueError("unsupported Markdown syntax")
-        buf += c
-        i += 1
-    flush()
-    return nodes
+    return jira_adf._inline(text, url_validator=https_url)
 
 
 def markdown_to_adf(markdown):
-    content = []
-    for line in markdown.splitlines():
-        if not line:
-            continue
-        heading = re.fullmatch(r"(#{1,6}) (.+)", line)
-        if heading:
-            content.append({"type": "heading", "attrs": {"level": len(heading[1])}, "content": _inline(heading[2])})
-        elif line.startswith("- "):
-            item = {"type": "listItem", "content": [{"type": "paragraph", "content": _inline(line[2:])}]}
-            if not content or content[-1]["type"] != "bulletList":
-                content.append({"type": "bulletList", "content": []})
-            content[-1]["content"].append(item)
-        else:
-            if line.startswith((" ", "\t", ">", "+ ")) or re.match(r"\d+[.)] ", line):
-                raise ValueError("unsupported Markdown block")
-            content.append({"type": "paragraph", "content": _inline(line)})
-    return {"type": "doc", "version": 1, "content": content}
+    # Preserve the old direct export\'s GAP URL length bound too.
+    return jira_adf.markdown_to_adf(markdown, url_validator=https_url)
 
 
 def category_labels(category):
