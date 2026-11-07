@@ -10,7 +10,7 @@ pending; only a completed non-success conclusion is a build failure.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Sequence
 
@@ -83,6 +83,7 @@ class RepositoryGateDecision:
     skip_status_post: bool = False
     reports: tuple[str, ...] = ()
     build_observations: dict | None = None
+    merge_observations: dict | None = None
 
 
 def decide_repository_pr(
@@ -100,8 +101,11 @@ def decide_repository_pr(
     build_gate_override: GateResult | None = None,
 ) -> RepositoryGateDecision:
     """Decide the repository PR from mergeability, builds, and feasibility."""
+    from lib.gap_notifications.merge_receipts import make_receipt
+
     if pull_request.state == "MERGED":
         return RepositoryGateDecision(
+            merge_observations=make_receipt(pull_request, now=now),
             url=pull_request.url,
             pr_status=PR_STATUS_SUCCESS,
             cli_status="success",
@@ -121,6 +125,7 @@ def decide_repository_pr(
             pull_request,
             pr_status=PR_STATUS_MERGE_FAILURE,
             cli_status="failure",
+            merge_observations=make_receipt(pull_request, now=now),
             reason=reason,
             target_url=pull_request.url,
             reports=(f"merge-failure {pull_request.url} {reason}",),
@@ -146,7 +151,14 @@ def decide_repository_pr(
         now=now,
         deadline=deadline,
     )
-    return _combine(pull_request, build_gate, feasibility_gate)
+    return replace(
+        _combine(pull_request, build_gate, feasibility_gate),
+        merge_observations=make_receipt(
+            pull_request, now=now, feasibility=feasibility,
+            gate=feasibility_gate, checks=check_runs,
+            query_error=check_query_error,
+        ),
+    )
 
 
 def expected_builds_for_pr(pull_request, tekton_documents, *, app_slug, app_id=None, allowed_components=None):
@@ -351,6 +363,7 @@ def _decision(
     reason: str,
     target_url: str | None,
     reports: tuple[str, ...],
+    merge_observations: dict | None = None,
 ) -> RepositoryGateDecision:
     description = _clip(f"{_where(pull_request)} {pr_status}: {reason}")
     url = target_url if target_url and target_url.startswith(("http://", "https://")) else None
@@ -363,6 +376,7 @@ def _decision(
         head_sha=pull_request.head_sha,
         target_url=url,
         reports=reports,
+        merge_observations=merge_observations,
     )
 
 

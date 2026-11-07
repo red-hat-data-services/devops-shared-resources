@@ -214,6 +214,7 @@ def _gh_payloads_by_number(mapping: dict[str, dict]) -> Any:
 # ---------------------------------------------------------------------------
 
 
+# Loading valid state must preserve the ordered child-PR URLs.
 def test_load_and_extract_pr_urls(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(path, _sample_state())
@@ -224,17 +225,20 @@ def test_load_and_extract_pr_urls(tmp_path: Path) -> None:
     ]
 
 
+# Saving state must create its missing parent directories.
 def test_save_state_creates_parent_dirs(tmp_path: Path) -> None:
     path = tmp_path / "GAP Leaders" / "2026-09-25_gap-abc" / "state.json"
     save_state(path, _sample_state())
     assert path.is_file()
 
 
+# A missing state file must produce a clear monitor error.
 def test_load_state_missing_file(tmp_path: Path) -> None:
     with pytest.raises(GapPrMonitorError, match="not found"):
         load_state(tmp_path / "missing.json")
 
 
+# Malformed JSON must not be accepted as Leader state.
 def test_load_state_rejects_invalid_json(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     path.write_text("{not-json", encoding="utf-8")
@@ -242,6 +246,7 @@ def test_load_state_rejects_invalid_json(tmp_path: Path) -> None:
         load_state(path)
 
 
+# Leader state must be an object rather than another JSON value.
 def test_load_state_rejects_non_object(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     path.write_text("[]\n", encoding="utf-8")
@@ -249,6 +254,7 @@ def test_load_state_rejects_non_object(tmp_path: Path) -> None:
         load_state(path)
 
 
+# Leader state must contain the required child-PR array.
 def test_load_state_requires_pull_requests_array(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     path.write_text('{"pull-requests": {}}\n', encoding="utf-8")
@@ -256,21 +262,25 @@ def test_load_state_requires_pull_requests_array(tmp_path: Path) -> None:
         load_state(path)
 
 
+# Every child entry must supply its PR URL.
 def test_extract_pr_urls_requires_pr_url() -> None:
     with pytest.raises(GapPrMonitorError, match="pr-url"):
         extract_pr_urls({"pull-requests": [{"repo": "x", "pr-status": "new"}]})
 
 
+# Non-object child entries must be rejected before URL extraction.
 def test_extract_pr_urls_rejects_non_object_entry() -> None:
     with pytest.raises(GapPrMonitorError, match="must be an object"):
         extract_pr_urls({"pull-requests": ["not-an-object"]})
 
 
+# Blank PR URLs must not be accepted as usable child references.
 def test_extract_pr_urls_rejects_blank_pr_url() -> None:
     with pytest.raises(GapPrMonitorError, match="pr-url"):
         extract_pr_urls({"pull-requests": [{"repo": "x", "pr-url": "  "}]})
 
 
+# Applying successful URLs must update only their matching children.
 def test_apply_success_statuses() -> None:
     payload = _sample_state()
     apply_success_statuses(
@@ -280,6 +290,7 @@ def test_apply_success_statuses() -> None:
     assert payload["pull-requests"][1]["pr-status"] == "new"
 
 
+# Mixed decisions must preserve each child's distinct failure or success outcome.
 def test_apply_pr_statuses_mixed() -> None:
     payload = _sample_state()
     apply_pr_statuses(
@@ -293,6 +304,7 @@ def test_apply_pr_statuses_mixed() -> None:
     assert payload["pull-requests"][1]["pr-status"] == "success"
 
 
+# Decisions for unknown URLs must not alter existing child entries.
 def test_apply_pr_statuses_ignores_unknown_urls() -> None:
     payload = _sample_state()
     apply_pr_statuses(payload, {"https://example.com/pull/1": "success"})
@@ -304,6 +316,7 @@ def test_apply_pr_statuses_ignores_unknown_urls() -> None:
 # ---------------------------------------------------------------------------
 
 
+# A valid trigger must resolve its own dated Leader state file.
 def test_state_path_for_trigger(tmp_path: Path) -> None:
     tid = "gap-4e997b5f8c224668b51d2fc8b4677495"
     expected = tmp_path / "GAP Leaders" / f"2026-09-25_{tid}" / "state.json"
@@ -313,6 +326,7 @@ def test_state_path_for_trigger(tmp_path: Path) -> None:
     assert path == expected.resolve()
 
 
+# Multiple dated folders for one trigger must resolve to the latest matching folder.
 def test_state_path_for_trigger_picks_latest_dated_folder(tmp_path: Path) -> None:
     tid = "gap-abc123"
     older = tmp_path / "GAP Leaders" / f"2026-09-20_{tid}" / "state.json"
@@ -323,6 +337,7 @@ def test_state_path_for_trigger_picks_latest_dated_folder(tmp_path: Path) -> Non
     assert state_path_for_trigger(tid, root=tmp_path) == newer.resolve()
 
 
+# Malformed trigger identifiers must fail rather than become filesystem paths.
 @pytest.mark.parametrize(
     "bad_id",
     ["", "   ", "not-a-gap-id", "GAP-abc", "gap", "gap-", "foo-gap-1"],
@@ -332,6 +347,7 @@ def test_state_path_for_trigger_rejects_bad_id(bad_id: str) -> None:
         state_path_for_trigger(bad_id)
 
 
+# An explicit state-file path must take precedence over discovery inputs.
 def test_resolve_state_file_prefers_explicit(tmp_path: Path) -> None:
     explicit = tmp_path / "custom" / "state.json"
     explicit.parent.mkdir()
@@ -340,6 +356,7 @@ def test_resolve_state_file_prefers_explicit(tmp_path: Path) -> None:
     assert resolved == explicit.resolve()
 
 
+# A trigger identifier must resolve to its matching Leader state.
 def test_resolve_state_file_from_trigger(tmp_path: Path) -> None:
     expected = tmp_path / "GAP Leaders" / "2026-09-25_gap-abc123" / "state.json"
     expected.parent.mkdir(parents=True)
@@ -348,6 +365,7 @@ def test_resolve_state_file_from_trigger(tmp_path: Path) -> None:
     assert resolved == expected.resolve()
 
 
+# A GAP label may identify the corresponding Leader state when no stronger input is supplied.
 def test_resolve_state_file_from_gap_label(tmp_path: Path) -> None:
     expected = (
         tmp_path / "GAP Leaders" / "2026-09-25_gap-e2e20260923133000" / "state.json"
@@ -361,6 +379,7 @@ def test_resolve_state_file_from_gap_label(tmp_path: Path) -> None:
     assert resolved == expected.resolve()
 
 
+# An explicit trigger identifier must take precedence over a conflicting label.
 def test_resolve_state_file_trigger_id_wins_over_labels(tmp_path: Path) -> None:
     expected = tmp_path / "GAP Leaders" / "2026-09-25_gap-from-flag" / "state.json"
     expected.parent.mkdir(parents=True)
@@ -377,6 +396,7 @@ def test_resolve_state_file_trigger_id_wins_over_labels(tmp_path: Path) -> None:
     assert resolved == expected.resolve()
 
 
+# Extract a GAP trigger label when present, otherwise report no trigger.
 def test_extract_trigger_id_from_labels() -> None:
     assert (
         extract_trigger_id_from_labels(
@@ -388,6 +408,7 @@ def test_extract_trigger_id_from_labels() -> None:
     assert extract_trigger_id_from_labels([]) is None
 
 
+# Normalize comma-separated labels and tolerate absent or empty input.
 def test_split_labels_csv() -> None:
     assert split_labels_csv("gated-artifacts-promoter, gap-abc ,x") == [
         "gated-artifacts-promoter",
@@ -398,6 +419,7 @@ def test_split_labels_csv() -> None:
     assert split_labels_csv(None) == []
 
 
+# Explicit CLI inputs must override environment-provided defaults.
 def test_resolve_inputs_for_cli_prefers_cli_over_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -417,6 +439,7 @@ def test_resolve_inputs_for_cli_prefers_cli_over_env(
     assert leader == "https://github.com/org/leader/pull/9"
 
 
+# Missing CLI inputs may use the configured environment defaults.
 def test_resolve_inputs_for_cli_reads_env_when_cli_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -438,6 +461,7 @@ def test_resolve_inputs_for_cli_reads_env_when_cli_empty(
     assert leader == "https://github.com/org/leader/pull/2"
 
 
+# GitHub output must use the expected repository-relative state path.
 def test_append_github_output_and_relative_path(tmp_path: Path) -> None:
     out = tmp_path / "github_output"
     root = tmp_path / "repo"
@@ -452,6 +476,7 @@ def test_append_github_output_and_relative_path(tmp_path: Path) -> None:
     assert out.read_text(encoding="utf-8") == "state_path=GAP Leaders/2026-09-25_gap-x/state.json\n"
 
 
+# CI environment inputs must resolve state and emit its path through GitHub output.
 def test_main_writes_github_output_from_ci_env(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -484,6 +509,7 @@ def test_main_writes_github_output_from_ci_env(
     )
 
 
+# Directory fallback is safe only when exactly one Leader state is available.
 def test_resolve_state_file_gap_dir_fallback_exactly_one(tmp_path: Path) -> None:
     only = tmp_path / "GAP Leaders" / "2026-09-25_gap-onlyone" / "state.json"
     only.parent.mkdir(parents=True)
@@ -497,6 +523,7 @@ def test_resolve_state_file_gap_dir_fallback_exactly_one(tmp_path: Path) -> None
     assert resolved == only.resolve()
 
 
+# Ambiguous directory fallback must fail instead of choosing an arbitrary Leader.
 def test_resolve_state_file_gap_dir_fallback_rejects_many(tmp_path: Path) -> None:
     for name in ("gap-one", "gap-two"):
         p = tmp_path / "GAP Leaders" / f"2026-09-25_{name}" / "state.json"
@@ -506,11 +533,13 @@ def test_resolve_state_file_gap_dir_fallback_rejects_many(tmp_path: Path) -> Non
         resolve_state_file(root=tmp_path, allow_gap_dir_fallback=True)
 
 
+# Missing concrete state-selection inputs must produce an explicit error.
 def test_resolve_state_file_requires_concrete_source() -> None:
     with pytest.raises(GapPrMonitorError, match="Cannot locate state.json"):
         resolve_state_file()
 
 
+# Unrelated state files must never be discovered through an unrestricted fallback search.
 def test_resolve_state_file_no_loose_find_without_fallback(tmp_path: Path) -> None:
     """Without gap-* label/trigger, random state.json must NOT be used."""
     loose = tmp_path / "random" / "state.json"
@@ -525,6 +554,7 @@ def test_resolve_state_file_no_loose_find_without_fallback(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
+# PR inspection must request the expected GitHub fields and parse merge metadata correctly.
 def test_fetch_pr_merge_info_builds_gh_command_and_parses() -> None:
     seen: list[list[str]] = []
 
@@ -558,6 +588,7 @@ def test_fetch_pr_merge_info_builds_gh_command_and_parses() -> None:
     assert info.pr.number == 20
 
 
+# Null mergeability fields must remain unknown rather than become conflicts.
 def test_fetch_pr_merge_info_handles_null_mergeable() -> None:
     def fake_gh(args: list[str]) -> str:
         return json.dumps(
@@ -578,6 +609,7 @@ def test_fetch_pr_merge_info_handles_null_mergeable() -> None:
     assert info.state == "OPEN"
 
 
+# Malformed GitHub JSON must raise a monitor error.
 def test_fetch_pr_merge_info_invalid_json() -> None:
     def fake_gh(args: list[str]) -> str:
         return "not-json{"
@@ -589,6 +621,7 @@ def test_fetch_pr_merge_info_invalid_json() -> None:
         )
 
 
+# Invalid PR URLs must be rejected before constructing an inspection request.
 def test_fetch_pr_merge_info_invalid_url() -> None:
     with pytest.raises(ValueError):
         fetch_pr_merge_info("not-a-url", gh_runner=lambda a: "{}")
@@ -599,6 +632,7 @@ def test_fetch_pr_merge_info_invalid_url() -> None:
 # ---------------------------------------------------------------------------
 
 
+# Explicit conflicting mergeability must produce a merge-failure decision.
 def test_classify_conflicting_mergeable() -> None:
     decision = classify_pr(
         _info(mergeable="CONFLICTING", merge_state_status="DIRTY"),
@@ -609,6 +643,7 @@ def test_classify_conflicting_mergeable() -> None:
     assert "merge conflict" in decision.description
 
 
+# A dirty merge state is sufficient conflict evidence even without a matching mergeable value.
 def test_classify_dirty_merge_state_alone() -> None:
     """DIRTY in mergeStateStatus is enough even if mergeable is odd."""
     decision = classify_pr(
@@ -618,6 +653,7 @@ def test_classify_dirty_merge_state_alone() -> None:
     assert decision.pr_status == "merge-failure"
 
 
+# A mergeable PR may pass the mergeability stage without skipping status publication.
 def test_classify_mergeable_success() -> None:
     decision = classify_pr(
         _info(mergeable="MERGEABLE", merge_state_status="CLEAN"),
@@ -628,6 +664,7 @@ def test_classify_mergeable_success() -> None:
     assert decision.skip_status_post is False
 
 
+# Non-conflict merge states must not be mislabeled as merge failures.
 @pytest.mark.parametrize("merge_state", ["CLEAN", "UNSTABLE", "BEHIND", "BLOCKED", "HAS_HOOKS"])
 def test_classify_non_conflict_merge_states_are_success(merge_state: str) -> None:
     decision = classify_pr(
@@ -637,6 +674,7 @@ def test_classify_non_conflict_merge_states_are_success(merge_state: str) -> Non
     assert decision.pr_status == "success"
 
 
+# Already merged PRs must skip further child-status publication.
 def test_classify_already_merged_skips_post() -> None:
     decision = classify_pr(
         _info(state="MERGED", mergeable=None, merge_state_status=None),
@@ -646,6 +684,7 @@ def test_classify_already_merged_skips_post() -> None:
     assert decision.skip_status_post is True
 
 
+# Unknown mergeability may resolve after the bounded retry delay without a false conflict.
 def test_classify_unknown_retries_then_success(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -676,6 +715,7 @@ def test_classify_unknown_retries_then_success(
     assert decision.pr_status == "success"
 
 
+# A retry that establishes a conflict must return a failure decision.
 def test_classify_unknown_retries_then_conflict(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -704,6 +744,8 @@ def test_classify_unknown_retries_then_conflict(
 # ---------------------------------------------------------------------------
 
 
+# Stage-one monitoring must persist distinct child decisions without directly concluding the
+# Leader.
 def test_run_stage1_monitor_posts_success_and_merge_failure(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(path, _sample_state())
@@ -754,6 +796,7 @@ def test_run_stage1_monitor_posts_success_and_merge_failure(tmp_path: Path) -> N
     assert result.leader_status_posted is False
 
 
+# Merged children remain successful in state but receive no redundant status post.
 def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(
@@ -798,6 +841,8 @@ def test_run_stage1_monitor_skips_status_for_merged(tmp_path: Path) -> None:
     assert result.overall_status == "early-gate-triggered"
 
 
+# Pending children keep the batch open; all-success waits for early gates and terminal failure
+# concludes it.
 def test_compute_overall_status_in_progress_and_terminal() -> None:
     assert (
         compute_overall_status(
@@ -858,10 +903,12 @@ def test_compute_overall_status_in_progress_and_terminal() -> None:
     )
 
 
+# An empty child batch must not be treated as a completed promotion.
 def test_compute_overall_status_empty_prs() -> None:
     assert compute_overall_status({"pull-requests": []}) is None
 
 
+# An all-conflict batch must conclude with failure.
 def test_compute_overall_status_all_merge_failure() -> None:
     assert (
         compute_overall_status(
@@ -886,6 +933,7 @@ def test_compute_overall_status_all_merge_failure() -> None:
     )
 
 
+# One failed child is sufficient for failure once all children have concluded.
 def test_compute_overall_status_two_success_one_failure() -> None:
     assert (
         compute_overall_status(
@@ -916,6 +964,7 @@ def test_compute_overall_status_two_success_one_failure() -> None:
     )
 
 
+# New children must keep a mixed batch in progress.
 def test_compute_overall_status_mixed_with_new_stays_in_progress() -> None:
     assert (
         compute_overall_status(
@@ -940,6 +989,7 @@ def test_compute_overall_status_mixed_with_new_stays_in_progress() -> None:
     )
 
 
+# Pending builds must not be treated as terminal stage-one outcomes.
 def test_compute_overall_status_build_pending_not_stage1_final() -> None:
     assert (
         compute_overall_status(
@@ -964,6 +1014,8 @@ def test_compute_overall_status_build_pending_not_stage1_final() -> None:
     )
 
 
+# Overall outcomes must be projected into structured gates while clearing the legacy status
+# field.
 def test_apply_overall_status_set_and_clear() -> None:
     from lib.gap_promotion_gates import get_gate_status
 
@@ -979,11 +1031,14 @@ def test_apply_overall_status_set_and_clear() -> None:
     assert "overall-status" not in payload
 
 
+# Invalid overall-status values must fail validation.
 def test_apply_overall_status_rejects_invalid() -> None:
     with pytest.raises(GapPrMonitorError, match="Invalid overall-status"):
         apply_overall_status({"pull-requests": []}, "pending")
 
 
+# After publication, an all-success batch must trigger early gates instead of concluding the
+# Leader.
 def test_run_stage1_monitor_posts_leader_conclusion_status(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1049,6 +1104,7 @@ def test_run_stage1_monitor_posts_leader_conclusion_status(
     assert gates["component-builds"] == "success"
 
 
+# Stage-one failure may update component gates but must not directly green the Leader.
 def test_run_stage1_monitor_writes_failure_without_leader_automerge(
     tmp_path: Path,
 ) -> None:
@@ -1098,6 +1154,7 @@ def test_run_stage1_monitor_writes_failure_without_leader_automerge(
     assert gates["component-builds"] == "failure"
 
 
+# Three successful children must still wait for early gates rather than conclude the Leader.
 def test_run_stage1_monitor_three_children_all_success_posts_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1174,6 +1231,7 @@ def test_run_stage1_monitor_three_children_all_success_posts_leader(
     assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
 
 
+# A stage-one mixed failure must not bypass the coordinator's Leader-publication boundary.
 def test_run_stage1_monitor_two_success_one_failure_no_leader_signal(
     tmp_path: Path,
 ) -> None:
@@ -1246,6 +1304,7 @@ def test_run_stage1_monitor_two_success_one_failure_no_leader_signal(
     assert gates["component-builds"] == "failure"
 
 
+# Without a Leader URL, persist component success and warn rather than post a Leader status.
 def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
     tmp_path: Path,
     capsys: pytest.CaptureFixture[str],
@@ -1295,6 +1354,7 @@ def test_run_stage1_monitor_all_success_without_leader_url_writes_overall(
     assert "no Leader PR URL" in err
 
 
+# Dry-run monitoring must leave stored child statuses unchanged.
 def test_run_stage1_monitor_dry_run_does_not_write(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(path, _sample_state())
@@ -1323,6 +1383,7 @@ def test_run_stage1_monitor_dry_run_does_not_write(tmp_path: Path) -> None:
     assert "overall-status" not in saved
 
 
+# A monitor run with no child PRs must fail explicitly.
 def test_run_stage1_monitor_empty_prs_raises(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(path, {"pull-requests": []})
@@ -1334,6 +1395,7 @@ def test_run_stage1_monitor_empty_prs_raises(tmp_path: Path) -> None:
         )
 
 
+# Inspection errors must abort when continue-on-error is disabled.
 def test_run_stage1_monitor_inspect_error_without_continue(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(path, _sample_state())
@@ -1347,6 +1409,7 @@ def test_run_stage1_monitor_inspect_error_without_continue(tmp_path: Path) -> No
         )
 
 
+# Continue-on-error must preserve successful partial progress but still report the failed run.
 def test_run_stage1_monitor_continue_on_error_partial(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(path, _sample_state())
@@ -1383,6 +1446,7 @@ def test_run_stage1_monitor_continue_on_error_partial(tmp_path: Path) -> None:
     assert "overall-status" not in saved
 
 
+# Failed status publication must surface as a monitor error.
 def test_run_stage1_monitor_post_error_hard_fail(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(
@@ -1417,6 +1481,7 @@ def test_run_stage1_monitor_post_error_hard_fail(tmp_path: Path) -> None:
         run_stage1_monitor(path, updater_factory=BoomUpdater, gh_runner=fake_gh)
 
 
+# A caller-supplied description must reach the child-status update.
 def test_run_stage1_monitor_description_override(tmp_path: Path) -> None:
     path = tmp_path / "state.json"
     save_state(
@@ -1462,10 +1527,12 @@ def test_run_stage1_monitor_description_override(tmp_path: Path) -> None:
 # ---------------------------------------------------------------------------
 
 
+# The CLI must fail when it cannot identify a state file or trigger.
 def test_main_requires_state_or_trigger() -> None:
     assert main([]) == 1
 
 
+# A successful CLI run must report its decisions and status-publication summary.
 def test_main_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1498,6 +1565,7 @@ def test_main_success(
     assert "Posted status" in out
 
 
+# A CLI trigger identifier must select the expected Leader state path.
 def test_main_with_trigger_id(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1527,6 +1595,7 @@ def test_main_with_trigger_id(
     assert seen["path"] == expected.resolve()
 
 
+# Monitor errors must produce a failing CLI exit and diagnostic message.
 def test_main_reports_monitor_error(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1548,6 +1617,7 @@ def test_main_reports_monitor_error(
 # ---------------------------------------------------------------------------
 
 
+# Open-Leader discovery must use the requested label and parse branch and label metadata.
 def test_list_open_leader_prs_parses_gh_json() -> None:
     payload = [
         {
@@ -1576,6 +1646,7 @@ def test_list_open_leader_prs_parses_gh_json() -> None:
     )
 
 
+# An explicit Leader URL must pass through without being replaced by discovery.
 def test_resolve_leader_pr_url_input_passes_through_url() -> None:
     url = "https://github.com/org/gap/pull/99"
     assert (
@@ -1588,6 +1659,7 @@ def test_resolve_leader_pr_url_input_passes_through_url() -> None:
     )
 
 
+# Latest-Leader selection must choose the highest open PR number.
 def test_resolve_leader_pr_url_input_latest_picks_highest_number() -> None:
     payload = [
         {
@@ -1615,6 +1687,7 @@ def test_resolve_leader_pr_url_input_latest_picks_highest_number() -> None:
     assert resolved == "https://github.com/org/gap/pull/40"
 
 
+# Latest-Leader selection must fail clearly when no open Leader exists.
 def test_resolve_leader_pr_url_input_latest_errors_when_none_open() -> None:
     with pytest.raises(GapPrMonitorError, match="No open Leader PRs"):
         resolve_leader_pr_url_input(
@@ -1624,6 +1697,7 @@ def test_resolve_leader_pr_url_input_latest_errors_when_none_open() -> None:
         )
 
 
+# Schedule mode must honor either its explicit flag or the configured event context.
 def test_should_run_schedule_mode_from_flag_and_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1634,6 +1708,7 @@ def test_should_run_schedule_mode_from_flag_and_env(
     assert should_run_schedule_mode(schedule_flag=False) is True
 
 
+# Leader repository selection must prefer CLI input, then configured environment fallbacks.
 def test_resolve_leader_repo_prefers_cli_then_env(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1645,6 +1720,7 @@ def test_resolve_leader_repo_prefers_cli_then_env(
     assert resolve_leader_repo(None) == "from/actions"
 
 
+# A scheduled run with no open Leaders must exit successfully without doing work.
 def test_run_scheduled_monitors_no_open_leaders(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1659,6 +1735,7 @@ def test_run_scheduled_monitors_no_open_leaders(
     assert "No open Leader PRs" in capsys.readouterr().out
 
 
+# Scheduled monitoring must check out and publish each discovered Leader branch.
 def test_run_scheduled_monitors_runs_each_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1719,6 +1796,7 @@ def test_run_scheduled_monitors_runs_each_leader(
     assert seen["leader_pr_url"] == "https://github.com/org/gap/pull/28"
 
 
+# Schedule mode must route the CLI to the scheduled coordinator with the resolved repository.
 def test_main_schedule_uses_scheduled_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1753,6 +1831,7 @@ def test_main_schedule_uses_scheduled_path(
 # ---------------------------------------------------------------------------
 
 
+# Publishing unchanged state must return the existing SHA without an empty commit.
 def test_publish_state_returns_sha_without_empty_commit(
     tmp_path: Path,
 ) -> None:
@@ -1780,6 +1859,7 @@ def test_publish_state_returns_sha_without_empty_commit(
     assert not any(c[:1] == ["commit"] for c in calls)
 
 
+# A rejected push may perform the bounded fetch/rebase retry sequence.
 def test_push_head_with_rebase_retries_after_rejection(tmp_path: Path) -> None:
     from scripts.gap_pr_monitor import _push_head_with_rebase
 
@@ -1807,6 +1887,7 @@ def test_push_head_with_rebase_retries_after_rejection(tmp_path: Path) -> None:
     assert ["pull", "--rebase", "origin", "gap-leader/gap-abc"] in calls
 
 
+# Exhausting push retries must surface rejection rather than report publication success.
 def test_push_head_with_rebase_raises_after_max_attempts(tmp_path: Path) -> None:
     from scripts.gap_pr_monitor import _push_head_with_rebase
 
@@ -1824,6 +1905,7 @@ def test_push_head_with_rebase_raises_after_max_attempts(tmp_path: Path) -> None
         )
 
 
+# Staged state changes must be committed and pushed before returning their new published SHA.
 def test_publish_state_commits_when_staged(
     tmp_path: Path,
 ) -> None:
@@ -1856,6 +1938,7 @@ def test_publish_state_commits_when_staged(
     assert any(c[:1] == ["fetch"] for c in calls)
 
 
+# A moved Leader head must invalidate the expected publication identity.
 def test_verify_leader_head_rejects_moved_sha() -> None:
     updater = FakeUpdater(check_name="gated artifacts promoter")
     updater.head_sha = "other-sha"
@@ -1867,6 +1950,7 @@ def test_verify_leader_head_rejects_moved_sha() -> None:
         )
 
 
+# Save and publish state before requesting early gates; do not prematurely conclude the Leader.
 def test_coordinator_posts_leader_only_after_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1931,6 +2015,7 @@ def test_coordinator_posts_leader_only_after_publish(
     assert "eg_comment" in order
 
 
+# Terminal failure must publish first, then signal batch conclusion on the published SHA.
 def test_coordinator_failure_publishes_and_greens_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1985,6 +2070,8 @@ def test_coordinator_failure_publishes_and_greens_leader(
     assert leader_post[2].get("description") == "GAP: overall failure"
 
 
+# The coordinator must pass published-state context to the failure summary, with tracking
+# unchecked by default.
 def test_coordinator_calls_failure_summary_after_publish(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2036,8 +2123,10 @@ def test_coordinator_calls_failure_summary_after_publish(
     assert calls[0]["leader_pr_url"] == leader
     assert calls[0]["state_path"] == path
     assert calls[0]["dry_run"] is True
+    assert calls[0]["tracking"] == {"status": "not_checked"}
 
 
+# A failure-summary exception must not invalidate an otherwise published gate result.
 def test_coordinator_failure_summary_errors_do_not_fail_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2081,6 +2170,7 @@ def test_coordinator_failure_summary_errors_do_not_fail_gate(
     assert result.published_sha == "published-sha-abc"
 
 
+# A terminal mixed failure must signal Leader conclusion, not claim that every child succeeded.
 def test_coordinator_mixed_children_failure_greens_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2148,6 +2238,7 @@ def test_coordinator_mixed_children_failure_greens_leader(
     assert leader_post[2].get("description") == "GAP: overall failure"
 
 
+# Non-terminal outcomes must be rejected before posting a Leader-conclusion status.
 def test_post_leader_conclusion_rejects_non_terminal_overall() -> None:
     updater = FakeUpdater(check_name="gated artifacts promoter")
     with pytest.raises(GapPrMonitorError, match="overall-status"):
@@ -2160,6 +2251,7 @@ def test_post_leader_conclusion_rejects_non_terminal_overall() -> None:
     assert updater.posts == []
 
 
+# Pending work may publish state but must not green the Leader.
 def test_coordinator_pending_overall_skips_leader_green(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2210,6 +2302,7 @@ def test_coordinator_pending_overall_skips_leader_green(
     assert "u" not in holder
 
 
+# The CLI publication flag must route through the publish-then-signal coordinator.
 def test_main_publish_state_flag_uses_coordinator(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2250,6 +2343,7 @@ def test_main_publish_state_flag_uses_coordinator(
     assert seen["leader"] == "https://github.com/org/gap/pull/1"
 
 
+# Dry-run publication must return its preview SHA without committing or pushing.
 def test_publish_state_dry_run_skips_commit_and_push(tmp_path: Path) -> None:
     state = tmp_path / "state.json"
     save_state(state, _sample_state())
@@ -2274,6 +2368,7 @@ def test_publish_state_dry_run_skips_commit_and_push(tmp_path: Path) -> None:
     assert not any(c[:1] == ["push"] for c in calls)
 
 
+# Without publication, even an existing success must not cause a Leader-status post.
 def test_coordinator_without_publish_skips_leader_green(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2325,6 +2420,8 @@ def test_coordinator_without_publish_skips_leader_green(
     assert "u" not in holder
 
 
+# Stage one must leave all-success children pending for early gates and never post directly to
+# the Leader.
 def test_run_stage1_monitor_no_longer_posts_leader_directly(
     tmp_path: Path,
 ) -> None:
@@ -2378,6 +2475,7 @@ def test_run_stage1_monitor_no_longer_posts_leader_directly(
 # ---------------------------------------------------------------------------
 
 
+# Only a nonempty batch of terminal child outcomes counts as concluded.
 def test_children_batch_concluded_helpers() -> None:
     assert children_batch_concluded([]) is False
     assert children_batch_concluded(["success"]) is True
@@ -2388,6 +2486,7 @@ def test_children_batch_concluded_helpers() -> None:
     assert children_batch_concluded(["build-pending"]) is False
 
 
+# Successful-child publication must respect batch completion and early-gate hold conditions.
 @pytest.mark.parametrize(
     ("pr_status", "batch_concluded", "overall_status", "expected"),
     [
@@ -2420,6 +2519,7 @@ def test_should_defer_child_success_status(
     )
 
 
+# Deferring success must create a pending post decision without changing the original decision.
 def test_status_decision_for_post_defers_success_when_batch_open() -> None:
     decision = RepositoryGateDecision(
         url="https://github.com/org/a/pull/1",
@@ -2438,6 +2538,8 @@ def test_status_decision_for_post_defers_success_when_batch_open() -> None:
     assert decision.cli_status == "success"
 
 
+# A successful child may retain success when the concluded batch contains another child's
+# failure.
 def test_status_decision_for_post_keeps_success_when_batch_done_overall_failure() -> None:
     decision = RepositoryGateDecision(
         url="https://github.com/org/a/pull/1",
@@ -2454,6 +2556,7 @@ def test_status_decision_for_post_keeps_success_when_batch_done_overall_failure(
     assert posted.cli_status == "success"
 
 
+# An early-gate wait must replace child green with an explicit pending explanation.
 def test_status_decision_for_post_defers_when_early_gate_triggered() -> None:
     from scripts.gap_pr_monitor import WAITING_FOR_EARLY_GATE_DESCRIPTION
 
@@ -2473,6 +2576,7 @@ def test_status_decision_for_post_defers_when_early_gate_triggered() -> None:
 
 
 
+# A child's failure must remain publishable while sibling work is still pending.
 def test_status_decision_for_post_keeps_failure_while_batch_open() -> None:
     decision = RepositoryGateDecision(
         url="https://github.com/org/a/pull/1",
@@ -2487,6 +2591,7 @@ def test_status_decision_for_post_keeps_failure_while_batch_open() -> None:
     assert posted.cli_status == "failure"
 
 
+# Already merged decisions must retain their skip-post behavior during deferral.
 def test_status_decision_for_post_skips_merged() -> None:
     decision = RepositoryGateDecision(
         url="https://github.com/org/a/pull/1",
@@ -2500,6 +2605,7 @@ def test_status_decision_for_post_skips_merged() -> None:
     assert status_decision_for_post(decision, batch_concluded=False) is decision
 
 
+# Stage-one decisions must support the same pending-success deferral as repository decisions.
 def test_status_decision_for_post_works_with_stage1_pr_decision() -> None:
     decision = PrDecision(
         url="https://github.com/org/a/pull/1",
@@ -2530,6 +2636,7 @@ def _gate(
     )
 
 
+# A successful child must remain pending on GitHub until its sibling finishes.
 def test_run_monitor_defers_success_while_sibling_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2589,6 +2696,7 @@ def test_run_monitor_defers_success_while_sibling_pending(
     assert "overall-status" not in saved
 
 
+# Once a mixed batch concludes, successful children go green while failed children stay failed.
 def test_run_monitor_greens_only_good_children_when_batch_fails(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2643,6 +2751,7 @@ def test_run_monitor_greens_only_good_children_when_batch_fails(
     assert gates["component-builds"] == "failure"
 
 
+# An all-success batch must hold every child pending until early gates conclude.
 def test_run_monitor_holds_child_green_when_all_succeed_for_early_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2698,6 +2807,7 @@ def test_run_monitor_holds_child_green_when_all_succeed_for_early_gate(
     assert all(e["pr-status"] == "success" for e in saved["pull-requests"])
 
 
+# Child failure must be posted immediately rather than waiting for a pending sibling.
 def test_run_monitor_posts_failure_immediately_while_sibling_pending(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2747,6 +2857,7 @@ def test_run_monitor_posts_failure_immediately_while_sibling_pending(
     assert "overall-status" not in saved
 
 
+# Even a single successful child must wait for the early-gate conclusion.
 def test_run_monitor_single_success_child_holds_for_early_gate(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2785,6 +2896,7 @@ def test_run_monitor_single_success_child_holds_for_early_gate(
     assert holder["u"].posts[0][2].get("description") == WAITING_FOR_EARLY_GATE_DESCRIPTION
 
 
+# Pending siblings must prevent both child green and Leader conclusion.
 def test_coordinator_defers_child_green_until_batch_then_greens_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2853,6 +2965,8 @@ def test_coordinator_defers_child_green_until_batch_then_greens_leader(
     assert all(u != leader for u, _s, _k in holder["u"].posts)
 
 
+# A concluded mixed batch must post individual child outcomes and the Leader's conclusion
+# signal.
 def test_coordinator_greens_good_children_and_leader_on_mixed_failure(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2927,6 +3041,7 @@ def test_coordinator_greens_good_children_and_leader_on_mixed_failure(
 # ---------------------------------------------------------------------------
 
 
+# An already recorded final success must not regress to an early-gate wait.
 def test_compute_overall_preserves_existing_final_success() -> None:
     assert (
         compute_overall_status(
@@ -2946,6 +3061,7 @@ def test_compute_overall_preserves_existing_final_success() -> None:
     )
 
 
+# An already recorded final failure must remain terminal.
 def test_compute_overall_preserves_existing_final_failure() -> None:
     assert (
         compute_overall_status(
@@ -2971,6 +3087,7 @@ def test_compute_overall_preserves_existing_final_failure() -> None:
     )
 
 
+# Early-gate-triggered state must be represented through component gates, not the legacy field.
 def test_apply_overall_status_accepts_early_gate_triggered() -> None:
     from lib.gap_promotion_gates import get_gate_status
 
@@ -2981,6 +3098,7 @@ def test_apply_overall_status_accepts_early_gate_triggered() -> None:
 
 
 
+# Build-success child states must advance the batch to its early-gate wait.
 def test_compute_overall_accepts_build_success_children() -> None:
     assert (
         compute_overall_status(
@@ -3005,6 +3123,7 @@ def test_compute_overall_accepts_build_success_children() -> None:
     )
 
 
+# Recognized early-gate comment variants must prevent accidental duplicate triggers.
 def test_early_gate_comment_already_present_detects_variants() -> None:
     leader = "https://github.com/org/gap/pull/9"
     comments = json.dumps(
@@ -3021,6 +3140,7 @@ def test_early_gate_comment_already_present_detects_variants() -> None:
     assert early_gate_comment_already_present(leader, gh_runner=gh) is True
 
 
+# Unrelated comments must not be mistaken for an existing early-gate trigger.
 def test_early_gate_comment_already_present_false_when_missing() -> None:
     leader = "https://github.com/org/gap/pull/9"
 
@@ -3030,6 +3150,7 @@ def test_early_gate_comment_already_present_false_when_missing() -> None:
     assert early_gate_comment_already_present(leader, gh_runner=gh) is False
 
 
+# An existing early-gate trigger must suppress another comment by default.
 def test_post_early_gate_trigger_comment_idempotent() -> None:
     leader = "https://github.com/org/gap/pull/9"
     calls: list[list[str]] = []
@@ -3044,6 +3165,7 @@ def test_post_early_gate_trigger_comment_idempotent() -> None:
     assert all(c[0] == "api" for c in calls)
 
 
+# A missing early-gate trigger must produce exactly one comment.
 def test_post_early_gate_trigger_comment_posts_once() -> None:
     leader = "https://github.com/org/gap/pull/9"
     calls: list[list[str]] = []
@@ -3062,6 +3184,7 @@ def test_post_early_gate_trigger_comment_posts_once() -> None:
     assert EARLY_GATE_COMMENT_BODY in comment_calls[0]
 
 
+# Explicit retrigger permission may post again despite an existing trigger comment.
 def test_post_early_gate_trigger_comment_allows_retrigger() -> None:
     leader = "https://github.com/org/gap/pull/9"
     comments: list[str] = []
@@ -3080,6 +3203,7 @@ def test_post_early_gate_trigger_comment_allows_retrigger() -> None:
     assert comments == [EARLY_GATE_COMMENT_BODY]
 
 
+# A changed child head must reset obsolete overall and promotion-gate state.
 def test_record_child_head_shas_detects_change() -> None:
     child = "https://github.com/org/repo/pull/1"
     payload = {
@@ -3107,6 +3231,7 @@ def test_record_child_head_shas_detects_change() -> None:
     }
 
 
+# An all-success batch must request early gates without prematurely posting Leader completion.
 def test_coordinator_all_success_comments_early_gate_no_leader_green(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3165,6 +3290,7 @@ def test_coordinator_all_success_comments_early_gate_no_leader_green(
     assert "u" not in holder
 
 
+# Existing early-gate comments must suppress duplicate triggers and premature Leader completion.
 def test_coordinator_early_gate_skips_duplicate_comment(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3221,6 +3347,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     assert comment_posts == 0
 
 
+# Changed child heads must permit a fresh early-gate trigger.
 def test_coordinator_retriggers_after_child_head_changes(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3274,6 +3401,8 @@ def test_coordinator_retriggers_after_child_head_changes(
     assert comment_posts == 1
 
 
+# Preserve recorded success without posting another early-gate comment or Leader status in this
+# case.
 def test_coordinator_preserves_success_and_greens_leader(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -3322,6 +3451,7 @@ def test_coordinator_preserves_success_and_greens_leader(
     assert result.leader_status_posted is False
 
 
+# Recorded overall success must release a successful child's status from its early-gate hold.
 def test_run_monitor_greens_children_when_overall_already_success(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

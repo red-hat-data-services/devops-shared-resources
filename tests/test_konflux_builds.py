@@ -146,6 +146,58 @@ def test_snapshot_key_resolves_unique_physical_component_only():
     assert observe([run(component="odh-foo-v3-6")]).status == "missing"
 
 
+# Completion metadata is retained from the selected attempt without changing the verdict.
+@pytest.mark.parametrize('status,reason', [('True', 'Succeeded'), ('False', 'Failed'),
+    ('False', 'PipelineRunTimeout'), ('False', 'PipelineRunCancelled')])
+def test_completion_time_is_serialized_in_utc(status, reason):
+    item = run(status=status, reason=reason)
+    item['status']['completionTime'] = '2026-11-05T11:01:31+01:00'
+    actual = observe([item])
+    assert actual.to_dict()['completed_at'] == '2026-11-05T10:01:31+00:00'
+    assert actual.created_at == '2026-11-05T10:00:00Z'
+    assert actual.status == observe([run(status=status, reason=reason)]).status
+
+
+# Malformed/naive/impossible display timestamps must not invent a time or alter existing gate policy.
+@pytest.mark.parametrize('value', [None, {}, [], True, 'bad', '2026-11-05T10:01:00',
+    '0001-01-01T00:00:00+23:00', '2026-11-05T09:00:00Z'])
+def test_invalid_completion_is_unavailable_without_changing_verdict(value):
+    item = run(status='False', reason='Failed')
+    item['status']['completionTime'] = value
+    actual = observe([item])
+    assert actual.completed_at == ''
+    assert actual.status == ('failure' if value else 'unknown')
+
+
+# A retry must never inherit the previous attempt's completion time, even if it is still pending.
+def test_latest_attempt_does_not_reuse_old_completion():
+    old = run(status='False', reason='Failed')
+    newer = run(name='new-run', created='2026-11-05T12:00:00Z', status='Unknown', reason='Running')
+    newer['status']['completionTime'] = '2026-11-05T12:01:00Z'
+    actual = observe([old, newer])
+    assert actual.name == 'new-run' and actual.status == 'pending' and actual.completed_at == ''
+
+
+# Completion time must survive receipt serialization and collection into the human Slack message.
+def test_completion_and_commit_flow_from_reader_to_slack():
+    from gap_notification_fakes import state
+    from lib.gap_notifications.analyze_leader_state import collect_build_observations
+    from lib.gap_notifications.dispatch_incidents import ENVIRONMENT
+    from lib.gap_notifications.notify_tools import slack_message
+    selected = observe([run(status='False', reason='Failed')]).to_dict()
+    payload = state(repo=REPO, pr_url='https://github.com/acme/foo/pull/123', head_sha=SHA,
+                    expected_components=[COMPONENT], runs=[selected])
+    payload['pull-requests'][0]['build-observations']['pr'] = 123
+    payload = json.loads(json.dumps(payload))
+    observations = collect_build_observations(payload, environment=ENVIRONMENT,
+        leader_url='https://github.com/acme/promoter/pull/84', state_url='https://github.com/acme/promoter/blob/head/state.json')
+    assert len(observations) == 1 and observations[0]['status'] == 'failure'
+    text = slack_message(observations[0], jira_url='https://stage-redhat.atlassian.net/browse/RHAI-1')
+    assert '*Build failed at:* 2026-11-05 10:01:00 UTC' in text
+    assert f'<https://github.com/acme/foo/commit/{SHA}|Commit aaaaaaa>' in text
+    assert '2026-11-06' not in text
+
+
 def record(item):
     return item
 

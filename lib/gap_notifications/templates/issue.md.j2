@@ -1,0 +1,41 @@
+# {{ notification_heading }}
+
+{{ destination_notice }}
+
+Historical snapshot: {{ historical }}; synthetic evidence: {{ synthetic }}. Missing flags are unavailable, not an assertion of live evidence.
+
+{{ note }}
+
+## Failure
+
+- Repository: {{ repository }}
+- Category: {{ category }}
+- Actual promotion stream: {{ source_branch }} → {{ destination_branch }}
+- Reason: {{ reason }}
+- Component: {{ component }}
+- Pipeline: {{ pipeline }}
+
+## Explicitly affected targets
+
+{% for target in targets %}- {{ target.branch }}: {{ target.reason }}; component: {{ target.component }}; pipeline: {{ target.pipeline }}
+{% else %}Unavailable. No targets inferred from the promotion destination or prose.
+{% endfor %}
+## Evidence links
+
+{% for link in links %}- [{{ link.label }}]({{ link.url }})
+{% else %}Unavailable.
+{% endfor %}
+## Diagnostics
+
+- Revision: `{{ revision }}`
+- Event: `{{ observation_id }}`
+{% if discussion_url %}
+## Slack discussion
+
+[Open Slack discussion]({{ discussion_url }})
+{% endif %}
+{% if metadata_url %}
+## Notification metadata
+
+[View notification metadata (JSON — source of truth)]({{ metadata_url }}) Jira permissions required.
+{% endif %}

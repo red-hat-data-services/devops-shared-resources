@@ -11,6 +11,8 @@ requires-python = ">=3.10"
 dependencies = [
     "PyYAML>=6.0",
     "requests>=2.31.0",
+    "atlassian-python-api==5.0.5",
+    "slack_sdk==3.46.0",
     "cel-python",
     "jinja2",
     "ruamel.yaml",
@@ -28,3 +30,7 @@ pythonpath = ["."]
 
 [tool.setuptools.packages.find]
 include = ["lib*"]
+
+[tool.setuptools.package-data]
+lib = ["templates/*.md.j2"]
+"lib.gap_notifications" = ["templates/*.md.j2"]

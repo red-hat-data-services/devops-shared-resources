@@ -1,16 +1,22 @@
 #!/usr/bin/env python3
-"""GAP failure reporter — upsert a Leader summary table for failing/closed children.
+"""Best-effort Leader failure/pending/closed table, separate from promotion gates.
 
-Separate from Stage-1 build gating. Each run (hourly schedule or dispatch):
+Resolve an explicit or scheduled Leader, load its state, and gather relevant
+child rows using persisted monitor evidence when requested or existing GitHub
+PR/check diagnostics otherwise. Keep reasons paired with build links, then
+create/update one comment marked <!-- gap-failure-summary --> rather than
+adding a new comment each run.
 
-1. Resolve open Leader PR(s) (or an explicit ``--leader-pr-url``).
-2. Read that Leader's ``state.json``.
-3. For build-failure / merge-failure / build-pending / closed children, gather
-   GitHub PR state, GAP commit-status description, comment-derived close
-   reasons, and (for build-failure) failed Konflux ``on-pull-request`` checks
-   from GitHub Checks (PipelineRun / check URL; no cluster token).
-4. Upsert **one** Leader issue comment marked ``<!-- gap-failure-summary -->``
-   (create once, then PATCH the same comment) so the thread stays tidy.
+An optional structured tracking handoff adds component-labelled Jira/Slack
+pairs from separately validated registry data. Standalone refresh does not
+implicitly acquire notification credentials or look up tickets: absent handoff
+means Not checked, lookup failure means Unavailable, never proof of no incident.
+Creator-only updates replace their managed section and preserve the build table.
+
+Reporting does not run notification lifecycle actions or determine recovery,
+Leader authority or promotion gates. Normal execution can read/update GitHub;
+dry-run suppresses comment mutation, not all diagnostic reads. Previous display
+text is never notification routing authority.
 """
 
 from __future__ import annotations
@@ -656,7 +662,9 @@ def render_summary_markdown(
     leader_pr_url: str,
     generated_at: str | None = None,
     creator_outcomes: Sequence[dict[str, str]] = (),
+    tracking: dict | None = None,
 ) -> str:
+    from lib.gap_notifications.lookup_tools import tracking_cell
     stamp = generated_at or utc_now_stamp()
     lines = [
         SUMMARY_MARKER,
@@ -689,8 +697,8 @@ def render_summary_markdown(
 
     lines.extend(
         [
-            "| Repo | PR | State status | PR state | Reason | Build links |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| Repo | PR | State status | PR state | Reason | Build links | Jira / Slack |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
         ]
     )
     for row in rows:
@@ -705,6 +713,7 @@ def render_summary_markdown(
                     _cell(row.pr_state + ("/merged" if row.merged else "")),
                     _cell(row.reason),
                     format_build_links_cell(row.build_links),
+                    tracking_cell(tracking, row.pr_url),
                 ]
             )
             + " |"
@@ -861,6 +870,7 @@ def report_for_leader(
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     git_runner: Callable[..., str] | None = None,
     reuse_monitor_evidence: bool = False,
+    tracking: dict | None = None,
 ) -> ReporterResult:
     run = gh_runner or _run_gh
     if head_ref:
@@ -888,7 +898,8 @@ def report_for_leader(
         # abort reporting for unrelated Leaders. Do not log the invalid payload.
         print(f"WARNING: ignoring invalid creator-outcomes in {path}; creator section omitted.", file=sys.stderr)
         creator_outcomes = []
-    body = render_summary_markdown(rows, leader_pr_url=leader_pr_url, creator_outcomes=creator_outcomes)
+    body = render_summary_markdown(rows, leader_pr_url=leader_pr_url,
+                                   creator_outcomes=creator_outcomes, tracking=tracking)
     comment_id, created, updated = upsert_leader_summary_comment(
         leader_pr_url, body, dry_run=dry_run, gh_runner=run
     )

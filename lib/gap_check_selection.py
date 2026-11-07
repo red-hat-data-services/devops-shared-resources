@@ -100,6 +100,10 @@ class FeasibilityRun:
     head_sha: str | None
     jobs: tuple[WorkflowJob, ...]
     query_error: str | None = None
+    run_id: int | None = None
+    attempt: int | None = None
+    url: str | None = None
+    source_head_sha: str | None = None
 
 
 def default_build_producer() -> tuple[str, int | None]:
@@ -429,6 +433,10 @@ def fetch_feasibility_run(owner: str, repo: str, sha: str, runner: GhRunner) -> 
         conclusion=_optional_str(latest.get("conclusion")),
         head_sha=sha,
         jobs=tuple(jobs),
+        run_id=run_id,
+        attempt=latest.get("run_attempt"),
+        url=_optional_str(latest.get("html_url")),
+        source_head_sha=_optional_str(latest.get("head_sha")),
     )
 
 

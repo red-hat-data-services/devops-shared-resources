@@ -8,6 +8,7 @@ from pathlib import Path
 from scripts import gap_failure_reporter as fr
 
 
+# Report the explicit stable-branch restriction as the reason for closure.
 def test_extract_close_reason_stable_restriction() -> None:
     comments = [
         {"body": "unrelated"},
@@ -24,6 +25,7 @@ def test_extract_close_reason_stable_restriction() -> None:
     assert "not allowed" in reason.lower()
 
 
+# A generated summary marker alone must not be mistaken for a closure reason.
 def test_extract_close_reason_ignores_summary_marker() -> None:
     comments = [
         {
@@ -34,6 +36,7 @@ def test_extract_close_reason_ignores_summary_marker() -> None:
     assert fr.extract_close_reason_from_comments(comments) is None
 
 
+# Closed children remain reportable even when their stored status says success.
 def test_should_report_closed_even_if_success_status() -> None:
     assert fr.should_report_child(state_status="success", pr_state="closed") is True
     assert fr.should_report_child(state_status="success", pr_state="open") is False
@@ -41,6 +44,7 @@ def test_should_report_closed_even_if_success_status() -> None:
     assert fr.should_report_child(state_status="build-pending", pr_state="open") is True
 
 
+# Only completed failing pull-request builds should contribute diagnostic links.
 def test_fetch_failed_links_checks_only_on_pull_request(monkeypatch) -> None:
     """Link completed failures with on-pull-request; drop on-push and success."""
     from lib.github_check_runs import CheckRun
@@ -120,6 +124,7 @@ def test_fetch_failed_links_checks_only_on_pull_request(monkeypatch) -> None:
     assert "pipelinerun" in links[0].url
 
 
+# Ignore push builds and successful checks when selecting failed-build links.
 def test_select_failed_build_checks_on_pull_request_only() -> None:
     runs = [
         {
@@ -173,6 +178,7 @@ def test_select_failed_build_checks_on_pull_request_only() -> None:
     assert "on-pull-request" in links[0].name
 
 
+# Describe the first failed build and count additional failures without inventing details.
 def test_format_build_failure_reason_matches_links() -> None:
     links = (
         fr.BuildCheckLink(
@@ -193,6 +199,8 @@ def test_format_build_failure_reason_matches_links() -> None:
     assert fr.format_build_failure_reason("acme/r", 9, ()) == "acme/r#9 build-failure"
 
 
+# Replace unexpanded feasibility expressions with readable explanations, preserving other
+# reasons.
 def test_humanize_merge_failure_reason_rewrites_unexpanded_feasibility_skip() -> None:
     raw = (
         "merge-failure: main-release-feasibility "
@@ -212,6 +220,7 @@ def test_humanize_merge_failure_reason_rewrites_unexpanded_feasibility_skip() ->
     ).endswith("concluded failure")
 
 
+# Fall back to the GitHub run page when no more specific build link is available.
 def test_check_run_link_falls_back_to_github_html_url() -> None:
     url = fr._check_run_link(
         {
@@ -222,6 +231,7 @@ def test_check_run_link_falls_back_to_github_html_url() -> None:
     assert url == "https://github.com/acme/r/runs/123"
 
 
+# Display the build name as the link label rather than repeating its long URL.
 def test_format_build_links_cell_is_name_only() -> None:
     cell = fr.format_build_links_cell(
         [
@@ -238,6 +248,7 @@ def test_format_build_links_cell_is_name_only() -> None:
     )
 
 
+# Render the summary marker and table with navigable child-PR and build links.
 def test_render_summary_markdown_table() -> None:
     rows = [
         fr.ChildFailureRow(
@@ -281,6 +292,35 @@ def test_render_summary_markdown_table() -> None:
     )
 
 
+# Tracking links must be current; standalone refreshes must not reuse stale incident links.
+def test_tracking_column_standalone_and_creator_only_refresh(monkeypatch, tmp_path):
+    row = fr.ChildFailureRow("repo", "https://github.com/acme/repo/pull/1", 1,
+                             "build-failure", "open", False, "failed")
+    tracking = {"status": "checked", "rows": {row.pr_url: [
+        {"component": "cpu", "status": "slack_pending", "jira_key": "RHAI-1"},
+        {"component": "gpu", "status": "confirmed", "jira_key": "RHAI-2",
+         "slack_url": "https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001"}]}}
+    leader = "https://github.com/acme/gap/pull/9"
+    body = fr.render_summary_markdown([row], leader_pr_url=leader, tracking=tracking)
+    assert "| Jira / Slack |" in body and "cpu: [RHAI-1]" in body
+    assert "gpu: [RHAI-2]" in body and "<br>" in body
+    captured = []
+    monkeypatch.setattr(fr, "list_issue_comments", lambda *a, **kw: [{"id": 1, "body": body}])
+    monkeypatch.setattr(fr, "upsert_leader_summary_comment", lambda url, content, **kw: captured.append(content) or (1, False, True))
+    fr.publish_creator_outcomes(leader, [], gh_runner=lambda a: "")
+    assert body.rstrip() in captured[-1]  # Existing build table/links unchanged.
+    monkeypatch.setattr(fr, "load_state", lambda path: {"pull-requests": []})
+    monkeypatch.setattr(fr, "resolve_state_file", lambda **kw: tmp_path / "state.json")
+    monkeypatch.setattr(fr, "collect_rows_from_state", lambda *a, **kw: [row])
+    result = fr.report_for_leader(leader_pr_url=leader, repo_root=tmp_path,
+                                  gh_runner=lambda a: "")
+    assert "Not checked" in result.body and "RHAI-1" not in result.body
+    unavailable = fr.report_for_leader(leader_pr_url=leader, repo_root=tmp_path,
+                                       gh_runner=lambda a: "", tracking={"status": "unavailable"})
+    assert "Unavailable" in unavailable.body and "No confirmed registry match" not in unavailable.body
+
+
+# Locate the existing managed summary by its marker rather than unrelated comments.
 def test_find_summary_comment() -> None:
     comments = [
         {"id": 1, "body": "hello"},
@@ -291,6 +331,7 @@ def test_find_summary_comment() -> None:
     assert found["id"] == 2
 
 
+# Refresh the managed summary in place instead of creating another comment.
 def test_upsert_updates_existing_comment() -> None:
     def gh(args: list[str]) -> str:
         joined = " ".join(args)
@@ -316,6 +357,7 @@ def test_upsert_updates_existing_comment() -> None:
     assert updated is True
 
 
+# Create a managed summary only when no existing summary can be found.
 def test_upsert_creates_when_missing() -> None:
     def gh(args: list[str]) -> str:
         if "--paginate" in args:
@@ -335,6 +377,7 @@ def test_upsert_creates_when_missing() -> None:
     assert updated is False
 
 
+# A dry run may describe a prospective summary but must not mutate comments.
 def test_upsert_dry_run_no_mutate() -> None:
     def gh(args: list[str]) -> str:
         if "--paginate" in args:

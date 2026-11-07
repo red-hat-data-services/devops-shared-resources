@@ -80,6 +80,7 @@ class StatePullRequest:
     builds: tuple[StateBuild, ...] = ()
     build_observations: dict[str, Any] | None = None
     head_sha: str | None = None
+    merge_observations: dict[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], *, index: int) -> "StatePullRequest":
@@ -124,6 +125,11 @@ class StatePullRequest:
             or not isinstance(observations.get("runs"), list)
         ):
             raise StateFileError(f"{path}.build-observations must be Konflux evidence")
+        merge = data.get("merge-observations")
+        if merge is not None and (not isinstance(merge, dict) or merge.get("schema") != 1
+                                  or any(not isinstance(merge.get(k), dict) for k in ("conflict", "feasibility"))):
+            # Invalid optional notification evidence is unavailable, not a gate error.
+            merge = None
         head_sha = str(data.get("head-sha") or "").strip() or None
         return cls(
             repo=repo,
@@ -132,6 +138,7 @@ class StatePullRequest:
             builds=builds,
             build_observations=observations,
             head_sha=head_sha,
+            merge_observations=merge,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -143,6 +150,8 @@ class StatePullRequest:
         }
         if self.build_observations is not None:
             result["build-observations"] = self.build_observations
+        if self.merge_observations is not None:
+            result["merge-observations"] = self.merge_observations
         if self.head_sha is not None:
             result["head-sha"] = self.head_sha
         return result
