@@ -29,7 +29,7 @@ be `settled` with a nonzero warning count, without retrying the core send.
 Only this pass's accepted decisions populate ephemeral `notification_urls`.
 Head-move deferrals/status-post failures cannot reuse historical persisted build
 receipts. The collector receives a copy containing only these accepted children.
-The monitor's persisted state format is unchanged.
+Accepted child entries may additionally carry versioned `merge-observations`; older state without these receipts remains valid.
 
 The existing `collect_build_observations` resolves the stream from structured
 `creator-outcomes`, validates repository/PR/current-head/component evidence, and
@@ -38,9 +38,33 @@ Jira registry remain unchanged. Missing/conflicting stream evidence holds the
 hook with a sanitized collection error; incomplete/unknown build results do not
 become recovery. Aggregate `pr-status=success`, absent children, closed/merged
 PRs and retired state do not establish recovery. A fresh explicit successful
-build receipt is required. Missing evidence for conflicts/feasibility remains a
-producer gap: **this hook currently emits build observations only**, without
-inventing observations for those categories.
+build receipt is required for build recovery. The default composite collector also
+normalizes independent conflict and feasibility receipts, without changing build IDs.
+
+Merge receipts preserve exact PR/head/base binding and the observed PR head branch
+(which may differ from the logical creator source branch). Exact creator PR mapping
+supplies incident stream identity. A notification-only PR snapshot verifies the same
+head/base/state/branches at acceptance; missing/moving/contradictory evidence becomes
+unknown, never a changed gate verdict, status publication or promotion decision.
+Conflict recovery requires an explicitly mergeable open PR; same-pair contradictory
+flips hold unknown against available predecessor receipts. No cross-Leader historical
+contradiction detection is claimed when predecessor evidence is unavailable.
+
+Feasibility evidence retains workflow execution ID/attempt/reported head and selected
+mandatory checks before aggregate verdict priority can mask its outcome. Recovery
+requires a complete successful workflow and all mandatory checks explicitly successful
+on the current head. A mandatory completed `skipped` (or other non-success) conclusion
+is failure, unlike an unqueried conflict-short-circuit, which is unknown. Query errors
+are unknown even after gate timeout; authoritative missing/pending checks may fail at
+the existing six-hour deadline. Build success never resolves a merge incident.
+
+Fingerprints include revision/execution/check facts, not check time, prose, state URL
+or API ordering. Genuine changed head/base or feasibility attempts supply new evidence;
+there is no epoch journal. Replayed pre-recovery events retain existing suppression.
+Optional malformed notification metadata is dropped/held without aborting ordinary
+child processing. Workflow and commit links are constructed from validated repository
+and execution/revision identifiers. Monitor detection time is not conflict onset or
+workflow completion; no Konflux completion timestamp is attached to merge failures.
 
 ## Flags and safety
 

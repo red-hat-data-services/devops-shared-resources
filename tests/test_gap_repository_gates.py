@@ -651,6 +651,40 @@ def _saved(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+# Optional evidence errors preserve definitive conflict history across accepted polls;
+# a fresh same-pair contradictory recovery must hold without changing ordinary success.
+@pytest.mark.parametrize("failure", ["producer", "binding"])
+def test_optional_receipt_errors_preserve_conflict_history(tmp_path, monkeypatch, failure):
+    from lib.gap_notifications import merge_receipts
+    github = _GitHub()
+    github.mergeable, github.merge_state = "CONFLICTING", "DIRTY"
+    path = _state(tmp_path)
+    first, _ = _run(path, github)
+    assert first.merge_failure_urls == [URL]
+    assert _saved(path)["pull-requests"][0]["merge-observations"]["last-conflict"]["status"] == "failure"
+    with monkeypatch.context() as patch:
+        if failure == "producer":
+            patch.setattr(merge_receipts, "make_receipt", lambda *a, **kw: None)
+        else:
+            def invalid(*a, **kw):
+                raise ValueError("optional evidence error")
+            patch.setattr(merge_receipts, "bind_receipt", invalid)
+        second, _ = _run(path, github)
+        assert second.merge_failure_urls == [URL]
+    held = _saved(path)["pull-requests"][0]["merge-observations"]
+    assert held["fresh"] is False
+    assert held["conflict"]["status"] == "unknown"
+    assert held["last-conflict"]["status"] == "failure"
+    github.mergeable, github.merge_state = "MERGEABLE", "CLEAN"
+    github.check_runs = [_build_check("odh-eval-hub-on-pull-request-65317"), *_feasibility_success_payloads()]
+    third, _ = _run(path, github)
+    assert third.success_urls == [URL]  # ordinary gate behavior is unchanged
+    final = _saved(path)["pull-requests"][0]["merge-observations"]
+    assert final["fresh"] is True
+    assert (final["head-sha"], final["base-sha"]) == (SHA, OTHER_SHA)
+    assert final["conflict"]["status"] == "unknown"
+
+
 def test_all_current_checks_pass_and_preserve_image_uri(tmp_path: Path) -> None:
     github = _GitHub()
     github.check_runs = [

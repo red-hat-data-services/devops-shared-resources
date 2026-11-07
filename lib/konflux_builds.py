@@ -87,6 +87,7 @@ class BuildObservation:
     namespace: str = ""
     created_at: str = ""
     url: str = ""
+    completed_at: str = ""
 
     def to_dict(self):
         """Serialize the selected build observation for state persistence."""
@@ -231,10 +232,20 @@ def select_latest(runs, *, repo, number, sha, components, namespace, ui_url=DEFA
             result = "unknown"
     if metadata.get("deletionTimestamp") and result not in {"success", "failure", "timed_out", "cancelled"}:
         result, reason = "unknown", "Latest PipelineRun is being deleted before a terminal observation"
+    # Optional display metadata must not change gate verdicts or attempt selection.
+    completed_at = ""
+    if result in {"success", "failure", "timed_out", "cancelled"}:
+        try:
+            completed = _timestamp(status.get("completionTime"))
+            if completed >= ordered[0][0]:
+                completed_at = completed.isoformat()
+        except (KonfluxQueryError, OverflowError):
+            pass
     ui = _endpoint(ui_url)
     return BuildObservation(labels[COMPONENT], result, reason, sha, metadata["name"],
                             metadata["uid"], namespace, metadata["creationTimestamp"],
-                            f"{ui}/ns/{quote(namespace)}/pipelinerun/{quote(metadata['name'])}")
+                            f"{ui}/ns/{quote(namespace)}/pipelinerun/{quote(metadata['name'])}",
+                            completed_at=completed_at)
 
 
 class _NoRedirect(HTTPRedirectHandler):

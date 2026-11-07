@@ -2258,6 +2258,32 @@ def _publish_decisions(
         status_updates[url] = decision.pr_status
         for entry in payload.get("pull-requests", []):
             if (entry.get("pr-url") or entry.get("pr_url")) == url:
+                if decision.merge_observations is not None:
+                    from lib.gap_notifications.merge_receipts import bind_receipt
+                    try:
+                        from types import SimpleNamespace
+                        ref = parse_pr_url(url)
+                        snapshot = _load_pr_view(url, ref, runner)
+                        current = SimpleNamespace(
+                            owner=ref.owner, repo=ref.repo, number=ref.number,
+                            head_sha=snapshot.get("headRefOid"), base_sha=snapshot.get("baseRefOid"),
+                            state=snapshot.get("state"), mergeable=snapshot.get("mergeable"),
+                            merge_state_status=snapshot.get("mergeStateStatus"),
+                            source_branch=snapshot.get("headRefName"), base_ref=snapshot.get("baseRefName"),
+                        )
+                    except (ValueError, RuntimeError, GhCommandError):
+                        current = None
+                    try:
+                        entry["merge-observations"] = bind_receipt(
+                            decision.merge_observations, current, entry.get("merge-observations"),
+                        )
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        # Optional notification metadata must never change gate acceptance.
+                        from lib.gap_notifications.merge_receipts import unavailable_receipt
+                        entry["merge-observations"] = unavailable_receipt(entry.get("merge-observations"))
+                else:
+                    from lib.gap_notifications.merge_receipts import unavailable_receipt
+                    entry["merge-observations"] = unavailable_receipt(entry.get("merge-observations"))
                 if decision.build_observations is not None:
                     entry["build-observations"] = decision.build_observations
                 elif build_status_source() == "github":

@@ -100,8 +100,8 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         filtered["pull-requests"] = [c for c in payload.get("pull-requests", [])
                                       if c.get("pr-url") in accepted]
         if collector is None:
-            from lib.gap_notifications.analyze_leader_state import collect_build_observations
-            collector = collect_build_observations
+            from lib.gap_notifications.analyze_merge_state import collect_observations
+            collector = collect_observations
         from lib.gap_notifications.dispatch_incidents import CHANNEL, Ledger, Dispatcher, validate_observations, bind_trial
         from lib.gap_notifications.notify_tools import jira_target
         target = jira_target(config.jira_environment)

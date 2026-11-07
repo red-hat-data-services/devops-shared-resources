@@ -886,16 +886,20 @@ def test_root_is_readable_and_selective():
         "pr_url": "https://github.com/acme/repo/pull/1",
         "leader_url": "https://github.com/acme/leader/pull/84",
         "historical_snapshot": True, "observed-at": "2026-11-07T01:23:10+01:00",
+        "head-sha": "a" * 40,
+        "selected-run": {"head_sha": "a" * 40, "completed_at": "2026-11-06T23:15:31+01:00"},
         "unrelated_debug_data": {"token": "NOT_FOR_DISPLAY"},
     })
     assert "*GAP · Build failed — staging test*" in text
     assert "*Component:* `cpu`" in text and "*Repository:* `acme/repo`" in text
-    assert "`main` → `stable`" in text
+    assert "*Promotion:*" not in text and "`main` → `stable`" not in text
     assert "<https://build.example/run/1|Failed build>" in text
     assert "<https://github.com/acme/repo/pull/1|Child PR>" in text
     assert "<https://github.com/acme/leader/pull/84|GAP Leader>" in text
-    assert f"<{JIRA}|Jira RHAI-177>" in text and "2026-11-07 00:23 UTC" in text
-    assert "Recorded snapshot — not a live build check" in text
+    assert f"<{JIRA}|Jira RHAI-177>" in text
+    assert "*Build failed at:* 2026-11-06 22:15:31 UTC" in text and "2026-11-07" not in text
+    assert f"<https://github.com/acme/repo/commit/{'a' * 40}|Commit aaaaaaa>" in text
+    assert "Recorded snapshot" not in text and "not a live build check" not in text
     assert "Reported reason" not in text and "NOT_FOR_DISPLAY" not in text
     assert "test_only=" not in text and "observation_id" not in text
 
@@ -904,7 +908,8 @@ def test_root_is_readable_and_selective():
 @pytest.mark.parametrize("category,heading", [("build", "Build failed"), ("conflict", "Merge conflict"), ("feasibility", "Promotion blocked")])
 def test_supported_categories_and_missing_evidence(category, heading):
     text = render(category=category, evidence={})
-    assert heading in text and "Supplied evidence — not a fresh build check" in text
+    assert heading in text and "Supplied evidence" not in text
+    assert ("*Build failed at:* Unavailable" in text) == (category == "build")
     assert ("*Component:*" in text) == (category == "build")
     assert "Failed build>" not in text
 
@@ -943,11 +948,12 @@ def test_slack_url_delimiters_and_entities_are_escaped():
     assert "<https://example.test/a%7Cb?q=1&amp;x=2|Failed build>" in text
 
 
-# Invalid or timezone-free timestamps must not masquerade as trusted UTC observations.
+# Invalid or timezone-free completion times must never fall back to a check/creation timestamp.
 @pytest.mark.parametrize("timestamp", [None, {}, "invalid", "2026-11-07T01:23:00", "0001-01-01T00:00:00+23:00"])
-def test_invalid_or_timezone_free_observation_time_does_not_claim_freshness(timestamp):
-    text = render(evidence={"observed-at": timestamp})
-    assert "UTC" not in text and "not a fresh build check" in text
+def test_invalid_or_timezone_free_completion_time_does_not_use_check_time(timestamp):
+    text = render(evidence={"observed-at": "2026-11-07T01:23:00Z",
+        "selected-run": {"completed_at": timestamp, "created_at": "2026-11-06T23:00:00Z"}})
+    assert "UTC" not in text and "*Build failed at:* Unavailable" in text
 
 
 # Synthetic evidence must remain labeled even when another flag suggests a non-test context.
@@ -955,7 +961,7 @@ def test_invalid_or_timezone_free_observation_time_does_not_claim_freshness(time
 def test_synthetic_label_cannot_be_hidden_by_test_only_flag(historical):
     text = render(evidence={"synthetic": True, "historical_snapshot": historical, "test_only": False})
     assert "staging test" in text and "Synthetic evidence" in text
-    assert ("Recorded snapshot" in text) == historical
+    assert "Recorded snapshot" not in text and "Supplied evidence" not in text
 
 
 # Structured reasons must not be dumped into the human-facing message.
@@ -991,8 +997,12 @@ def test_format_upgrade_does_not_resend_old_receipts_and_new_events_stay_threade
     def forbidden(*a, **kw):
         raise AssertionError("already delivered events must not be re-rendered")
     monkeypatch.setattr(dispatch, "slack_message", forbidden)
-    replay = runner("fresh").run([observation()])
+    enriched = observation(evidence={"head-sha": "a" * 40,
+        "selected-run": {"head_sha": "a" * 40, "completed_at": "2026-11-06T23:00:00Z"}})
+    before = copy.deepcopy(jira.properties)
+    replay = runner("fresh").run([enriched])
     assert replay["outbox"][0]["state"] == "confirmed" and len(slack.calls) == 1
+    assert jira.properties == before
     monkeypatch.setattr(dispatch, "slack_message", formatter)
     runner("update").run([observation(oid="new-build")])
     assert "Failure update" in slack.calls[-1][0]
@@ -1057,7 +1067,7 @@ def test_mutated_production_facade_revalidates_target_and_issue_type():
     assert not session.calls
 
 
-# Production content must name its destination without discarding synthetic/snapshot caveats.
+# Production content must retain synthetic labeling and avoid claiming global recovery.
 def test_production_presentation_is_labeled_without_claiming_global_recovery():
     from lib.gap_notifications.notify_tools import jira_target, slack_message
     target = jira_target('production')
@@ -1067,7 +1077,7 @@ def test_production_presentation_is_labeled_without_claiming_global_recovery():
     assert 'synthetic evidence: True' in markdown
     text = slack_message(dict(obs, status='success'), jira_url=target.url + '/browse/RHAI-1', **target.options)
     assert 'production Jira' in text and 'staging test' not in text
-    assert 'Synthetic evidence' in text and 'Recorded snapshot' in text
+    assert 'Synthetic evidence' in text and 'Recorded snapshot' not in text
     assert 'not a claim that the whole promotion is healthy' in text
 
 
@@ -1106,6 +1116,54 @@ def test_managed_metadata_remains_environment_scoped(selected, other):
     assert visible_link_status(body, correct, metadata=True, jira_environment=selected) == 'ambiguous_or_edited'
     with pytest.raises(ValueError, match='edited'):
         project_body(body, None, metadata=correct, **jira_target(selected).options)
+
+
+# Commit links require matching full selected-run/receipt SHAs and a safe consistent GitHub repo.
+@pytest.mark.parametrize('problem', ['short', 'mismatch', 'missing-run-sha', 'missing-receipt-sha', 'non-string',
+    'markup', 'other-host', 'traversal', 'repo-mismatch', 'bad-evidence-repo'])
+def test_commit_link_omitted_for_missing_or_inconsistent_identity(problem):
+    evidence = {'head-sha': 'a' * 40, 'selected-run': {'head_sha': 'a' * 40}}
+    repo = 'github.com/acme/repo'
+    if problem == 'short': evidence['selected-run']['head_sha'] = 'aaaaaaa'
+    if problem == 'mismatch': evidence['selected-run']['head_sha'] = 'b' * 40
+    if problem == 'missing-run-sha': evidence['selected-run'] = {}
+    if problem == 'missing-receipt-sha': evidence.pop('head-sha')
+    if problem == 'non-string': evidence['selected-run']['head_sha'] = {'sha': 'a' * 40}
+    if problem == 'markup': evidence['selected-run']['head_sha'] = '<!channel>'
+    if problem == 'other-host': repo = 'gitlab.com/acme/repo'
+    if problem == 'traversal': repo = 'acme/..'
+    if problem == 'repo-mismatch': evidence['repository'] = 'other/repo'
+    if problem == 'bad-evidence-repo': evidence['repository'] = ['acme/repo']
+    text = render(repository=repo, evidence=evidence)
+    assert '|Commit ' not in text and '/commit/' not in text
+    assert '|Jira RHAI-177>' in text
+
+
+# Verified commit links must work for canonical or short GitHub repos in roots and replies.
+@pytest.mark.parametrize('repo', ['acme/repo', 'github.com/acme/repo', 'GitHub.com/Acme/Repo'])
+@pytest.mark.parametrize('reply', [False, True])
+def test_commit_link_uses_full_sha_and_short_label(repo, reply):
+    evidence = {'head-sha': 'b' * 40, 'repository': 'acme/repo', 'selected-run': {'head_sha': 'b' * 40}}
+    text = slack_message(observation(repository=repo, evidence=evidence), jira_url=JIRA, reply=reply)
+    assert f'<https://github.com/acme/repo/commit/{"b" * 40}|Commit bbbbbbb>' in text
+
+
+# Both failure and recovery use the selected run's completion timestamp, in UTC, even in replies.
+@pytest.mark.parametrize('status,label', [('failure', 'Build failed at'), ('success', 'Build completed at')])
+@pytest.mark.parametrize('reply', [False, True])
+def test_build_completion_display_is_scoped_to_outcome(status, label, reply):
+    text = slack_message(observation(status=status, evidence={'observed-at': '2030-01-01T00:00:00Z',
+        'selected-run': {'completed_at': '2026-11-07T01:23:10+01:00'}}), jira_url=JIRA, reply=reply)
+    assert f'*{label}:* 2026-11-07 00:23:10 UTC' in text and '2030' not in text
+    assert '*Promotion:*' not in text and 'Recorded snapshot' not in text
+
+
+# Build-specific timestamps/commit links must not leak into conflict or feasibility messages.
+@pytest.mark.parametrize('category', ['conflict', 'feasibility'])
+def test_other_categories_do_not_use_build_metadata(category):
+    text = render(category=category, evidence={'head-sha': 'a' * 40,
+        'selected-run': {'head_sha': 'a' * 40, 'completed_at': '2026-11-07T00:00:00Z'}})
+    assert 'UTC' not in text and '|Commit ' not in text and '*Build failed at:*' not in text
 
 
 if __name__ == "__main__":

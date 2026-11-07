@@ -377,3 +377,31 @@ def test_monitor_cli_reads_jira_environment_only_for_enabled_notifications(tmp_p
     assert monitor.main(['--repo-root', str(tmp_path), '--notification-mode', mode]) == 0
     assert len(captured) == 1
     assert (captured[0].jira_environment if captured[0] else None) == expected
+
+
+def test_default_composite_hook_conflict_recovery_never_closes_build(hook):
+    invoke, jira, slack, opts, _ = hook
+    payload = state(expected_components=['api'], runs=[run('api', 'failure')])
+    child = payload['pull-requests'][0]
+    child['head-sha'] = 'a' * 40
+    receipt = dict(schema=1, repository='acme/demo', pr=42,
+                   **{'head-sha': 'a' * 40, 'base-sha': 'b' * 40,
+                      'source-branch': 'temporary-sync-head', 'target-branch': 'main',
+                      'pr-state': 'OPEN', 'fresh': True,
+                      'conflict': {'status': 'failure', 'mergeable': 'CONFLICTING', 'merge-state-status': 'DIRTY'},
+                      'feasibility': {'status': 'unknown', 'query-skipped': True}})
+    child['merge-observations'] = receipt
+    assert invoke(payload)['status'] == 'settled'
+    assert len(jira.issues) == len(slack.calls) == 2
+    invoke(payload)
+    assert len(slack.calls) == 2
+    # New base pair with explicit success recovers conflict, not the still failing build.
+    receipt['base-sha'] = 'c' * 40
+    receipt['conflict'] = {'status': 'success', 'mergeable': 'MERGEABLE', 'merge-state-status': 'CLEAN'}
+    invoke(payload)
+    assert not jira.closed('RHAI-1') and jira.closed('RHAI-2')
+    assert slack.calls[-1][1]['thread_ts'] == jira.properties['RHAI-2']['delivery']['root']['ts']
+    receipt['base-sha'] = 'b' * 40
+    receipt['conflict'] = {'status': 'failure', 'mergeable': 'CONFLICTING', 'merge-state-status': 'DIRTY'}
+    invoke(payload)
+    assert len(jira.issues) == 2  # old pre-recovery replay is not recurrence

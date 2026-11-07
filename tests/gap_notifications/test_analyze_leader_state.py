@@ -154,8 +154,11 @@ def test_collect_build_observations_observation_id_is_stable_across_snapshot_noi
     noisy = copy.deepcopy(payload)
     noisy["pull-requests"][0]["build-observations"]["observed-at"] = "2026-11-06T16:00:00+00:00"
     noisy["pull-requests"][0]["build-observations"]["gate-reason"] = "changed prose"
+    noisy["pull-requests"][0]["build-observations"]["runs"][0]["completed_at"] = "2026-11-06T15:00:00Z"
     second = collect_build_observations(noisy, environment=ENVIRONMENT, leader_url=LEADER_URL + "?x=1", state_url=STATE_URL + "?x=1")[0]
     assert first["observation_id"] == second["observation_id"]
+    assert "completed_at" not in first["evidence"]["selected-run"]
+    assert second["evidence"]["selected-run"]["completed_at"] == "2026-11-06T15:00:00Z"
 
 
 # A changed outcome on the same run must produce a distinct event identifier.

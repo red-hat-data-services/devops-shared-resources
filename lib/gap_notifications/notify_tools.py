@@ -664,6 +664,71 @@ def _slack_link(value, label):
     return f"<{url}|{label}>"
 
 
+def _slack_commit_link(observation, run):
+    """Link only a full selected-build SHA agreeing with the receipt's revision/repository."""
+    evidence = observation["evidence"]
+    sha = run.get("head_sha")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-f]{40}", sha) or sha != evidence.get("head-sha"):
+        return None
+
+    def repository(value):
+        if not isinstance(value, str):
+            return None
+        value = value.lower().removeprefix("github.com/")
+        if not re.fullmatch(r"[a-z0-9_-]+/[a-z0-9_.-]+", value) or value.split("/")[1] in {".", ".."}:
+            return None
+        return value
+
+    repo = repository(observation.get("repository"))
+    if repo is None or ("repository" in evidence and repository(evidence["repository"]) != repo):
+        return None
+    return _slack_link(f"https://github.com/{repo}/commit/{sha}", f"Commit {sha[:7]}")
+
+
+def _slack_build_time(run, status):
+    """Display the selected run's completion time, never the polling/creation time."""
+    value = "Unavailable"
+    try:
+        completed = datetime.fromisoformat(run.get("completed_at", "").replace("Z", "+00:00"))
+        if completed.tzinfo is not None:
+            value = completed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        pass
+    label = "Build failed at" if status == "failure" else "Build completed at"
+    return f"*{label}:* {value}"
+
+
+def _slack_merge_links(observation):
+    """Construct merge-evidence links from bound identities, never supplied URL overrides."""
+    if observation.get("category") not in {"conflict", "feasibility"}:
+        return []
+    evidence = observation["evidence"]
+    if evidence.get("source") != "github-merge-receipt" or evidence.get("status") != observation.get("status"):
+        return []
+    repo = observation.get("repository")
+    if not isinstance(repo, str):
+        return []
+    repo = repo.lower().removeprefix("github.com/")
+    if not re.fullmatch(r"[a-z0-9_-]+/[a-z0-9_.-]+", repo) or repo.split("/")[1] in {".", ".."}:
+        return []
+    evidence_repo = evidence.get("repository")
+    pr_url, sha = evidence.get("pr_url"), evidence.get("head-sha")
+    if (not isinstance(evidence_repo, str) or evidence_repo.lower().removeprefix("github.com/") != repo
+            or not isinstance(pr_url, str)
+            or not re.fullmatch(r"https://github\.com/" + re.escape(repo) + r"/pull/[1-9][0-9]*", pr_url.lower())
+            or not isinstance(sha, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", sha)):
+        return []
+    links = [_slack_link(f"https://github.com/{repo}/commit/{sha}", f"Commit {sha[:7]}")]
+    facts = evidence.get("merge-receipt")
+    if observation["category"] == "feasibility" and isinstance(facts, dict):
+        run_id, attempt = facts.get("run-id"), facts.get("attempt")
+        if (type(run_id) is int and run_id > 0 and type(attempt) is int and attempt > 0
+                and facts.get("head-sha") == sha and facts.get("run-head-sha") == sha):
+            links.append(_slack_link(f"https://github.com/{repo}/actions/runs/{run_id}/attempts/{attempt}",
+                                     "Feasibility run"))
+    return links
+
+
 def slack_message(observation, *, jira_url, reply=False, jira_environment="stage"):
     """Render an explicitly scoped notification without clients, lookups or delivery-state changes.
 
@@ -684,12 +749,11 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
     if category == "build":
         lines.append(f"*Component:* `{_slack_text(observation.get('component'))}`")
     if not reply:
-        lines.extend([
-            f"*Repository:* `{_slack_text(observation.get('repository'))}`",
-            f"*Promotion:* `{_slack_text(observation.get('source_branch'), 80)}` → `{_slack_text(observation.get('destination_branch'), 80)}`",
-        ])
+        lines.append(f"*Repository:* `{_slack_text(observation.get('repository'))}`")
     run = evidence.get("selected-run")
     run = run if isinstance(run, dict) else {}
+    if category == "build":
+        lines.append(_slack_build_time(run, status))
     reason = evidence.get("reason") or run.get("reason")
     if isinstance(reason, str) and reason.strip() and reason.strip().lower() not in {"failed", "failure", "success", "succeeded", "completed"}:
         lines.append(f"*Reported reason:* `{_slack_text(reason, 240)}`")
@@ -699,25 +763,15 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
         raise ValueError("a safe Jira link is required")
     links = [
         _slack_link(evidence.get("build_url"), "Successful build" if status == "success" else "Failed build") if category == "build" else None,
+        _slack_commit_link(observation, run) if category == "build" else None,
+        *_slack_merge_links(observation),
         _slack_link(evidence.get("pr_url"), "Child PR"), jira,
     ]
     if not reply:
         links.append(_slack_link(evidence.get("leader_url"), "GAP Leader"))
     lines.extend(["", " · ".join(link for link in links if link)])
-    provenance = []
     if evidence.get("synthetic") is True:
-        provenance.append("Synthetic evidence")
-    if evidence.get("historical_snapshot") is True:
-        provenance.append("Recorded snapshot — not a live build check")
-    elif evidence.get("synthetic") is not True:
-        provenance.append("Supplied evidence — not a fresh build check")
-    try:
-        observed = datetime.fromisoformat(evidence.get("observed-at", "").replace("Z", "+00:00"))
-        if observed.tzinfo is not None:
-            provenance.append("observed " + observed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
-    except (ValueError, TypeError, AttributeError, OverflowError):
-        pass
-    lines.extend(["", " · ".join(provenance)])
+        lines.extend(["", "Synthetic evidence"])
     if status == "success":
         lines.append("Staging result only; does not establish production recovery." if target.name == "stage"
                      else "Reported component outcome only; not a claim that the whole promotion is healthy.")

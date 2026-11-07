@@ -5,7 +5,20 @@ Leader selection, monitor mutation from the standalone CLI, reopening of closed
 issues, or claim of exactly-once delivery. Staging issues retain the
 `[GAP STAGING TEST]` marker. Explicit production selection uses `[GAP PRODUCTION]`;
 this identifies the Jira destination, not proof of live production build health.
-Historical/synthetic evidence remains labeled in both environments.
+Jira descriptions retain historical/synthetic provenance in both environments.
+Slack keeps destination and synthetic-test labels without snapshot/check boilerplate.
+
+Slack build alerts show the selected PipelineRun's completion time in UTC, not the
+monitor's check time or the run's creation time. New Konflux receipts retain this
+optional value as `completed_at`; old snapshots are not backfilled. Missing, invalid
+or timezone-free values display `Unavailable`. Completion means the run finished,
+not necessarily when its first task failed. No duration is displayed.
+
+The links row includes a short commit SHA only when the selected run's full SHA
+matches the receipt revision and the GitHub repository identity is consistent.
+The link uses the full SHA. Formatting and completion metadata do not change event
+identities, edit old messages, or cause existing delivery receipts to resend.
+The redundant promotion branch line is omitted; failure-reason behavior is unchanged.
 
 `GAP_JIRA_ENVIRONMENT` selects one allowlisted Jira destination:
 
@@ -288,8 +301,11 @@ does not verify live checks or independently aggregate targets. Feasibility succ
 mean affected targets affirmatively recovered and no applicable failures remain. Missing
 or removed targets, skipped/query-error checks, pending checks, empty sets, retired Leader,
 and closed/merged PR are NOT recovery. Use unknown when unresolved. Empty `[]` only retries
-previously queued work and never infers recovery. Normalized snapshot/live extraction is
-separate; structured conflict and per-target feasibility collection remains future work.
+previously queued work and never infers recovery. The opt-in monitor hook now combines
+build collection with structured current-revision conflict and workflow-wide feasibility
+receipts; see [monitor integration](monitor.md). Required completed skipped checks are
+nonpassing failures, whereas unqueried/query-error evidence is unknown. Per-target
+prose is not routing or recovery authority.
 
 Stable event IDs must describe facts, not observation timestamps/Leader URLs. Reuse an ID
 only for identical facts. Jira persists seen hashes where a ticket exists. A success before
