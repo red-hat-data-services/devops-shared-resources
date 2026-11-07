@@ -1,6 +1,7 @@
 """Tests for normalized GAP build observation collection."""
 
 from __future__ import annotations
+from gap_notification_fakes import state, run, LEADER_URL
 
 import copy
 import json
@@ -14,60 +15,7 @@ from lib.gap_notifications.analyze_leader_state import (
 )
 
 ENVIRONMENT = "stage-redhat.atlassian.net/RHAI/C0883L8FARE"
-LEADER_URL = "https://github.com/red-hat-data-services/gated-artifacts-promoter/pull/84"
 STATE_URL = "file:///tmp/leader-84/state.json"
-
-
-def state(*, repo="acme/demo", pr_url="https://github.com/acme/demo/pull/42",
-          source_branch="feature/x", target_branch="main", pr_status="build-failure",
-          pr_state="OPEN", head_sha="a" * 40, observed_at="2026-11-06T15:12:46.242781+00:00",
-          expected_components=None, runs=None, query_error=None, query_skipped=None,
-          gate_reason="odm-demo failure"):
-    return {
-        "pull-requests": [{
-            "repo": "demo",
-            "pr-url": pr_url,
-            "pr-status": pr_status,
-            "builds": [],
-            "build-observations": {
-                "source": "konflux",
-                "repository": repo,
-                "pr": 42,
-                "head-sha": head_sha,
-                "observed-at": observed_at,
-                "expected-components": list(expected_components or []),
-                "runs": list(runs or []),
-                **({"query-error": query_error} if query_error else {}),
-                **({"query-skipped": query_skipped} if query_skipped else {}),
-                "pr-state": pr_state,
-                "gate-reason": gate_reason,
-            },
-        }],
-        "creator-outcomes": [{
-            "repo": repo,
-            "source-branch": source_branch,
-            "target-branch": target_branch,
-            "outcome": "success",
-            "reason": "creator snapshot",
-            "pr-url": pr_url,
-            "workflow-url": "https://github.com/acme/workflows/actions/runs/1",
-            "observed-at": observed_at,
-        }],
-    }
-
-
-def run(component, status, *, reason="Completed", head_sha="a" * 40, uid=None, created_at="2026-11-06T14:38:29Z"):
-    return {
-        "component": component,
-        "status": status,
-        "reason": reason,
-        "head_sha": head_sha,
-        "name": f"{component}-pipeline",
-        "uid": uid or f"uid-{component}",
-        "namespace": "rhoai-tenant",
-        "created_at": created_at,
-        "url": f"https://konflux.example/ns/rhoai-tenant/pipelinerun/{component}",
-    }
 
 
 def test_collect_build_observations_returns_normalized_current_receipts():

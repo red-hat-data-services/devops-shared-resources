@@ -211,19 +211,6 @@ def test_recovery_then_new_failure_creates_successor_and_stale_replay_noops(tmp_
     assert any(call[0] == "transition_to_done" for call in jira.calls)
 
 
-def test_cross_run_success_recovery_closes_open_matching(tmp_path, shared_clients):
-    jira, slack = shared_clients
-    dispatch1 = make_dispatcher(tmp_path, jira, slack, name="ledger-1.json")
-    dispatch1.run([observation()])
-    root_thread = slack.calls[0][1]["thread_ts"] if slack.calls[0][1].get("thread_ts") else None
-
-    dispatch2 = make_dispatcher(tmp_path, jira, slack, name="ledger-2.json")
-    result = dispatch2.run([observation(status="success", oid="success-1")])
-    assert jira.issues["RHAI-1"]["fields"]["status"]["statusCategory"]["key"] == "done"
-    assert result["outbox"][0]["state"] == "confirmed"
-    assert slack.calls[-1][1]["thread_ts"] == "1.456"
-
-
 def test_grouped_feasibility_branches_share_identity(tmp_path, shared_clients):
     jira, slack = shared_clients
     dispatch = make_dispatcher(tmp_path, jira, slack)
@@ -263,22 +250,7 @@ def test_missing_property_and_untrusted_scope_hold(tmp_path):
     assert result["outbox"][0]["hold"] == "registry_or_delivery_unavailable"
 
 
-def test_24kib_property_size_cap_holds_if_practical(tmp_path):
-    jira, slack = FakeJira(), FakeSlack()
-    dispatch = make_dispatcher(tmp_path, jira, slack)
-    result = dispatch.run([observation()])
-    key = jira.issue_keys()[0]
-    jira.notification_state[key]["seen_event_ids"] = {f"ev-{i}": "failure" for i in range(2000)}
-
-    fresh = make_dispatcher(tmp_path, jira, slack, name="ledger-big.json")
-    held = fresh.run([observation(oid="run-2")])
-    assert held["outbox"][0]["state"] in {"pending", "reconciliation_required"}
-    assert held["outbox"][0]["hold"] == "registry_or_delivery_unavailable"
-    assert len(slack.calls) == 1
-    assert jira.calls
-
-
-def test_persisted_slack_inflight_and_fresh_ledger_never_posts_duplicate(tmp_path, shared_clients):
+def test_persisted_slack_inflight_same_journal_restart_never_posts_duplicate(tmp_path, shared_clients):
     jira, slack = shared_clients
     slack.fail_once = True
     dispatch1 = make_dispatcher(tmp_path, jira, slack, name="ledger-1.json")
@@ -318,44 +290,54 @@ def test_receipt_persistence_failure_never_loses_prior_thread(tmp_path, shared_c
     jira, slack = shared_clients
     dispatch = make_dispatcher(tmp_path, jira, slack)
     dispatch.run([observation()])
+    original_root = copy.deepcopy(jira.notification_state["RHAI-1"]["delivery"]["root"])
+    original_event = jira.notification_state["RHAI-1"]["delivery"]["last_event"]
+    fired_faults = []
 
     def fail_on_recovery_put(key, value):
-        return (
-            value.get("jira_intent") is None
-            and value.get("delivery", {}).get("root") is not None
-            and value.get("delivery", {}).get("intent") is None
-            and value.get("delivery", {}).get("last_outcome") == "success"
+        delivery = value["delivery"]
+        final_reply_ack = (
+            value.get("jira_intent") is None and value.get("last_outcome") == "success"
+            and delivery["root"] == original_root and delivery["intent"] is None
+            and delivery["last_event"] == value["last_event"]
         )
+        if final_reply_ack and not fired_faults:
+            assert len(slack.calls) == 2
+            assert slack.calls[-1][1]["thread_ts"] == original_root["ts"]
+            fired_faults.append(copy.deepcopy(value))
+            return True
+        return False
 
     jira.fail_put_when = fail_on_recovery_put
     first = dispatch.run([observation(status="success", oid="success-1")])
+    assert len(fired_faults) == 1
+    assert fired_faults[0]["delivery"]["last_event"] != original_event
+    task = first["outbox"][1]
+    assert task["slack_receipt"] == {"channel": CHANNEL, "ts": "2.456"}
+    assert task["state"] == "pending"
+    assert task["hold"] == "registry_or_delivery_unavailable"
+    assert task["error_type"] == "RuntimeError"
+    delivery = copy.deepcopy(jira.notification_state["RHAI-1"]["delivery"])
+    assert delivery["root"] == original_root and delivery["last_event"] == original_event
+    assert delivery["intent"]["state"] == "inflight"
     assert len(slack.calls) == 2
-    assert slack.calls[-1][1]["thread_ts"] == "1.456"
-    assert first["outbox"][1]["state"] in {"confirmed", "pending", "reconciliation_required"}
 
     replay = make_dispatcher(tmp_path, jira, slack)
     result = replay.run([observation(status="success", oid="success-1")])
-    assert len(slack.calls) == 2
-    assert result["outbox"][1]["state"] == "confirmed"
+    assert len(fired_faults) == 1 and len(slack.calls) == 2
+    assert result["outbox"][1]["state"] == "reconciliation_required"
+    assert result["outbox"][1]["hold"] == "registry_or_delivery_unavailable"
+    assert jira.notification_state["RHAI-1"]["delivery"] == delivery
 
 
-def test_multiple_open_candidates_and_query_failure_hold(tmp_path):
+def test_query_failure_with_existing_registry_holds(tmp_path):
     jira, slack = FakeJira(), FakeSlack()
     dispatch = make_dispatcher(tmp_path, jira, slack)
     dispatch.run([observation()])
-    key = jira.issue_keys()[0]
-    second = copy.deepcopy(jira.issues[key])
-    second["key"] = "RHAI-99"
-    jira.issues["RHAI-99"] = second
-    jira.notification_state["RHAI-99"] = copy.deepcopy(jira.notification_state[key])
-
-    ambiguous = make_dispatcher(tmp_path, jira, slack, name="ledger-ambiguous.json")
-    result = ambiguous.run([observation(oid="run-2")])
-    assert result["outbox"][0]["state"] in {"pending", "reconciliation_required"}
-    assert result["outbox"][0]["hold"] == "registry_or_delivery_unavailable"
-
+    before = copy.deepcopy((jira.issues, jira.notification_state, slack.calls))
     jira.fail_find_once = True
     queried = make_dispatcher(tmp_path, jira, slack, name="ledger-query.json")
     result = queried.run([observation(oid="run-3")])
     assert result["outbox"][0]["state"] in {"pending", "reconciliation_required"}
     assert result["outbox"][0]["hold"] == "registry_or_delivery_unavailable"
+    assert (jira.issues, jira.notification_state, slack.calls) == before

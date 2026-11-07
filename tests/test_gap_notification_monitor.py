@@ -5,8 +5,8 @@ from dataclasses import replace
 import pytest
 
 from lib.gap_notifications.monitor_hook import NotificationConfig, notify_after_publish
-from test_gap_notification_dispatch import Jira, Slack
-from test_gap_notification_observations import state, run, LEADER_URL
+from gap_notification_fakes import Jira, Slack
+from gap_notification_fakes import state, run, LEADER_URL
 from scripts import gap_pr_monitor as monitor
 
 PR = "https://github.com/acme/demo/pull/42"

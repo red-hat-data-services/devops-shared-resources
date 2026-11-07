@@ -1,4 +1,8 @@
-"""Display projection uses fake services only, never a notification lifecycle run."""
+"""Read-only tracking and inspection of registry records seeded with fake services."""
+import json
+from lib.gap_notifications.lookup_tools import inspect_issue
+from lib.gap_notifications.notify_tools import section
+from gap_notification_fakes import make_runner
 import copy
 
 import pytest
@@ -6,7 +10,7 @@ import pytest
 from lib.gap_notifications.dispatch_incidents import Dispatcher, Ledger
 from lib.gap_notifications.dispatch_incidents import incident_key
 from lib.gap_notifications.lookup_tools import project_tracking, tracking_cell
-from test_gap_notification_dispatch import Jira, Slack, observation
+from gap_notification_fakes import Jira, Slack, observation
 
 PR = 'https://github.com/acme/repo/pull/42'
 
@@ -227,3 +231,40 @@ def test_no_match_not_checked_unavailable_and_safe_rendering():
     assert '<script>' not in cell and '\\|' in cell and '\\[' in cell
     projection['rows'][PR][0].update(jira_key='OTHER-1', slack_url='https://evil.test')
     assert tracking_cell(projection, PR) == 'Unavailable'
+
+
+@pytest.fixture
+def setup(tmp_path):
+    return make_runner(tmp_path)
+
+
+def test_inspect_retry_deadline_and_visible_missing(setup):
+    runner, jira, _ = setup
+    runner().run([observation()])
+    state = jira.properties['RHAI-1']
+    state['delivery']['intent'] = {'id': state['episode_id'], 'event_id': state['last_event'],
+        'outcome': 'failure', 'state': 'rate_limited', 'retry_at': 1900000000}
+    nodes = jira.issues['RHAI-1']['fields']['description']['content']
+    index = next(i for i, node in enumerate(nodes) if node == section('')[0])
+    del nodes[index:index + 2]
+    report = inspect_issue(jira, 'RHAI-1')
+    assert report['visible_link'] == 'missing'
+    assert report['slack_intent']['retry_at'] == 1900000000
+
+
+@pytest.mark.parametrize('field,value', [('scope', 'wrong'), ('trial_id', 'different'), ('episode_id', 'not-uuid')])
+def test_inspect_rejects_malformed_identity(setup, field, value):
+    runner, jira, _ = setup
+    runner().run([observation()])
+    jira.properties['RHAI-1'][field] = value
+    assert inspect_issue(jira, 'RHAI-1')['property'] == 'malformed_or_unavailable'
+
+
+@pytest.mark.parametrize('state', [None, {}, {'trial_id': 'SECRET', 'incident_key': 'SECRET'}])
+def test_inspect_missing_malformed_safe(setup, state):
+    runner, jira, _ = setup
+    runner().run([observation()])
+    jira.properties['RHAI-1'] = state
+    report = inspect_issue(jira, 'RHAI-1')
+    assert report['property'] == ('missing' if state is None else 'malformed_or_unavailable')
+    assert 'SECRET' not in json.dumps(report)

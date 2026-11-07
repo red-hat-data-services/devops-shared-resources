@@ -26,8 +26,7 @@ def test_restricted_markdown_exact_shape():
     assert gap_presentation.markdown_to_adf('# Header\n\nText `code` [Link](https://example.test/a)\n- One\n- Two') == body
 
 
-@pytest.mark.parametrize('markdown', ['**strong**', '_em_', '> quote', '1. numbered',
-    '```fence```', '  nested', '[bad](http://example.test)', '<html>', '---', 'a | b'])
+@pytest.mark.parametrize('markdown', ['**strong**', '_em_', '> quote', '1. numbered', '```fence```', '  nested', '[bad](http://example.test)', '<html>', '---', 'a | b', '**bold**', '```code```', '1. ordered', '+ unordered', '##', '|table|'])
 def test_no_new_markdown_syntax(markdown):
     with pytest.raises(ValueError):
         jira_adf.markdown_to_adf(markdown)

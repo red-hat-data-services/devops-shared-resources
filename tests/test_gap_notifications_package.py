@@ -5,7 +5,7 @@ import subprocess
 import sys
 
 from lib.gap_notifications import notify_tools
-from test_gap_notification_dispatch import observation
+from gap_notification_fakes import observation
 
 
 def test_packaged_template_and_real_formatting_work_outside_checkout(tmp_path, monkeypatch):

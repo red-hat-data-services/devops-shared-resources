@@ -1,3 +1,6 @@
+from lib.gap_notifications.dispatch_incidents import discussion_url, metadata_url
+from lib.gap_notifications.notify_tools import project_body, section, visible_link_status
+from gap_notification_fakes import make_runner
 import copy
 import json
 
@@ -7,10 +10,9 @@ import lib.gap_notifications.notify_tools as presentation
 
 from lib.gap_notifications.dispatch_incidents import _description, _summary
 from lib.gap_notifications.notify_tools import JiraNotifier
-from lib.gap_notifications.notify_tools import category_labels, markdown_to_adf, render_markdown
-from test_gap_notification_dispatch import observation, setup
-import test_gap_notification_jira as adapter_tests
-from test_gap_notification_jira import FakeResponse, FakeSession
+from lib.gap_notifications.notify_tools import category_labels, render_markdown
+from gap_notification_fakes import observation
+from service_client_fakes import FakeResponse, FakeSession, notifier_for, issue_for
 
 
 @pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
@@ -54,12 +56,6 @@ def test_grouped_targets_and_literal_injection(monkeypatch, tmp_path):
 def test_bad_urls_fail(url):
     with pytest.raises(ValueError):
         _description(observation(evidence={'leader_url': url}))
-
-
-@pytest.mark.parametrize('md', ['**bold**', '<html>', '> quote', '```code```', '1. ordered', '+ unordered', '  nested', '[bad](http://example.test)', '##', '|table|'])
-def test_unsupported_syntax_fails(md):
-    with pytest.raises(ValueError):
-        markdown_to_adf(md)
 
 
 def test_explicit_targets_only_and_bounded():
@@ -145,46 +141,50 @@ def test_dispatcher_only_adds_labels_despite_stale_registry_snapshot(setup, monk
     assert 'human-after-search' in jira.issues['RHAI-1']['fields']['labels']
 
 
-def test_additive_adapter_missing_label_readback_fails():
-    helper = adapter_tests.JiraNotifierTests()
-    current = helper._issue(labels=['human'])
-    session = FakeSession(responses={'get': [FakeResponse(current), FakeResponse(current)],
-                                    'put': [FakeResponse(None, 204)]})
-    with pytest.raises(adapter_tests.JiraAmbiguousError):
-        helper._notifier(session).update_issue('RHAI-1', add_labels=['gap-build-failure'])
-
-
-def test_additive_adapter_rejects_replace_and_add_together():
-    helper = adapter_tests.JiraNotifierTests()
-    session = FakeSession()
-    with pytest.raises(ValueError):
-        helper._notifier(session).update_issue('RHAI-1', labels=['one'], add_labels=['two'])
-    assert session.calls == []
-
-
-def test_additive_adapter_update_preserves_racing_human_label():
-    helper = adapter_tests.JiraNotifierTests()
-    adf = _description(observation())
-    # The registry search snapshot lacks human-new. It appears before adapter GET.
-    current = helper._issue(description=adf, labels=['gap-registry-id', 'human-new'])
-    updated = copy.deepcopy(current)
-    updated['fields']['labels'].extend(['gap-build-failure', 'human-even-newer'])
-    session = FakeSession(responses={'get': [FakeResponse(current), FakeResponse(updated)],
-                                    'put': [FakeResponse(None, 204)]})
-    actual = helper._notifier(session).update_issue('RHAI-1', description=adf, add_labels=['gap-build-failure'])
-    assert set(actual['fields']['labels']) == set(updated['fields']['labels'])
-    payload = next(kwargs['json'] for method, _, kwargs in session.calls if method == 'put')
-    assert 'labels' not in payload['fields']
-    assert payload['update']['labels'] == [{'add': 'gap-build-failure'}]
-
-
 def test_actual_adapter_fake_transport_roundtrip():
-    helper = adapter_tests.JiraNotifierTests()
     obs = observation(evidence={'leader_url': 'https://example.test/leader/1', 'head_sha': 'abc123'})
     adf = _description(obs)
-    issue = helper._issue(summary=_summary(obs), description=adf, labels=['gap-build-failure'])
+    issue = issue_for(summary=_summary(obs), description=adf, labels=['gap-build-failure'])
     session = FakeSession(responses={'post': [FakeResponse({'key': 'RHAI-1'})], 'get': [FakeResponse(issue)]})
-    result = helper._notifier(session).create_bug(_summary(obs), adf, ['gap-build-failure'])
+    result = notifier_for(session).create_bug(_summary(obs), adf, ['gap-build-failure'])
     assert result['key'] == 'RHAI-1'
     assert JiraNotifier._adf_signature(adf) == JiraNotifier._adf_signature(issue['fields']['description'])
     assert '"code"' in json.dumps(adf) and '"href": "https://example.test/leader/1"' in json.dumps(adf)
+
+
+@pytest.fixture
+def setup(tmp_path):
+    return make_runner(tmp_path)
+
+
+def test_both_sections_preserve_body_idempotent_and_reject_edited_metadata():
+    body = {'type': 'doc', 'version': 1, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'human text'}]}]}
+    slack = discussion_url({'channel': 'C0883L8FARE', 'ts': '123.000001'})
+    meta = metadata_url('RHAI-123')
+    updated = project_body(body, slack, metadata=meta)
+    assert updated['content'][:1] == body['content']
+    assert project_body(updated, slack, metadata=meta) == updated
+    assert visible_link_status(updated, slack) == 'match'
+    assert visible_link_status(updated, meta, metadata=True) == 'match'
+    updated['content'].extend(section(meta, metadata=True))
+    with pytest.raises(ValueError):
+        project_body(updated, slack, metadata=meta)
+    updated['content'] = updated['content'][:-2]
+    updated['content'][-1]['content'][-1]['text'] = 'human changed note'
+    with pytest.raises(ValueError):
+        project_body(updated, slack, metadata=meta)
+
+
+def test_projection_preserves_nodes_and_rejects_edited_duplicates():
+    body = {'type': 'doc', 'version': 1, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'human'}]}]}
+    url = discussion_url({'channel': 'C0883L8FARE', 'ts': '123.000001'})
+    updated = project_body(body, url)
+    assert updated['content'][:1] == body['content']
+    assert project_body(updated, url) == updated
+    duplicate = copy.deepcopy(updated)
+    duplicate['content'].extend(section(url))
+    with pytest.raises(ValueError):
+        project_body(duplicate, url)
+    updated['content'][-1]['content'][0]['text'] = 'edited by human'
+    with pytest.raises(ValueError):
+        project_body(updated, url)

@@ -7,7 +7,7 @@ import requests
 from lib.gap_notifications import notify_tools as gap
 from lib.jira_client import (JiraClient, JiraAmbiguousError, JiraPermanentError,
     JiraTransientError)
-from test_gap_notification_jira import FakeResponse, FakeSession
+from service_client_fakes import FakeResponse, FakeSession
 
 SITE = 'https://example-jira.test'
 

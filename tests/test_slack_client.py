@@ -1,6 +1,7 @@
 """Offline tests for the reusable Slack client."""
 
 from __future__ import annotations
+from service_client_fakes import FakeResponse
 
 import unittest
 from types import SimpleNamespace
@@ -9,16 +10,6 @@ from unittest.mock import Mock, patch
 from lib.slack_client import (
     SlackClient,
 )
-
-
-class FakeResponse:
-    def __init__(self, data=None, status_code=200, headers=None):
-        self._data = data
-        self.status_code = status_code
-        self.headers = headers or {}
-
-    def json(self):
-        return self._data
 
 
 class FakeSession:

@@ -1,3 +1,7 @@
+import pytest
+from lib.gap_notifications.lookup_tools import inspect_issue
+from gap_notification_fakes import observation
+from gap_notification_fakes import make_runner
 import io
 import json
 
@@ -21,7 +25,15 @@ def test_default_dry_run_no_credentials_clients_or_files(tmp_path):
 
 
 def test_reject_production_before_client_creation(tmp_path):
-    assert main(args(tmp_path) + ["--jira-url", "https://redhat.atlassian.net", "--write"], environ={}, stdout=io.StringIO()) == 1
+    constructed = []
+    def forbidden(*values):
+        constructed.append(values)
+        raise AssertionError("client constructed before destination validation")
+    env = {"JIRA_USER_EMAIL": "fixture", "JIRA_API_TOKEN": "fake", "SLACK_TOKEN": "fake"}
+    assert main(args(tmp_path) + ["--jira-url", "https://redhat.atlassian.net", "--write"],
+                environ=env, jira_factory=forbidden, slack_factory=forbidden,
+                stdout=io.StringIO()) == 1
+    assert constructed == []
 
 
 def test_write_requires_explicit_environment_credentials(tmp_path):
@@ -85,3 +97,39 @@ def test_dry_run_registry_v2_reports_candidate_without_remote_lookup(tmp_path):
     assert data["registry_version"] == 2 and data["incidents"] == 1
     assert len(data["outbox"]) == 1
     assert not (tmp_path / "ledger.json").exists()
+
+
+@pytest.fixture
+def setup(tmp_path):
+    return make_runner(tmp_path)
+
+
+def test_inspect_jira_only_no_ledger_or_slack(setup, monkeypatch, tmp_path):
+    runner, jira, _ = setup
+    runner().run([observation()])
+    # Query must perform only these two reads.
+    class ReadOnly:
+        get_issue = jira.get_issue
+        get_notification_state = jira.get_notification_state
+    def forbidden(*a, **kw):
+        raise AssertionError('forbidden')
+    before_files = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr('lib.gap_notifications.dispatch_incidents.Ledger', forbidden)
+    out = io.StringIO()
+    assert main(['--inspect', 'RHAI-1'], environ={'JIRA_API_EMAIL': 'fixture', 'JIRA_API_TOKEN': 'fake'},
+                jira_factory=lambda *a: ReadOnly(), slack_factory=forbidden, stdout=out) == 0
+    result = json.loads(out.getvalue())
+    assert result['trial_id'] == 'trial' and result['trial_match'] is None
+    assert result['visible_link'] == 'match' and result['open'] is True
+    assert {p.name: p.read_bytes() for p in tmp_path.iterdir()} == before_files
+    assert inspect_issue(jira, 'RHAI-1', trial='wrong')['property'] == 'trial_mismatch'
+    jira.close('RHAI-1')
+    assert inspect_issue(jira, 'RHAI-1')['open'] is False
+
+
+@pytest.mark.parametrize('extra', [['--write'], ['--ledger', '/not/read'], ['--resolve-receipt', '/not/read'], ['--jira-url', 'https://redhat.atlassian.net']])
+def test_inspect_rejects_mutating_or_production_args(extra):
+    def forbidden(*a, **kw):
+        raise AssertionError('client created')
+    assert main(['--inspect', 'RHAI-1'] + extra, environ={}, jira_factory=forbidden, stdout=io.StringIO()) == 1
