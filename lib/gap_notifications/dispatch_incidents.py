@@ -21,7 +21,7 @@ Cosmetic ADF mechanics live in notify_tools; delivery never imports lookup_tools
 from __future__ import annotations
 
 from lib.gap_notifications.notify_tools import (JiraNotifier, category_labels, description,
-    project_body, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
+    project_body, slack_message, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
 import copy
 import json
 from typing import Any
@@ -269,14 +269,6 @@ def _key(value):
     if not isinstance(value, str) or not re.fullmatch(r"RHAI-[1-9][0-9]*", value):
         raise ValueError("invalid Jira receipt key")
     return value
-
-
-def _notice(observation):
-    evidence = observation["evidence"]
-    return (f"test_only={evidence.get('test_only', True)}; synthetic={evidence.get('synthetic', False)}; "
-            f"historical_snapshot={evidence.get('historical_snapshot', False)}\n"
-            f"{evidence.get('note', 'Explicit supplied evidence; not a live production evaluation.')}\n"
-            "This staging trial does not establish production recovery.")
 
 
 def _description(observation, *, discussion_url=None, metadata_url=None):
@@ -604,13 +596,13 @@ class Dispatcher:
             delivery["last_event"] = event
             self._put(key, state)
             return  # No unrelated recovery root.
+        text = slack_message(obs, jira_url=f"{STAGE}/browse/{key}", reply=delivery["root"] is not None)
         intent = {"id": str(uuid.uuid4()), "event_id": event, "outcome": obs["status"], "state": "inflight"}
         delivery["intent"] = intent
         _bounded(state)
         self._put(key, state)  # Durable remote intent BEFORE Slack POST.
         task.update(operation="slack", delivery_id=intent["id"])
         self._save()
-        text = f"[GAP STAGING TEST] {obs['status']}: {obs['repository']} {obs['category']}\n{_notice(obs)}\n{STAGE}/browse/{key}\n" + json.dumps(obs["evidence"], sort_keys=True)[:2500]
         try:
             result = _receipt(self.slack.send(text, thread_ts=(delivery["root"] or {}).get("ts"), client_msg_id=intent["id"]))
         except Exception as exc:

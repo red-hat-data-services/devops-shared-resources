@@ -22,6 +22,8 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
+from datetime import datetime, timezone
+import unicodedata
 from lib.jira_client import (JiraClient, JiraError, JiraRateLimitError, JiraTransientError,
     JiraAmbiguousError, JiraPermanentError, JiraValidationError)
 from lib import jira_adf
@@ -605,6 +607,87 @@ class SlackNotifier:
             thread_ts=thread_ts,
             client_msg_id=client_msg_id,
         )
+
+
+def _slack_text(value, limit=160):
+    """Bound literal inline-code text; neutralize mentions, code fences and controls."""
+    text = " ".join((value if isinstance(value, str) else "Unavailable").split())
+    text = "".join(c for c in text if not unicodedata.category(c).startswith("C"))
+    text = text or "Unavailable"
+    if len(text) > limit:
+        text = text[:limit - 1] + "…"
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "ˋ")
+
+
+def _slack_link(value, label):
+    """Optional bounded HTTPS link with a static label, never evidence-supplied markup."""
+    try:
+        url = https_url(value)
+    except ValueError:
+        return None
+    if any(unicodedata.category(c).startswith("C") for c in url):
+        return None
+    url = url.replace("|", "%7C").replace("&", "&amp;")
+    if len(url) > 700:
+        return None
+    return f"<{url}|{label}>"
+
+
+def slack_message(observation, *, jira_url, reply=False):
+    """Render a staging notification without clients, lookups or delivery-state changes.
+
+    Only selected evidence is displayed; this is not a general secret scrubber.
+    Existing roots/receipts, not message content, determine threading and replay.
+    Optional unsafe/oversized URLs are omitted rather than emitted as Slack markup.
+    """
+    evidence = observation["evidence"]
+    category, status = observation["category"], observation["status"]
+    failure = {"build": "Build failed", "conflict": "Merge conflict", "feasibility": "Promotion blocked"}
+    success = {"build": "Successful build observed", "conflict": "Conflict resolved", "feasibility": "Feasibility restored"}
+    if status not in {"failure", "success"}:
+        raise ValueError("Slack notifications require a definitive outcome")
+    heading = success[category] if status == "success" else ("Failure update" if reply else failure[category])
+    lines = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading} — staging test*"]
+    if category == "build":
+        lines.append(f"*Component:* `{_slack_text(observation.get('component'))}`")
+    if not reply:
+        lines.extend([
+            f"*Repository:* `{_slack_text(observation.get('repository'))}`",
+            f"*Promotion:* `{_slack_text(observation.get('source_branch'), 80)}` → `{_slack_text(observation.get('destination_branch'), 80)}`",
+        ])
+    run = evidence.get("selected-run")
+    run = run if isinstance(run, dict) else {}
+    reason = evidence.get("reason") or run.get("reason")
+    if isinstance(reason, str) and reason.strip() and reason.strip().lower() not in {"failed", "failure", "success", "succeeded", "completed"}:
+        lines.append(f"*Reported reason:* `{_slack_text(reason, 240)}`")
+    jira_key = re.search(r"/browse/(RHAI-[1-9][0-9]{0,15})$", jira_url) if isinstance(jira_url, str) else None
+    jira = _slack_link(jira_url, f"Jira {jira_key[1]}" if jira_key else "Jira")
+    if jira is None:
+        raise ValueError("a safe Jira link is required")
+    links = [
+        _slack_link(evidence.get("build_url"), "Successful build" if status == "success" else "Failed build") if category == "build" else None,
+        _slack_link(evidence.get("pr_url"), "Child PR"), jira,
+    ]
+    if not reply:
+        links.append(_slack_link(evidence.get("leader_url"), "GAP Leader"))
+    lines.extend(["", " · ".join(link for link in links if link)])
+    provenance = []
+    if evidence.get("synthetic") is True:
+        provenance.append("Synthetic evidence")
+    if evidence.get("historical_snapshot") is True:
+        provenance.append("Recorded snapshot — not a live build check")
+    elif evidence.get("synthetic") is not True:
+        provenance.append("Supplied evidence — not a fresh build check")
+    try:
+        observed = datetime.fromisoformat(evidence.get("observed-at", "").replace("Z", "+00:00"))
+        if observed.tzinfo is not None:
+            provenance.append("observed " + observed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"))
+    except (ValueError, TypeError, AttributeError, OverflowError):
+        pass
+    lines.extend(["", " · ".join(provenance)])
+    if status == "success":
+        lines.append("Staging result only; does not establish production recovery.")
+    return "\n".join(lines)
 
 
 def literal(value):
