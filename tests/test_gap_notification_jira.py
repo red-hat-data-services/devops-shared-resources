@@ -8,8 +8,8 @@ from types import SimpleNamespace
 
 import requests
 
-from lib.gap_notification_dispatch import _description as dispatch_description
-from lib.gap_notification_jira import (
+from lib.gap_notifications.dispatch_incidents import _description as dispatch_description
+from lib.gap_notifications.notify_tools import (
     STAGING_JIRA_ORIGIN,
     JiraAmbiguousError,
     JiraNotifier,

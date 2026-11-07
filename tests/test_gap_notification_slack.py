@@ -8,7 +8,7 @@ from unittest.mock import Mock, patch
 
 import requests
 
-from lib.gap_notification_slack import (
+from lib.gap_notifications.notify_tools import (
     SLACK_CHAT_POST_MESSAGE,
     SLACK_MAX_RETRY_AFTER,
     SlackAmbiguousError,

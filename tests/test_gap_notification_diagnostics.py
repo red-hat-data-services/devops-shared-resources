@@ -4,8 +4,10 @@ import json
 
 import pytest
 
-from lib.gap_notification_diagnostics import discussion_url, inspect_issue, project_body, section, visible_link_status, metadata_url
-from lib.gap_notification_slack import SlackAmbiguousError, SlackPermanentError, SlackRateLimitError
+from lib.gap_notifications.dispatch_incidents import discussion_url, metadata_url
+from lib.gap_notifications.lookup_tools import inspect_issue
+from lib.gap_notifications.notify_tools import project_body, section, visible_link_status
+from lib.gap_notifications.notify_tools import SlackAmbiguousError, SlackPermanentError, SlackRateLimitError
 from scripts.gap_notify import main
 from test_gap_notification_dispatch import observation, setup
 
@@ -90,7 +92,7 @@ def test_closed_race_projection_is_cosmetic_only(setup, monkeypatch):
 @pytest.mark.parametrize('projection_fails', [False, True])
 def test_metadata_on_delivery_failure_preserves_original_core_state(setup, monkeypatch, error, state, projection_fails):
     runner, jira, slack = setup
-    monkeypatch.setattr('lib.gap_notification_dispatch.time.time', lambda: 1800000000)
+    monkeypatch.setattr('lib.gap_notifications.dispatch_incidents.time.time', lambda: 1800000000)
     def send(*a, **kw):
         raise error('ORIGINAL_SECRET', retry_after=30)
     monkeypatch.setattr(slack, 'send', send)
@@ -197,7 +199,7 @@ def test_inspect_jira_only_no_ledger_or_slack(setup, monkeypatch, tmp_path):
         raise AssertionError('forbidden')
     before_files = {p.name: p.read_bytes() for p in tmp_path.iterdir()}
     monkeypatch.chdir(tmp_path)
-    monkeypatch.setattr('lib.gap_notification_dispatch.Ledger', forbidden)
+    monkeypatch.setattr('lib.gap_notifications.dispatch_incidents.Ledger', forbidden)
     out = io.StringIO()
     assert main(['--inspect', 'RHAI-1'], environ={'JIRA_API_EMAIL': 'fixture', 'JIRA_API_TOKEN': 'fake'},
                 jira_factory=lambda *a: ReadOnly(), slack_factory=forbidden, stdout=out) == 0

@@ -1,5 +1,18 @@
-"""Staging Jira adapter for the GAP notification prototype."""
+"""GAP service facades, bounded issue content and pure managed ADF sections.
 
+JiraNotifier enforces staging origin/project/Bug scope, atomic initial properties,
+restricted content and stronger readbacks; completed issues are not reopened or
+content-edited. SlackNotifier preserves explicit-channel sends and mutable
+configuration; its callers own the fixed staging-channel policy. Generic Jira,
+Slack and ADF operations remain outside this package.
+
+Content helpers escape/bound supplied evidence, render the packaged issue
+Markdown template and delegate restricted ADF conversion. Managed discussion
+and metadata sections are cosmetic preparation/inspection, not routing data.
+Pure helpers require no authenticated instance or network. Callers own registry
+selection, lifecycle, deduplication and persistence; this module imports no
+lifecycle or lookup execution.
+"""
 from __future__ import annotations
 
 import copy
@@ -9,10 +22,22 @@ import re
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import urlsplit
-
 from lib.jira_client import (JiraClient, JiraError, JiraRateLimitError, JiraTransientError,
     JiraAmbiguousError, JiraPermanentError, JiraValidationError)
 from lib import jira_adf
+from lib.slack_client import (
+    SLACK_CHAT_POST_MESSAGE,
+    SLACK_MAX_RETRY_AFTER,
+    SlackAmbiguousError,
+    SlackClient,
+    SlackError,
+    SlackPermanentError,
+    SlackRateLimitError,
+    SlackTransientError,
+)
+from importlib.resources import files
+from jinja2 import Environment, StrictUndefined
+
 
 STAGING_JIRA_ORIGIN = "https://stage-redhat.atlassian.net"
 STAGING_JIRA_PROJECT = "RHAI"
@@ -546,3 +571,169 @@ class JiraNotifier:
     @staticmethod
     def _escape_jql(value: str) -> str:
         return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+@dataclass
+class SlackNotifier:
+    token: str = field(repr=False)
+    channel: str
+    session: Any = None
+    timeout: int = 20
+
+    def __post_init__(self) -> None:
+        self._validate_inputs()
+        self.session = self._client().session
+
+    def _validate_inputs(self) -> None:
+        if not isinstance(self.token, str) or not self.token.strip():
+            raise ValueError("token must be a non-empty string")
+        if not isinstance(self.channel, str) or not self.channel.strip():
+            raise ValueError("channel must be a non-empty string")
+        if self.session is not None and not hasattr(self.session, "post"):
+            raise TypeError("session must provide post()")
+        if not isinstance(self.timeout, (int, float)) or self.timeout <= 0:
+            raise ValueError("timeout must be positive")
+
+    def _client(self) -> SlackClient:
+        return SlackClient(self.token, session=self.session, timeout=self.timeout)
+
+    def send(self, text: str, *, thread_ts: str | None = None, client_msg_id: str | None = None) -> dict[str, str]:
+        self._validate_inputs()
+        return self._client().post_message(
+            self.channel,
+            text,
+            thread_ts=thread_ts,
+            client_msg_id=client_msg_id,
+        )
+
+
+def literal(value):
+    if value is None or value == "":
+        value = "Unavailable"
+    text = " ".join(str(value).split())
+    if len(text) > 2000:
+        raise ValueError("presentation field exceeds 2000 characters")
+    return jira_adf.escape_literal(text)
+
+
+def https_url(value):
+    if not isinstance(value, str) or len(value) > 4096:
+        raise ValueError("invalid evidence URL")
+    return jira_adf.https_url(value)
+
+
+def _inline(text):
+    return jira_adf._inline(text, url_validator=https_url)
+
+
+def markdown_to_adf(markdown):
+    # Preserve the old direct export\'s GAP URL length bound too.
+    return jira_adf.markdown_to_adf(markdown, url_validator=https_url)
+
+
+def category_labels(category):
+    return {"build": ["gap-build-failure"],
+            "conflict": ["gap-sync-failure", "gap-merge-conflict"],
+            "feasibility": ["gap-sync-failure", "gap-feasibility-failure"]}[category]
+
+
+def render_markdown(observation, *, discussion_url=None, metadata_url=None):
+    e = observation["evidence"]
+    run = e.get("selected-run") or {}
+    creator = e.get("creator-outcome") or {}
+    context = {key: literal(observation.get(key)) for key in (
+        "repository", "category", "source_branch", "destination_branch", "component", "pipeline", "observation_id")}
+    context.update(pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
+                   reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
+                   note=literal(e.get("note")),
+                   synthetic=literal(e.get("synthetic")), historical=literal(e.get("historical_snapshot")),
+                   revision=literal(e.get("head_sha") or e.get("head-sha")), targets=[], links=[],
+                   discussion_url=https_url(discussion_url) if discussion_url else None,
+                   metadata_url=https_url(metadata_url) if metadata_url else None)
+    targets = e.get("affected_targets", [])
+    if not isinstance(targets, list) or len(targets) > 40:
+        raise ValueError("affected_targets must be a list of at most 40 entries")
+    for target in targets:
+        if not isinstance(target, dict) or not re.fullmatch(r"rhoai-[A-Za-z0-9._-]+", str(target.get("branch", ""))):
+            raise ValueError("affected target requires an explicit rhoai-X branch")
+        context["targets"].append({k: literal(target.get(k)) for k in ("branch", "reason", "component", "pipeline")})
+    for label, value in [("Child PR", e.get("pr_url")), ("Leader", e.get("leader_url")),
+                         ("Build logs or PipelineRun", e.get("build_url")), ("State snapshot", e.get("state_url")),
+                         ("Creator workflow", e.get("workflow_url") or creator.get("workflow-url")),
+                         ("Creator PR", creator.get("pr-url"))]:
+        if value:
+            context["links"].append({"label": label, "url": https_url(value)})
+    template = files("lib.gap_notifications").joinpath("templates/issue.md.j2").read_text(encoding="utf-8")
+    rendered = Environment(undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True).from_string(template).render(**context)
+    if len(rendered) > 24000:
+        raise ValueError("presentation exceeds 24000 characters")
+    return rendered
+
+
+def description(observation, *, discussion_url=None, metadata_url=None):
+    return markdown_to_adf(render_markdown(observation, discussion_url=discussion_url, metadata_url=metadata_url))
+
+
+SLACK_ORIGIN = "https://redhat-internal.slack.com"
+HEADING = {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "Slack discussion"}]}
+
+
+def section(url, *, metadata=False):
+    heading = copy.deepcopy(HEADING)
+    if metadata:
+        heading["content"][0]["text"] = "Notification metadata"
+    content = [{"type": "text", "text": "View notification metadata (JSON — source of truth)" if metadata else "Open Slack discussion",
+                "marks": [{"type": "link", "attrs": {"href": url}}]}]
+    if metadata:
+        content.append({"type": "text", "text": " Jira permissions required."})
+    return [heading, {"type": "paragraph", "content": content}]
+
+
+def _managed_indices(body, *, metadata=False):
+    if not isinstance(body, dict) or body.get("type") != "doc" or not isinstance(body.get("content"), list):
+        raise ValueError("description unavailable")
+    nodes = body["content"]
+    indices = [i for i, n in enumerate(nodes) if n.get("type") == "heading" and
+               any(c.get("text") == ("Notification metadata" if metadata else "Slack discussion") for c in n.get("content", []))]
+    if len(indices) > 1:
+        raise ValueError("ambiguous discussion sections")
+    if indices:
+        i = indices[0]
+        if i + 1 >= len(nodes) or nodes[i] != section("", metadata=metadata)[0]:
+            raise ValueError("edited discussion section")
+        paragraph = nodes[i + 1]
+        try:
+            url = paragraph["content"][0]["marks"][0]["attrs"]["href"]
+            pattern = (r"https://stage-redhat\.atlassian\.net/rest/api/3/issue/RHAI-[1-9][0-9]*/properties/gap\.notification\.v1"
+                       if metadata else re.escape(SLACK_ORIGIN) + r"/archives/C0883L8FARE/p[0-9]+")
+            if not re.fullmatch(pattern, url) or paragraph != section(url, metadata=metadata)[1]:
+                raise ValueError("edited discussion section")
+        except (KeyError, IndexError, TypeError):
+            raise ValueError("edited discussion section") from None
+    return indices
+
+
+def project_body(body, url, *, metadata=None):
+    updated = copy.deepcopy(body)
+    # Plan both sections before returning any mutation; edits/duplicates fail closed.
+    for value, is_metadata in ((url, False), (metadata, True)):
+        if value is None:
+            continue
+        indices = _managed_indices(updated, metadata=is_metadata)
+        nodes = section(value, metadata=is_metadata)
+        if indices:
+            updated["content"][indices[0]:indices[0] + 2] = nodes
+        else:
+            updated["content"].extend(nodes)
+    JiraNotifier._validate_adf(updated)
+    return updated
+
+
+def visible_link_status(body, url, *, metadata=False):
+    try:
+        indices = _managed_indices(body, metadata=metadata)
+        if not indices:
+            return "missing"
+        return "match" if body["content"][indices[0] + 1] == section(url, metadata=metadata)[1] else "mismatch"
+    except ValueError:
+        return "ambiguous_or_edited"

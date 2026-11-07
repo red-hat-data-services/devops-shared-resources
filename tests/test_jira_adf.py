@@ -5,8 +5,8 @@ import inspect
 import pytest
 
 from lib import jira_adf
-from lib import gap_notification_presentation as gap_presentation
-from lib import gap_notification_jira as gap_jira
+from lib.gap_notifications import notify_tools as gap_presentation
+from lib.gap_notifications import notify_tools as gap_jira
 
 
 def test_restricted_markdown_exact_shape():

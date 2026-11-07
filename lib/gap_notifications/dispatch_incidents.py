@@ -1,9 +1,32 @@
-"""Single-writer staging Jira registry; local ledger is only a cache/uncertainty journal."""
+"""Single-writer staging notification lifecycle backed by the Jira registry.
+
+Ingest explicit normalized observations into a trial-scoped local outbox, then
+resolve incidents through validated Jira labels/properties and issue status.
+Failures create or reuse episodes; explicit positive observations can recover
+them with a configured done transition. Unknown evidence does not establish
+recovery, and continued failure after manual closure creates a successor rather
+than reopening an issue. Confirmed Slack receipts and event IDs support replay
+deduplication; uncertain writes retain durable intents/holds for reconciliation.
+
+Jira gap.notification.v1 is routing authority. The flock/atomic-replace ledger
+is a cache, audit and uncertainty journal, not distributed coordination. Callers
+supply adapters and must ensure a single writer. Search-plus-create is non-atomic;
+this prototype provides neither exactly-once delivery nor concurrent-writer
+safety. Presentation links are cosmetic and cannot authorize lifecycle actions.
+
+Canonical incident normalization and shared registry/receipt/link validation
+live here so read-only lookup can validate independently of delivery execution.
+Cosmetic ADF mechanics live in notify_tools; delivery never imports lookup_tools.
+"""
 from __future__ import annotations
+
+from lib.gap_notifications.notify_tools import (JiraNotifier, category_labels, description,
+    project_body, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
 import copy
+import json
+from typing import Any
 import fcntl
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
@@ -14,20 +37,123 @@ import uuid
 from urllib.parse import urlsplit
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from lib.gap_notification_incidents import incident_key
-from lib.gap_notification_presentation import category_labels, description
-from lib.gap_notification_jira import JiraNotifier
+
+
+VALID_CATEGORIES = frozenset({"build", "conflict", "feasibility"})
+VALID_STATUSES = frozenset({"failure", "success", "unknown"})
+
+
+class IncidentError(ValueError):
+    """Raised when an observation payload is invalid."""
+
+
+def _mapping(value: Any, *, path: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise IncidentError(f"{path} must be a mapping")
+    return value
+
+
+def _jsonable(value: Any, *, path: str) -> Any:
+    try:
+        json.dumps(value, allow_nan=False)
+    except (TypeError, ValueError) as exc:
+        raise IncidentError(f"{path} must be JSON-compatible") from exc
+    return value
+
+
+def _text(value: Any, *, path: str) -> str:
+    if not isinstance(value, str):
+        raise IncidentError(f"{path} must be a string")
+    text = value.strip()
+    if not text:
+        raise IncidentError(f"{path} is required")
+    return text
+
+
+def _repository(value: Any) -> str:
+    repo = _text(value, path="repository")
+    parts = [part.strip().lower() for part in repo.split("/")]
+    if len(parts) == 2:
+        owner, name = parts
+        if not owner or not name:
+            raise IncidentError("repository must be owner/repo or host/owner/repo")
+        return f"github.com/{owner}/{name}"
+    if len(parts) == 3:
+        host, owner, name = parts
+        if not host or not owner or not name:
+            raise IncidentError("repository must be owner/repo or host/owner/repo")
+        return f"{host}/{owner}/{name}"
+    raise IncidentError("repository must be owner/repo or host/owner/repo")
+
+
+def _normalize_observation(observation: dict[str, Any]) -> dict[str, Any]:
+    data = _mapping(observation, path="observation")
+    environment = _text(data.get("environment"), path="environment")
+    repository = _repository(data.get("repository"))
+    source_branch = _text(data.get("source_branch"), path="source_branch")
+    destination_branch = _text(data.get("destination_branch"), path="destination_branch")
+    category = _text(data.get("category"), path="category")
+    if category not in VALID_CATEGORIES:
+        raise IncidentError(f"category must be one of {sorted(VALID_CATEGORIES)}")
+    status = _text(data.get("status"), path="status")
+    if status not in VALID_STATUSES:
+        raise IncidentError(f"status must be one of {sorted(VALID_STATUSES)}")
+    observation_id = _text(data.get("observation_id"), path="observation_id")
+    evidence = _jsonable(_mapping(data.get("evidence"), path="evidence"), path="evidence")
+
+    normalized: dict[str, Any] = {
+        "environment": environment,
+        "repository": repository,
+        "source_branch": source_branch,
+        "destination_branch": destination_branch,
+        "category": category,
+        "status": status,
+        "observation_id": observation_id,
+        "evidence": copy.deepcopy(evidence),
+    }
+    if category == "build":
+        component = _text(data.get("component"), path="component")
+        normalized["component"] = component
+        pipeline = data.get("pipeline")
+        if pipeline is not None:
+            normalized["pipeline"] = _text(pipeline, path="pipeline")
+    return normalized
+
+
+def _incident_identity(observation: dict[str, Any]) -> dict[str, Any]:
+    identity: dict[str, Any] = {
+        "environment": observation["environment"],
+        "repository": observation["repository"],
+        "source_branch": observation["source_branch"],
+        "destination_branch": observation["destination_branch"],
+        "category": observation["category"],
+    }
+    if observation["category"] == "build":
+        identity["component"] = observation["component"]
+        if "pipeline" in observation:
+            identity["pipeline"] = observation["pipeline"]
+    return identity
+
+
+def incident_key(observation: dict) -> str:
+    """Return a deterministic, human-inspectable incident identity."""
+    normalized = _normalize_observation(observation)
+    return json.dumps(_incident_identity(normalized), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
 
 STAGE = "https://stage-redhat.atlassian.net"
 CHANNEL = "C0883L8FARE"
 ENVIRONMENT = "stage-redhat.atlassian.net/RHAI/C0883L8FARE"
 PROPERTY_LIMIT = 24 * 1024
 
+
 def _hash(value):
     return hashlib.sha256(value.encode()).hexdigest()
 
+
 def _stamp():
     return datetime.now(timezone.utc).isoformat()
+
 
 def validate_observations(observations):
     if not isinstance(observations, list) or len(observations) > 1000:
@@ -40,6 +166,7 @@ def validate_observations(observations):
             raise ValueError("observation exceeds 64 KiB")
     return observations
 
+
 def bind_trial(ledger, trial_id):
     if not isinstance(trial_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", trial_id):
         raise ValueError("invalid trial ID")
@@ -49,8 +176,10 @@ def bind_trial(ledger, trial_id):
     result.update(schema=2, trial_id=trial_id)
     return result
 
+
 def incident_label(key, trial_id="default"):
     return "gap-registry-" + _hash(trial_id + ":" + key)[:40]
+
 
 def ingest(ledger, observations, *, trial_id="default"):
     validate_observations(observations)
@@ -71,6 +200,7 @@ def ingest(ledger, observations, *, trial_id="default"):
         for field in ("hold", "error_type", "retry_at"):
             task.pop(field, None)
     return data
+
 
 class Ledger:
     """flock + atomic replace; lock spans dispatch. No distributed coordination."""
@@ -162,19 +292,21 @@ def _presentation(observation, existing_labels, *, discussion_url=None, metadata
     return body, labels
 
 
-
 def _event(obs):
     return _hash(obs["observation_id"])
+
 
 def _bounded(state):
     if len(json.dumps(state, allow_nan=False).encode()) >= PROPERTY_LIMIT:
         raise ValueError("registry property exceeds 24 KiB; operator archival required")
     return state
 
+
 def _receipt(value):
     if not isinstance(value, dict) or value.get("channel") != CHANNEL or not re.fullmatch(r"[0-9]+\.[0-9]+", str(value.get("ts", ""))):
         raise ValueError("invalid Slack receipt")
     return {"channel": CHANNEL, "ts": value["ts"]}
+
 
 def _validate_state(value, key, trial, label):
     if not isinstance(value, dict):
@@ -215,8 +347,10 @@ def _validate_state(value, key, trial, label):
                 raise ValueError("invalid retry deadline")
     return copy.deepcopy(value)
 
+
 class RegistryHold(RuntimeError):
     pass
+
 
 class Dispatcher:
     """Single writer only: Jira properties are not compare-and-swap locks."""
@@ -415,7 +549,6 @@ class Dispatcher:
         task["jira_key"] = key
         if event not in state["seen_event_ids"]:
             if obs["status"] == "failure":
-                from lib.gap_notification_diagnostics import discussion_url, validated_property, metadata_url
                 root = state["delivery"]["root"]  # Jira registry only, never evidence.
                 validated_property(issue, state, trial=self.trial_id, identity=task["incident_key"])
                 body, labels = _presentation(obs, [], discussion_url=discussion_url(root) if root else None,
@@ -447,7 +580,6 @@ class Dispatcher:
     def _project_discussion(self, task, key):
         """Cosmetic projection is isolated from core receipt/intents and cannot cause resend."""
         try:
-            from lib.gap_notification_diagnostics import validated_property, discussion_url, project_body, metadata_url
             issue = self.jira.get_issue(key)
             if _closed(issue):
                 return
@@ -483,7 +615,6 @@ class Dispatcher:
             result = _receipt(self.slack.send(text, thread_ts=(delivery["root"] or {}).get("ts"), client_msg_id=intent["id"]))
         except Exception as exc:
             # Definite rejection can be recorded; all ambiguous outcomes retain inflight.
-            from lib.gap_notification_slack import SlackRateLimitError, SlackPermanentError
             if isinstance(exc, SlackRateLimitError):
                 deadline = time.time() + min(max(exc.retry_after or 60, 1), 3600)
                 delivery["intent"].update(state="rate_limited", retry_at=deadline)
@@ -499,3 +630,44 @@ class Dispatcher:
             delivery["root"] = result
         delivery.update(last_event=event, intent=None)
         self._put(key, state)
+
+
+def discussion_url(root):
+    receipt = _receipt(root)
+    return f"{SLACK_ORIGIN}/archives/{receipt['channel']}/p{receipt['ts'].replace('.', '')}"
+
+
+def validated_property(issue, state, *, trial=None, identity=None):
+    """Validate full stored scope/identity before using routing data; never description."""
+    if not isinstance(state, dict):
+        raise ValueError("missing property")
+    stored_trial = state.get("trial_id")
+    bind_trial({}, stored_trial)
+    if trial is not None and trial != stored_trial:
+        raise ValueError("trial mismatch")
+    stored_identity = state.get("incident_key")
+    parsed = json.loads(stored_identity)
+    obs = dict(parsed, status="failure", observation_id="diagnostic", evidence={})
+    if incident_key(obs) != stored_identity or (identity is not None and identity != stored_identity):
+        raise ValueError("incident mismatch")
+    label = incident_label(stored_identity, stored_trial)
+    checked = _validate_state(state, stored_identity, stored_trial, label)
+    # Summary retains caller repository spelling; identity canonicalizes it.
+    # Validate that spelling against the stored identity, never against body links.
+    prefix = f"[GAP STAGING TEST] {obs['category']} failure: "
+    summary = issue.get("fields", {}).get("summary", "")
+    if not isinstance(summary, str) or not summary.startswith(prefix):
+        raise ValueError("summary identity mismatch")
+    summary_obs = dict(obs, repository=summary[len(prefix):])
+    if incident_key(summary_obs) != stored_identity:
+        raise ValueError("summary repository mismatch")
+    _verify_issue(issue, {"label": label, "latest": summary_obs})
+    if "gap-episode-" + uuid.UUID(checked["episode_id"]).hex not in issue["fields"]["labels"]:
+        raise ValueError("episode mismatch")
+    if checked["delivery"]["root"] is not None and checked["delivery"]["last_event"] is None:
+        raise ValueError("root lacks confirmed delivery event")
+    return checked
+
+
+def metadata_url(key):
+    return f"{STAGE}/rest/api/3/issue/{_key(key)}/properties/gap.notification.v1"

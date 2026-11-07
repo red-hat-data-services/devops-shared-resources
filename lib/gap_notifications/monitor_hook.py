@@ -1,7 +1,19 @@
-"""Opt-in staging side effect after accepted monitor state publication.
+"""Opt-in staging notifications after accepted monitor state publication.
 
-This hook never decides promotion gates or chooses a Leader. Single active Leader
-and single notification writer are caller assumptions, not guarantees here.
+Filter the published Leader snapshot to this pass's accepted child decisions,
+collect normalized observations, then invoke the existing dispatcher only in
+explicit write mode. Disabled/preview/monitor-dry-run paths avoid notification
+credentials, clients and ledger access. Write mode uses fixed staging adapters,
+an explicit stable trial and a journal outside the monitored checkout.
+
+Return/log bounded delivery counts, never a historical task/evidence dump.
+An optional separate tracking handoff performs validated read-only Jira lookup
+for the same accepted observations, without initiating writes or Slack reads
+for display. Errors remain isolated from promotion gates and summary reporting.
+
+This hook neither chooses a Leader nor decides gates. A single active Leader
+and notification writer are caller assumptions, not guarantees; state
+publication and notification writes are not one transaction.
 """
 from __future__ import annotations
 
@@ -49,13 +61,16 @@ def _state_url(leader_url, published_sha, relative):
 def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None,
                          published_sha=None, state_path=None, repo_root=None,
                          dry_run=False, collector=None, dispatcher_factory=None,
-                         jira_factory=None, slack_factory=None, environ=None):
+                         jira_factory=None, slack_factory=None, environ=None, tracking=None):
     """Non-blocking. No credential/client/ledger access unless explicitly write-enabled.
 
     Input is the published payload, restricted to this pass's accepted decisions.
     No reload of arbitrary historical children, aggregate-success inference, or live
     service queries occurs in collection. Exceptions never leak transport text.
     """
+    if tracking is not None:
+        tracking.clear()
+        tracking.update(status="not_checked")
     if config is None or config.mode == "disabled":
         return {"status": "disabled"}
     if dry_run:
@@ -82,9 +97,9 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         filtered["pull-requests"] = [c for c in payload.get("pull-requests", [])
                                       if c.get("pr-url") in accepted]
         if collector is None:
-            from lib.gap_notification_observations import collect_build_observations
+            from lib.gap_notifications.analyze_leader_state import collect_build_observations
             collector = collect_build_observations
-        from lib.gap_notification_dispatch import ENVIRONMENT, CHANNEL, STAGE, Ledger, Dispatcher, validate_observations
+        from lib.gap_notifications.dispatch_incidents import ENVIRONMENT, CHANNEL, STAGE, Ledger, Dispatcher, validate_observations
         observations = collector(filtered, environment=ENVIRONMENT, leader_url=leader_url, state_url=link)
         validate_observations(observations)
         counts = {s: sum(o["status"] == s for o in observations) for s in ("failure", "success", "unknown")}
@@ -102,16 +117,33 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
             if not all(isinstance(v, str) and v.strip() for v in (email, token, slack_token)):
                 raise ValueError("explicit staging notification credentials required")
             if jira_factory is None:
-                from lib.gap_notification_jira import JiraNotifier
+                from lib.gap_notifications.notify_tools import JiraNotifier
                 jira_factory = JiraNotifier
             if slack_factory is None:
-                from lib.gap_notification_slack import SlackNotifier
+                from lib.gap_notifications.notify_tools import SlackNotifier
                 slack_factory = SlackNotifier
+            jira = jira_factory(STAGE, "RHAI", "Bug", email, token)
             dispatcher = (dispatcher_factory or Dispatcher)(Ledger(config.ledger),
-                jira_factory(STAGE, "RHAI", "Bug", email, token), slack_factory(slack_token, CHANNEL),
+                jira, slack_factory(slack_token, CHANNEL),
                 trial_id=config.trial_id, transition_id=config.transition_id,
                 transition_fields=config.transition_fields)
             data = dispatcher.run(observations)
+            if tracking is not None:
+                try:
+                    from lib.gap_notifications.dispatch_incidents import incident_key
+                    from lib.gap_notifications.lookup_tools import project_tracking
+                    current = {(incident_key(o), o["observation_id"]) for o in observations}
+                    hints = {}
+                    for task in data.get("outbox", []):
+                        obs = task.get("observation", {})
+                        identity = task.get("incident_key")
+                        if ((identity, obs.get("observation_id")) in current
+                                and incident_key(obs) == identity and task.get("jira_key")):
+                            hints.setdefault(identity, []).append(task["jira_key"])
+                    tracking.update(project_tracking(observations, jira, trial_id=config.trial_id, known_keys=hints))
+                except Exception:
+                    tracking.clear()
+                    tracking.update(status="unavailable")
             # Fixed keys keep historical outbox growth out of logs; never emit
             # arbitrary state names, warning text, or task-level evidence.
             state_counts = dict.fromkeys(("confirmed", "superseded", "pending", "inflight",
@@ -129,6 +161,9 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         print("GAP staging notifications: " + json.dumps(result, sort_keys=True), file=sys.stderr)
         return result
     except Exception as exc:
+        if tracking is not None:
+            tracking.clear()
+            tracking.update(status="unavailable")
         result = {"status": "error", "error_type": type(exc).__name__}
         print("WARNING: GAP staging notifications isolated failure: " + type(exc).__name__, file=sys.stderr)
         return result

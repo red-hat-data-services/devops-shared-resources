@@ -4,7 +4,7 @@ from dataclasses import replace
 
 import pytest
 
-from lib.gap_notification_monitor import NotificationConfig, notify_after_publish
+from lib.gap_notifications.monitor_hook import NotificationConfig, notify_after_publish
 from test_gap_notification_dispatch import Jira, Slack
 from test_gap_notification_observations import state, run, LEADER_URL
 from scripts import gap_pr_monitor as monitor
@@ -89,7 +89,7 @@ def test_noop_guards_do_not_touch_dependencies(hook, changes, status):
 
 
 def test_deferred_children_never_reuse_persisted_receipts(hook):
-    invoke, _, _, opts, _ = hook
+    invoke, jira, slack, opts, _ = hook
     observed = []
     payload = state(expected_components=["api"], runs=[run("api", "failure")])
     old = copy.deepcopy(payload["pull-requests"][0])
@@ -101,6 +101,13 @@ def test_deferred_children_never_reuse_persisted_receipts(hook):
         return []
     invoke(payload, config=replace(opts["config"], mode="preview"), collector=collector)
     assert [o["pr-url"] for o in observed] == [PR]
+    tracking = {}
+    invoke(payload, tracking=tracking)
+    assert set(tracking["rows"]) == {PR}
+    from lib.gap_notifications.lookup_tools import tracking_cell
+    assert tracking_cell(tracking, old["pr-url"]) == "Not checked"
+    assert tracking["rows"][PR][0]["jira_key"] == "RHAI-1"
+    assert len(jira.issues) == len(slack.calls) == 1
     assert payload == before
 
 
@@ -140,7 +147,7 @@ def test_confirmed_core_retains_cosmetic_warning_visibility(hook, monkeypatch, c
 def test_large_historical_outbox_summary_is_fixed_shape(hook, capsys, historical_count):
     import json
     invoke, _, _, _, _ = hook
-    outbox = [{"state": "confirmed", "presentation_warning": "SECRET warning", "evidence": "X" * 1000}
+    outbox = [{"state": "confirmed", "jira_key": "RHAI-999", "presentation_warning": "SECRET warning", "evidence": "X" * 1000}
               for _ in range(historical_count)]
     outbox += [{"state": "superseded"}, {"state": "pending"}, {"state": "SECRET unknown state"}]
     class HistoricalDispatcher:
@@ -148,7 +155,10 @@ def test_large_historical_outbox_summary_is_fixed_shape(hook, capsys, historical
             pass
         def run(self, observations):
             return {"outbox": outbox}
-    result = invoke(dispatcher_factory=HistoricalDispatcher)
+    tracking = {}
+    result = invoke(dispatcher_factory=HistoricalDispatcher, tracking=tracking)
+    assert set(tracking["rows"]) == {PR}
+    assert tracking["rows"][PR][0]["status"] == "not_found"
     assert result["status"] == "held"
     assert result["delivery_task_count"] == historical_count + 3
     assert result["presentation_warning_count"] == historical_count
@@ -187,13 +197,18 @@ def test_incomplete_publication_identity_does_not_deliver(hook, published_sha, l
 
 
 def test_coordinator_only_invokes_after_publish_and_preserves_gate_result(tmp_path, monkeypatch):
-    from lib.gap_notification_monitor import NotificationConfig
+    from lib.gap_notifications.monitor_hook import NotificationConfig
     path = tmp_path / "state.json"
     payload = state(expected_components=["api"], runs=[run("api", "failure")])
     monitor.save_state(path, payload)
     child = monitor.MonitorResult(path, [], [], [], [], False, overall_status="pending", notification_urls=(PR,))
     monkeypatch.setattr(monitor, "run_monitor", lambda *a, **kw: child)
     order = []
+    summaries = []
+    def summary(**kw):
+        order.append("summary")
+        summaries.append(copy.deepcopy(kw))
+    monkeypatch.setattr(monitor, "_post_leader_failure_summary", summary)
     def publish(*a, **kw):
         order.append("publish")
         return monitor.PublishResult("b" * 40, True)
@@ -201,25 +216,67 @@ def test_coordinator_only_invokes_after_publish_and_preserves_gate_result(tmp_pa
     def notify(*a, **kw):
         order.append("notify")
         assert kw["accepted_urls"] == (PR,) and kw["published_sha"] == "b" * 40
+        kw["tracking"].update(status="checked", rows={PR: [{"component": "api", "status": "slack_pending", "jira_key": "RHAI-1"}]})
         return {"status": "held"}
-    monkeypatch.setattr("lib.gap_notification_monitor.notify_after_publish", notify)
+    monkeypatch.setattr("lib.gap_notifications.monitor_hook.notify_after_publish", notify)
     opts = dict(repo_root=tmp_path, leader_pr_url=LEADER_URL, head_ref="leader")
     # No publication => no hook, even if configured.
     assert monitor.run_monitor_publish_and_signal(path, **opts, publish=False, notification_config=NotificationConfig("preview")) is child
     assert not order
     # Disabled => no hook (ordinary monitor result unchanged).
     result = monitor.run_monitor_publish_and_signal(path, **opts, publish=True)
-    assert order == ["publish"] and result.notification_result is None
+    assert order == ["publish", "summary"] and result.notification_result is None
+    assert summaries[-1]["tracking"] == {"status": "not_checked"}
     order.clear()
     result = monitor.run_monitor_publish_and_signal(path, **opts, publish=True, notification_config=NotificationConfig("preview"))
-    assert order == ["publish", "notify"]
+    assert order == ["publish", "notify", "summary"]
+    assert summaries[-1]["tracking"]["rows"][PR][0]["jira_key"] == "RHAI-1"
     assert result.overall_status == child.overall_status and result.notification_result == {"status": "held"}
     # Even unexpected helper failures remain isolated.
     def broken(*a, **kw):
         raise RuntimeError("SECRET")
-    monkeypatch.setattr("lib.gap_notification_monitor.notify_after_publish", broken)
+    monkeypatch.setattr("lib.gap_notifications.monitor_hook.notify_after_publish", broken)
     result = monitor.run_monitor_publish_and_signal(path, **opts, publish=True, notification_config=NotificationConfig("preview"))
     assert result.overall_status == child.overall_status and result.notification_result["status"] == "error"
+
+
+def test_tracking_separate_reused_pending_and_failure_isolation(hook, monkeypatch, capsys):
+    invoke, jira, slack, opts, _ = hook
+    tracking = {}
+    result = invoke(tracking=tracking)
+    assert result["status"] == "settled"
+    assert tracking["rows"][PR][0]["jira_key"] == "RHAI-1"
+    assert tracking["rows"][PR][0]["slack_url"]
+    assert "tracking" not in result and "slack_url" not in capsys.readouterr().err
+    replay = {}
+    invoke(tracking=replay)
+    assert replay == tracking and len(slack.calls) == 1
+    slack.fail = True
+    payload = state(expected_components=["api", "gpu"], runs=[run("api", "failure"), run("gpu", "failure")])
+    held = invoke(payload, tracking=tracking)
+    assert held["status"] == "held"
+    assert tracking["rows"][PR][0]["slack_url"]
+    pending = tracking["rows"][PR][1]
+    assert pending["jira_key"] == "RHAI-2" and pending["status"] == "held"
+    assert "slack_url" not in pending
+    sends = len(slack.calls)
+    def fail(*a, **kw):
+        raise RuntimeError("SECRET")
+    monkeypatch.setattr("lib.gap_notifications.lookup_tools.project_tracking", fail)
+    result = invoke(payload, tracking=tracking)
+    assert result["status"] == "held" and tracking == {"status": "unavailable"}
+    assert len(slack.calls) == sends
+    assert "SECRET" not in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("mode,dry_run", [("disabled", False), ("preview", False), ("write", True)])
+def test_tracking_noop_still_no_clients_credentials_ledger(hook, mode, dry_run):
+    invoke, jira, slack, opts, calls = hook
+    tracking = {"status": "checked", "rows": {"OLD": []}}
+    invoke(config=replace(opts["config"], mode=mode), dry_run=dry_run, environ=Bomb(), tracking=tracking)
+    assert tracking == {"status": "not_checked"} and not calls
+    from pathlib import Path
+    assert not Path(opts["config"].ledger).exists()
 
 
 def test_parser_default_disabled():

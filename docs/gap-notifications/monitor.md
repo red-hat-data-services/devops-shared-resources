@@ -96,6 +96,54 @@ writes are not transactional: a crash before invoking this hook can miss a pass;
 a later normal monitor pass can re-observe current evidence. No queue/scheduler,
 workflow wiring, credential setup or live-service trial is included.
 
+## Leader table tracking projection
+
+The existing failure/pending/closed table gains a **Jira / Slack** column.
+After the already-enabled write-mode dispatcher finishes, a separate optional
+structured handoff resolves current accepted component/pipeline observations
+with search/GET only, using the **configured stable trial ID**. For each identity
+it validates the entire staging registry property and issue identity with the
+existing diagnostics helpers. It selects the unique open incident, or the
+latest validated closed episode when none is open, explicitly marked **Closed**.
+A closed ticket without a confirmed root says **No confirmed Slack thread**,
+not that delivery is queued. Multiple open incidents,
+duplicate episodes, wrong scope/trial/identity/channel, malformed properties or
+failed lookups do not produce links. Search visibility can lag; no match is
+displayed as **No confirmed registry match**, never as proof that no ticket
+exists. Current-task known keys can fill a search lag only after identical fresh
+issue/property validation; historical outbox receipts are not display authority.
+
+Rows pair escaped component/pipeline labels with Jira and confirmed Slack root
+links, separating multiple entries with `<br>`. Successful-empty (`not_found`)
+entries are condensed to one counted row-level note so they do not bury links;
+unavailable components remain individually labelled. A confirmed Jira issue is shown
+even if Slack is pending/unconfirmed; no thread is invented. Existing confirmed
+roots remain usable when later delivery is held, with an explicit held label.
+Visible descriptions, previous comment text and arbitrary test namespaces are
+never scanned for routing. There are no Slack history requests or extra scopes.
+
+The projection reuses the existing explicitly configured Jira adapter, never
+constructs clients or reads credentials by itself. The rendering helper has no
+eager service-client/transport imports (the preexisting `lib` package initializer
+still imports `requests` for PRCreator; this feature does not alter that). It
+never creates, updates, closes or resends anything for display. Lookup failures remain **Unavailable**
+and cannot change dispatcher held/error status or promotion gates. No per-task
+links or historical evidence are added to bounded console summaries or state.json.
+
+Standalone reporter refreshes, disabled/preview/dry-run notification modes, and
+children deferred by the current monitor pass show **Not checked** when no
+explicit current projection exists. Standalone reporting does not implicitly
+load notification credentials or query services. It may replace prior displayed
+links with this explicit uncertainty, not a claim of no incident; prior display
+text is not authoritative. Creator-only refresh still replaces only its managed
+creator section and preserves the build table, including tracking cells.
+
+This is shared-repository code only. Consumer workflow pins/rollout configuration
+require a separately reviewed follow-up; this change enables no workflow or live
+trial. Original PR84 captured preview namespace is
+`leader84-full-cce96577-stage-001`; the retired isolated refactor namespace must
+not be merged into those results.
+
 ## Offline validation
 
 `tests/test_gap_notification_monitor.py` runs the **real collector and existing

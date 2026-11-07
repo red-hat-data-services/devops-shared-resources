@@ -281,6 +281,33 @@ def test_render_summary_markdown_table() -> None:
     )
 
 
+def test_tracking_column_standalone_and_creator_only_refresh(monkeypatch, tmp_path):
+    row = fr.ChildFailureRow("repo", "https://github.com/acme/repo/pull/1", 1,
+                             "build-failure", "open", False, "failed")
+    tracking = {"status": "checked", "rows": {row.pr_url: [
+        {"component": "cpu", "status": "slack_pending", "jira_key": "RHAI-1"},
+        {"component": "gpu", "status": "confirmed", "jira_key": "RHAI-2",
+         "slack_url": "https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001"}]}}
+    leader = "https://github.com/acme/gap/pull/9"
+    body = fr.render_summary_markdown([row], leader_pr_url=leader, tracking=tracking)
+    assert "| Jira / Slack |" in body and "cpu: [RHAI-1]" in body
+    assert "gpu: [RHAI-2]" in body and "<br>" in body
+    captured = []
+    monkeypatch.setattr(fr, "list_issue_comments", lambda *a, **kw: [{"id": 1, "body": body}])
+    monkeypatch.setattr(fr, "upsert_leader_summary_comment", lambda url, content, **kw: captured.append(content) or (1, False, True))
+    fr.publish_creator_outcomes(leader, [], gh_runner=lambda a: "")
+    assert body.rstrip() in captured[-1]  # Existing build table/links unchanged.
+    monkeypatch.setattr(fr, "load_state", lambda path: {"pull-requests": []})
+    monkeypatch.setattr(fr, "resolve_state_file", lambda **kw: tmp_path / "state.json")
+    monkeypatch.setattr(fr, "collect_rows_from_state", lambda *a, **kw: [row])
+    result = fr.report_for_leader(leader_pr_url=leader, repo_root=tmp_path,
+                                  gh_runner=lambda a: "")
+    assert "Not checked" in result.body and "RHAI-1" not in result.body
+    unavailable = fr.report_for_leader(leader_pr_url=leader, repo_root=tmp_path,
+                                       gh_runner=lambda a: "", tracking={"status": "unavailable"})
+    assert "Unavailable" in unavailable.body and "No confirmed registry match" not in unavailable.body
+
+
 def test_find_summary_comment() -> None:
     comments = [
         {"id": 1, "body": "hello"},

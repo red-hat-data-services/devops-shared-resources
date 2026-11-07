@@ -2036,6 +2036,7 @@ def test_coordinator_calls_failure_summary_after_publish(
     assert calls[0]["leader_pr_url"] == leader
     assert calls[0]["state_path"] == path
     assert calls[0]["dry_run"] is True
+    assert calls[0]["tracking"] == {"status": "not_checked"}
 
 
 def test_coordinator_failure_summary_errors_do_not_fail_gate(

@@ -1,4 +1,16 @@
-"""Normalize Leader build evidence into lifecycle observations."""
+"""Normalize supplied Leader component-build evidence into lifecycle observations.
+
+Resolve each child's promotion stream from structured creator outcomes and
+validate repository/PR/current-head receipt consistency. Select component runs
+from the recorded expected-component evidence and emit deterministic
+failure/success/unknown observations with explicit provenance and event IDs.
+
+Collection is offline: it does not refresh GitHub/Konflux, construct service
+clients, or infer recovery from aggregate PR status, absence or closure. The
+monitor must restrict input to accepted current decisions. This producer emits
+build observations only; it does not invent conflict or feasibility evidence
+or choose notification destinations/trial namespaces.
+"""
 
 from __future__ import annotations
 

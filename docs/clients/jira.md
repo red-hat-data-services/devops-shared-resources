@@ -85,7 +85,7 @@ These functions need no client, auth, session or network:
 
 ## Compatible GAP policy facade
 
-`lib.gap_notification_jira.JiraNotifier` retains its constructor and eight
+`lib.gap_notifications.notify_tools.JiraNotifier` retains its constructor and eight
 existing operations, including their return shapes and fake-session injection.
 Constructor validation remains immediate. Later valid updates to its public
 session/email/token/timeout fields are honored by a lightweight delegate derived
@@ -107,7 +107,7 @@ It delegates service calls to `JiraClient` while retaining:
 callable without constructing an authenticated client. Dispatcher, diagnostics,
 monitor and CLI callers were not changed.
 
-`gap_notification_presentation` still owns the GAP template, category labels,
+`lib.gap_notifications.notify_tools` still owns the GAP template, category labels,
 observation context, missing-value defaults and application caps. Its existing
 `literal`, `https_url`, `_inline`, `markdown_to_adf`, `render_markdown` and
 `description` exports retain behavior and delegate pure mechanics. In particular,

@@ -7,8 +7,8 @@ import json
 
 import pytest
 
-from lib.gap_notification_dispatch import CHANNEL, Dispatcher, Ledger, incident_label
-from lib.gap_notification_slack import SlackRateLimitError
+from lib.gap_notifications.dispatch_incidents import CHANNEL, Dispatcher, Ledger, incident_label
+from lib.gap_notifications.notify_tools import SlackRateLimitError
 
 ENVIRONMENT = "stage-redhat.atlassian.net/RHAI/C0883L8FARE"
 TRIAL_ID = "leader84-local-001"
@@ -308,7 +308,7 @@ def test_rate_limit_persists_deadline_and_retries_after_it_expires(tmp_path, mon
     assert len(slack.calls) == 1
     assert before_deadline["outbox"][0]["state"] in {"pending", "reconciliation_required"}
 
-    monkeypatch.setattr("lib.gap_notification_dispatch.time.time", lambda: task["retry_at"] + 1)
+    monkeypatch.setattr("lib.gap_notifications.dispatch_incidents.time.time", lambda: task["retry_at"] + 1)
     after_deadline = fresh.run([])
     assert len(slack.calls) == 2
     assert after_deadline["outbox"][0]["state"] == "confirmed"

@@ -1,7 +1,17 @@
-"""Explicit Jira Cloud REST v3 site-origin client, without application policy.
+"""Explicit Jira Cloud REST v3 site-origin operations without GAP policy.
 
-Operations return service acknowledgements/data, not GAP-verified success.
-No credential discovery, automatic mutation retries, or restricted ADF coercion.
+Use caller-supplied origin, credentials, session and timeout for issue get/search/
+create/update, named properties and transitions. Search completes bounded
+pagination or fails rather than returning partial inventory; omitted search
+fields explicitly request summary. Create can include properties atomically in
+its POST. Generic fields/JSON are not interpreted as GAP content or restricted
+ADF, and results are service data/acknowledgements, not GAP-verified success.
+
+Classify failures by semantic read versus write (POST search is a read), retain
+sanitized error metadata and treat uncertain mutations as ambiguous. Never
+automatically retry writes or discover authentication. This is a site-origin
+Cloud client, not a gateway/discovery SDK; destination authorization, incident
+policy and stronger application readbacks remain caller responsibilities.
 """
 from __future__ import annotations
 import copy

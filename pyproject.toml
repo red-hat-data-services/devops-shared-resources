@@ -31,3 +31,4 @@ include = ["lib*"]
 
 [tool.setuptools.package-data]
 lib = ["templates/*.md.j2"]
+"lib.gap_notifications" = ["templates/*.md.j2"]

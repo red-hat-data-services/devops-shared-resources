@@ -1,5 +1,20 @@
 #!/usr/bin/env python3
-"""Explicit normalized observations -> isolated staging notification ledger."""
+"""CLI for explicit observations and isolated staging notification trials.
+
+Without --write, validate supplied observation JSON and ingest it against a
+trial-bound journal snapshot in memory, printing a preview without authenticated
+clients or journal writes. With --write, use explicitly supplied environment
+credentials for the fixed staging Jira/Slack destinations and existing
+dispatcher; an empty observation list can drain pending work. Receipt resolution
+is an explicit write-mode operator action, not automatic proof of delivery.
+
+The separate --inspect mode reads only Jira issue/property diagnostics, needs
+explicit Jira credentials and avoids ledger/Slack access. Preview can read the
+local journal; it is not the monitor's stricter no-ledger preview. None of these
+modes collects live build truth. Error reports are sanitized; preview output
+includes supplied outbox/evidence and is not a secret scrubber. Unresolved writes
+stay visible, and the ledger cannot be Leader state or the observation input.
+"""
 from __future__ import annotations
 
 import argparse
@@ -12,7 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from lib.gap_notification_dispatch import CHANNEL, STAGE, Dispatcher, Ledger, bind_trial, ingest
+from lib.gap_notifications.dispatch_incidents import CHANNEL, STAGE, Dispatcher, Ledger, bind_trial, ingest
 
 
 def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdout=None):
@@ -37,8 +52,8 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
         if args.inspect:
             if args.write or args.observations or args.ledger or args.resolve_receipt or args.transition_id or args.transition_fields != "{}":
                 raise ValueError("inspect is exclusive and read-only")
-            from lib.gap_notification_jira import JiraNotifier
-            from lib.gap_notification_diagnostics import inspect_issue
+            from lib.gap_notifications.notify_tools import JiraNotifier
+            from lib.gap_notifications.lookup_tools import inspect_issue
             JiraNotifier._issue_key(args.inspect)
             env = environ if environ is not None else os.environ
             email = env.get("JIRA_USER_EMAIL") or env.get("JIRA_API_EMAIL")
@@ -80,10 +95,10 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
             if not all(isinstance(v, str) and v.strip() for v in (email, token, slack_token)):
                 raise ValueError("explicit staging Jira/Slack environment credentials required")
             if jira_factory is None:
-                from lib.gap_notification_jira import JiraNotifier
+                from lib.gap_notifications.notify_tools import JiraNotifier
                 jira_factory = JiraNotifier
             if slack_factory is None:
-                from lib.gap_notification_slack import SlackNotifier
+                from lib.gap_notifications.notify_tools import SlackNotifier
                 slack_factory = SlackNotifier
             jira = jira_factory(STAGE, "RHAI", args.issue_type, email, token)
             slack = slack_factory(slack_token, CHANNEL)

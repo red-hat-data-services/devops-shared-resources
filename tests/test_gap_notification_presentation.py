@@ -3,11 +3,11 @@ import json
 
 import pytest
 from jinja2 import UndefinedError
-import lib.gap_notification_presentation as presentation
+import lib.gap_notifications.notify_tools as presentation
 
-from lib.gap_notification_dispatch import _description, _summary
-from lib.gap_notification_jira import JiraNotifier
-from lib.gap_notification_presentation import category_labels, markdown_to_adf, render_markdown
+from lib.gap_notifications.dispatch_incidents import _description, _summary
+from lib.gap_notifications.notify_tools import JiraNotifier
+from lib.gap_notifications.notify_tools import category_labels, markdown_to_adf, render_markdown
 from test_gap_notification_dispatch import observation, setup
 import test_gap_notification_jira as adapter_tests
 from test_gap_notification_jira import FakeResponse, FakeSession
@@ -105,7 +105,7 @@ def test_invalid_presentation_has_no_write_intent_and_corrected_can_proceed(setu
                     return '**unsupported**'
             patch.setattr(presentation, 'files', lambda package: InvalidTemplate())
         else:
-            patch.setattr('lib.gap_notification_dispatch.category_labels', lambda category: ['invalid label'])
+            patch.setattr('lib.gap_notifications.dispatch_incidents.category_labels', lambda category: ['invalid label'])
         failed = runner().run([obs])
     assert failed['outbox'][-1]['error_type'] == 'ValueError'
     if not existing:

@@ -5,7 +5,7 @@ import json
 import pytest
 import requests
 
-from lib import gap_notification_jira as gap
+from lib.gap_notifications import notify_tools as gap
 from lib.jira_client import (JiraClient, JiraAmbiguousError, JiraPermanentError,
     JiraRateLimitError, JiraTransientError, JiraValidationError)
 from test_gap_notification_jira import FakeResponse, FakeSession

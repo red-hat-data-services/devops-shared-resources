@@ -7,7 +7,7 @@ import json
 
 import pytest
 
-from lib.gap_notification_incidents import IncidentError, incident_key
+from lib.gap_notifications.dispatch_incidents import IncidentError, incident_key
 
 
 def observation(*, environment="stage-redhat", repository="acme/gap", source_branch="feature",

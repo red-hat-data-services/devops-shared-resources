@@ -2,8 +2,8 @@ import copy
 
 import pytest
 
-from lib.gap_notification_dispatch import CHANNEL, Dispatcher, Ledger, ingest, incident_label
-from lib.gap_notification_incidents import incident_key
+from lib.gap_notifications.dispatch_incidents import CHANNEL, Dispatcher, Ledger, ingest, incident_label
+from lib.gap_notifications.dispatch_incidents import incident_key
 
 
 def observation(status="failure", oid="run-1", **changes):
@@ -147,8 +147,8 @@ def test_manual_close_then_positive_recovery_prevents_old_failure_recreation(set
 
 
 def test_definite_rate_limit_retries_after_remote_deadline_across_fresh_ledgers(setup, monkeypatch):
-    from lib.gap_notification_slack import SlackRateLimitError
-    import lib.gap_notification_dispatch as module
+    from lib.gap_notifications.notify_tools import SlackRateLimitError
+    import lib.gap_notifications.dispatch_incidents as module
     runner, jira, slack = setup
     monkeypatch.setattr(module.time, "time", lambda: 1000)
     original = slack.send

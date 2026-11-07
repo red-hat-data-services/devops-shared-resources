@@ -1,8 +1,15 @@
-"""Pure restricted Markdown/ADF utilities; no Jira clients or credentials.
+"""Pure restricted Markdown/ADF mechanics, independent of authenticated clients.
 
-Supported Markdown: one-line paragraphs, headings, flat bullets, explicit HTTPS
-links and inline code; punctuation escapes. This is not full Markdown or ADF.
-Application defaults and presentation size limits belong to callers.
+Escape literal punctuation, validate explicit HTTPS links, convert the supported
+Markdown subset to ADF, validate supported ADF nodes/marks and compute structural
+signatures for application readback comparisons. Markdown supports one-line
+paragraphs, headings, flat bullets, links and inline code; the ADF validator also
+recognizes existing node forms that the converter does not generate.
+
+This is neither a full Markdown parser nor full ADF schema validation. Callers
+own templates, missing-value defaults and application size limits; an optional
+URL validator lets legacy GAP wrappers retain their stricter bounds. No network,
+credential access or service-client construction is needed for these utilities.
 """
 import re
 import string

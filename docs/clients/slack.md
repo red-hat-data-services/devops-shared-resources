@@ -17,4 +17,4 @@ Reusable Slack delivery operations live in `lib/slack_client.py`.
 
 ## GAP compatibility
 
-`lib/gap_notification_slack.py` remains as the compatibility wrapper for existing GAP callers and tests.
+`lib/gap_notifications/notify_tools.py` remains as the compatibility wrapper for existing GAP callers and tests.

@@ -9,9 +9,32 @@ Destinations are fixed: Jira `https://stage-redhat.atlassian.net`, project `RHAI
 Bug (`10016`), Slack `C0883L8FARE`. Observation `environment` must be exactly
 `stage-redhat.atlassian.net/RHAI/C0883L8FARE`.
 
+## Package boundaries
+
+Notification policy lives in `lib/gap_notifications/`, with a minimal initializer
+and five explicit tools:
+
+- `analyze_leader_state.py`: offline accepted-snapshot build collection.
+- `dispatch_incidents.py`: canonical identity, registry validation, lifecycle,
+  journal and delivery coordination; shared receipt/URL validation lives here.
+- `notify_tools.py`: GAP Jira/Slack facades, bounded content formatting and pure
+  managed ADF sections; no lifecycle or lookup imports.
+- `monitor_hook.py`: opt-in post-publication integration and separate tracking
+  handoff; disabled/preview/dry-run guarantees are unchanged.
+- `lookup_tools.py`: read-only inspection/tracking plus dependency-light table
+  rendering. Lookup imports shared validation only when needed; rendering does
+  not initiate service queries or load notification transports.
+
+Delivery depends on notify tools, never lookup tools. Lookup uses shared registry
+validation without executing delivery. The old unmerged flat GAP module paths
+are removed, not retained as forwarding shims. Existing script entry points and
+facade/function contracts remain; generic Jira/Slack clients and ADF utilities
+stay outside this package. The issue template moves with identical content to
+`lib/gap_notifications/templates/issue.md.j2`, declared as package data.
+
 ## Readable presentation
 
-Jira descriptions use the packaged `lib/templates/gap_notification_issue.md.j2`
+Jira descriptions use the packaged `lib/gap_notifications/templates/issue.md.j2`
 with Jinja2 StrictUndefined, independent of the current directory. The restricted
 Markdown converter supports headings, one-line paragraphs, flat bullets, explicit
 HTTPS links and inline code; no HTML, emphasis, tables, nested lists or code fences.

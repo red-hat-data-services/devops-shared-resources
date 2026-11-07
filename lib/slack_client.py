@@ -1,4 +1,16 @@
-"""Reusable Slack client for confirmed message delivery receipts."""
+"""Reusable explicit Slack chat.postMessage transport and receipt validation.
+
+Send caller-selected channel/text with optional thread timestamp and message ID,
+disabled unfurls, explicit bearer token/session/timeout and no redirects. Verify
+the service acknowledgement and channel/timestamp before returning a receipt;
+sanitize errors into rate-limit, permanent, transient or ambiguous categories
+without exposing raw response bodies or tokens.
+
+There is no credential discovery, channel policy, history lookup, persistence,
+automatic retry or exactly-once guarantee. A supplied client message ID does
+not resolve uncertain outcomes by itself. Applications choose destinations,
+record confirmed receipts and decide how to reconcile or hold failed sends.
+"""
 
 from __future__ import annotations
 

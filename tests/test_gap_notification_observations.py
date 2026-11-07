@@ -8,7 +8,7 @@ from pathlib import Path
 
 import pytest
 
-from lib.gap_notification_observations import (
+from lib.gap_notifications.analyze_leader_state import (
     ObservationCollectionError,
     collect_build_observations,
 )

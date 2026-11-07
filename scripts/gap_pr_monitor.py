@@ -1,22 +1,26 @@
 #!/usr/bin/env python3
-"""GAP PR monitor (RHOAIENG-93565, RHOAIENG-97054, RHAI-8079, RHAI-8261, RHAI-10942).
+"""GAP child monitoring, promotion-gate publication and Leader reporting.
 
-Read leader state.json, evaluate each child PR's component builds and
-main-to-release feasibility checks, post the gated artifacts promoter commit
-status, and update pr-status.
+Resolve the Leader/state snapshot, evaluate child component builds and
+main-to-release feasibility, and publish accepted current-head decisions.
+Deferred/head-moved children cannot contribute stale evidence to the optional
+notification hook. When state publication is requested, invoke that hook after
+publication and before the best-effort Leader failure summary, passing fresh
+validated tracking links separately from bounded notification result counts.
 
-Good children stay GitHub ``pending`` while siblings are still open (RHAI-8261)
-and again while builds succeeded but Early Gate has not concluded (so the final
-green can include a short EG status note). All-success batches set
-``component-builds`` to success and comment ``/early-gate`` (RHAI-10942).
-``overall-status`` is legacy and is stripped; ``promotion-gates`` is SoT.
-EG gates stay ``required: false`` so EG *failure* still greens children once
-EG has concluded; flip ``required`` later to demand EG success.
+Promotion gates, not legacy overall-status, are authoritative. Good children
+remain pending while siblings or Early Gate are outstanding; completed build
+batches can signal /early-gate. EG gates currently have required: false: under
+that policy EG conclusion, not a successful EG outcome, releases children (an
+EG failure can still green them once concluded). Requiring EG success needs a
+policy change. Notification delivery and cosmetic reporting failures do not
+decide promotion outcomes.
 
-State path (RHOAIENG-93564 / sync layout):
-GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json
-where trigger_id looks like gap-<uuid>
-(e.g. GAP Leaders/2026-09-25_gap-60907cdcc8e64561aa75bc326fe22899/state.json).
+The CLI can perform GitHub/Git/status/comment operations outside dry-run mode;
+notification writes additionally require their own explicit opt-in. Neither a
+successful Git publication nor a notification receipt makes these operations
+transactional. State lives under GAP Leaders/<date>_<trigger_id>/state.json;
+Leader selection, rollover guards and accepted-decision checks remain here.
 """
 
 from __future__ import annotations
@@ -1256,6 +1260,7 @@ def _post_leader_failure_summary(
     head_ref: str,
     dry_run: bool,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
+    tracking: dict | None = None,
 ) -> None:
     """Upsert the Leader failure/pending/closed summary comment (best-effort).
 
@@ -1274,6 +1279,7 @@ def _post_leader_failure_summary(
         dry_run=dry_run,
         gh_runner=gh_runner,
         reuse_monitor_evidence=build_status_source() == "konflux",
+        tracking=tracking,
     )
     prefix = "[dry-run] " if dry_run else ""
     action = "create" if summary.created else ("update" if summary.updated else "noop")
@@ -1427,16 +1433,18 @@ def run_monitor_publish_and_signal(
     )
 
     notification_result = None
+    notification_tracking = {"status": "not_checked"}
     if notification_config is not None and notification_config.mode != "disabled":
         try:
-            from lib.gap_notification_monitor import notify_after_publish
+            from lib.gap_notifications.monitor_hook import notify_after_publish
             notification_result = notify_after_publish(
                 load_state(result.state_path), accepted_urls=result.notification_urls,
                 config=notification_config, leader_url=leader_pr_url,
                 published_sha=published.sha, state_path=result.state_path,
-                repo_root=repo_root, dry_run=dry_run,
+                repo_root=repo_root, dry_run=dry_run, tracking=notification_tracking,
             )
         except Exception as exc:
+            notification_tracking = {"status": "unavailable"}
             notification_result = {"status": "error", "error_type": type(exc).__name__}
             print("WARNING: GAP staging notification hook failed: " + type(exc).__name__, file=sys.stderr)
 
@@ -1524,6 +1532,7 @@ def run_monitor_publish_and_signal(
                 head_ref=branch,
                 dry_run=dry_run,
                 gh_runner=gh_runner,
+                tracking=notification_tracking,
             )
         except Exception as exc:  # noqa: BLE001 — summary must not fail the gate
             print(
@@ -2442,7 +2451,7 @@ def main(argv: list[str] | None = None) -> int:
     notification_config = None
     if args.notification_mode != "disabled":
         try:
-            from lib.gap_notification_monitor import NotificationConfig
+            from lib.gap_notifications.monitor_hook import NotificationConfig
             notification_config = NotificationConfig(
                 mode=args.notification_mode, ledger=args.notification_ledger,
                 trial_id=args.notification_trial_id,
