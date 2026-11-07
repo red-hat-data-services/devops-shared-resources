@@ -9,6 +9,7 @@ from lib.gap_notifications import notify_tools as gap_presentation
 from lib.gap_notifications import notify_tools as gap_jira
 
 
+# Restricted Markdown must produce the exact supported ADF structure through both entry points.
 def test_restricted_markdown_exact_shape():
     assert inspect.isfunction(jira_adf.validate_adf)
     body = jira_adf.markdown_to_adf('# Header\n\nText `code` [Link](https://example.test/a)\n- One\n- Two')
@@ -26,6 +27,7 @@ def test_restricted_markdown_exact_shape():
     assert gap_presentation.markdown_to_adf('# Header\n\nText `code` [Link](https://example.test/a)\n- One\n- Two') == body
 
 
+# Unsupported Markdown syntax must remain rejected by both pure and GAP-facing converters.
 @pytest.mark.parametrize('markdown', ['**strong**', '_em_', '> quote', '1. numbered', '```fence```', '  nested', '[bad](http://example.test)', '<html>', '---', 'a | b', '**bold**', '```code```', '1. ordered', '+ unordered', '##', '|table|'])
 def test_no_new_markdown_syntax(markdown):
     with pytest.raises(ValueError):
@@ -34,6 +36,7 @@ def test_no_new_markdown_syntax(markdown):
         gap_presentation.markdown_to_adf(markdown)
 
 
+# Pure escaping must remain policy-free while the GAP wrapper applies defaults and size bounds.
 def test_pure_escaping_does_not_own_gap_defaults_or_bounds():
     assert jira_adf.escape_literal('* [] _') == r'\* \[\] \_'
     assert jira_adf.escape_literal('') == ''
@@ -44,6 +47,8 @@ def test_pure_escaping_does_not_own_gap_defaults_or_bounds():
         gap_presentation.literal('x' * 2001)
 
 
+# GAP compatibility entry points must enforce their URL bound without restricting the pure
+# converter.
 def test_legacy_url_bounds_apply_to_direct_markdown_and_inline_exports():
     url = 'https://example.test/' + 'x' * 4096
     assert jira_adf.https_url(url) == url
@@ -55,6 +60,7 @@ def test_legacy_url_bounds_apply_to_direct_markdown_and_inline_exports():
             operation(argument)
 
 
+# Pure URL validation must reject unsafe links independently of service clients.
 @pytest.mark.parametrize('url', ['http://example.test', 'https://user:pass@example.test',
     'https://example.test/a b', 'https://example.test/[x]', 'https://example.test/`code`'])
 def test_link_safety_is_pure(url):
@@ -62,6 +68,7 @@ def test_link_safety_is_pure(url):
         jira_adf.https_url(url)
 
 
+# ADF signatures must preserve link targets and reject unsupported document structures.
 def test_signature_preserves_link_target_and_supported_structure():
     original = jira_adf.markdown_to_adf('[link](https://example.test/one)')
     changed = copy.deepcopy(original)
@@ -74,6 +81,7 @@ def test_signature_preserves_link_target_and_supported_structure():
             validate(unsupported)
 
 
+# Pure compatibility helpers must work without constructing Jira or Slack clients.
 def test_legacy_pure_entrypoints_never_construct_clients(monkeypatch):
     def forbidden(*a, **kw):
         raise AssertionError('offline formatting must not construct an authenticated client')

@@ -14,6 +14,7 @@ def args(tmp_path, observations=None):
     return ["--observations", str(source), "--ledger", str(tmp_path / "ledger.json")]
 
 
+# Default CLI preview must need no credentials or clients and create no journal or lock file.
 def test_default_dry_run_no_credentials_clients_or_files(tmp_path):
     output = io.StringIO()
     def forbidden(*a, **kw):
@@ -24,6 +25,7 @@ def test_default_dry_run_no_credentials_clients_or_files(tmp_path):
     assert not (tmp_path / "ledger.json.lock").exists()
 
 
+# Production destinations must fail before either client factory is invoked.
 def test_reject_production_before_client_creation(tmp_path):
     constructed = []
     def forbidden(*values):
@@ -36,11 +38,14 @@ def test_reject_production_before_client_creation(tmp_path):
     assert constructed == []
 
 
+# Write mode must require explicit credentials and must not create a journal when they are
+# missing.
 def test_write_requires_explicit_environment_credentials(tmp_path):
     assert main(args(tmp_path) + ["--write"], environ={}, stdout=io.StringIO()) == 1
     assert not (tmp_path / "ledger.json").exists()
 
 
+# The email alias must work while adapters remain pinned to the agreed staging destinations.
 def test_email_alias_and_exact_staging_adapter_configuration(tmp_path):
     called = []
     def jira(*values):
@@ -56,6 +61,7 @@ def test_email_alias_and_exact_staging_adapter_configuration(tmp_path):
     assert called[1][1] == "C0883L8FARE"
 
 
+# The primary Jira email variable must take precedence over its compatibility alias.
 def test_user_email_has_precedence(tmp_path):
     got = []
     env = {"JIRA_USER_EMAIL": "primary", "JIRA_API_EMAIL": "fallback", "JIRA_API_TOKEN": "fake", "SLACK_BOT_TOKEN": "fake"}
@@ -63,6 +69,7 @@ def test_user_email_has_precedence(tmp_path):
     assert got[0][3] == "primary"
 
 
+# CLI failures must not print raw exception text that could contain secrets.
 def test_never_print_exception_text(tmp_path):
     out = io.StringIO()
     def fail(*a):
@@ -72,12 +79,14 @@ def test_never_print_exception_text(tmp_path):
     assert "VERY_SECRET" not in out.getvalue()
 
 
+# The CLI must refuse to use Leader state as its uncertainty journal.
 def test_refuse_leader_state_as_ledger(tmp_path):
     values = args(tmp_path)
     values[-1] = str(tmp_path / "state.json")
     assert main(values, stdout=io.StringIO()) == 1
 
 
+# An incompatible old journal must fail before client construction.
 def test_registry_v2_rejects_old_ledger_before_client_construction(tmp_path):
     values = args(tmp_path)
     (tmp_path / "ledger.json").write_text(json.dumps({"schema": 1, "trial_id": "default"}))
@@ -87,6 +96,7 @@ def test_registry_v2_rejects_old_ledger_before_client_construction(tmp_path):
     assert result == 1 and constructed == []
 
 
+# Preview must report candidate incidents without querying remote state or persisting a journal.
 def test_dry_run_registry_v2_reports_candidate_without_remote_lookup(tmp_path):
     obs = {"environment": "stage-redhat.atlassian.net/RHAI/C0883L8FARE", "repository": "acme/repo",
            "source_branch": "main", "destination_branch": "stable", "category": "conflict",
@@ -104,6 +114,8 @@ def setup(tmp_path):
     return make_runner(tmp_path)
 
 
+# Inspection must use Jira reads only, preserve local files and report trial mismatches
+# explicitly.
 def test_inspect_jira_only_no_ledger_or_slack(setup, monkeypatch, tmp_path):
     runner, jira, _ = setup
     runner().run([observation()])
@@ -128,6 +140,7 @@ def test_inspect_jira_only_no_ledger_or_slack(setup, monkeypatch, tmp_path):
     assert inspect_issue(jira, 'RHAI-1')['open'] is False
 
 
+# Inspection must reject write-oriented options and production destinations.
 @pytest.mark.parametrize('extra', [['--write'], ['--ledger', '/not/read'], ['--resolve-receipt', '/not/read'], ['--jira-url', 'https://redhat.atlassian.net']])
 def test_inspect_rejects_mutating_or_production_args(extra):
     def forbidden(*a, **kw):

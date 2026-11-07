@@ -1,23 +1,25 @@
-"""Tests for normalized GAP build observation collection."""
-
+"""Tests for analyze_leader_state responsibilities."""
 from __future__ import annotations
-from gap_notification_fakes import state, run, LEADER_URL
 
+from gap_notification_fakes import state, run, LEADER_URL
 import copy
 import json
 from pathlib import Path
-
 import pytest
-
 from lib.gap_notifications.analyze_leader_state import (
     ObservationCollectionError,
     collect_build_observations,
 )
 
+
+# Observations
+
 ENVIRONMENT = "stage-redhat.atlassian.net/RHAI/C0883L8FARE"
 STATE_URL = "file:///tmp/leader-84/state.json"
 
 
+# Normalize current component receipts deterministically with stream identity and provenance
+# intact.
 def test_collect_build_observations_returns_normalized_current_receipts():
     payload = state(
         expected_components=["api", "web"],
@@ -51,6 +53,7 @@ def test_collect_build_observations_returns_normalized_current_receipts():
     assert observations == collect_build_observations(copy.deepcopy(payload), environment=ENVIRONMENT, leader_url=LEADER_URL, state_url=STATE_URL)
 
 
+# Missing or ambiguous creator streams must not be guessed during collection.
 @pytest.mark.parametrize("payload,match", [
     ({"pull-requests": [{"repo": "demo", "pr-url": "https://github.com/acme/demo/pull/42", "builds": [],
                           "build-observations": {"source": "konflux", "repository": "acme/demo", "pr": 42,
@@ -73,6 +76,7 @@ def test_collect_build_observations_refuses_missing_or_ambiguous_creator_stream(
         collect_build_observations(payload, environment=ENVIRONMENT, leader_url=LEADER_URL, state_url=STATE_URL)
 
 
+# Component build receipts, not aggregate PR status, determine build outcomes.
 def test_collect_build_observations_maps_mixed_statuses_and_ignores_pr_status_for_build_receipts():
     payload = state(
         pr_status="merge-failure",
@@ -95,17 +99,20 @@ def test_collect_build_observations_maps_mixed_statuses_and_ignores_pr_status_fo
     assert all(item["evidence"]["build_url"] for item in observations)
 
 
+# Without explicit expected components, unrelated recorded runs must not become observations.
 def test_collect_build_observations_with_empty_expected_components_skips_runs():
     payload = state(expected_components=[], runs=[run("api", "success")])
     assert collect_build_observations(payload, environment=ENVIRONMENT, leader_url=LEADER_URL, state_url=STATE_URL) == []
 
 
+# Multiple current receipts for one component must fail rather than choose an arbitrary run.
 def test_collect_build_observations_rejects_duplicate_component_runs():
     payload = state(expected_components=["api"], runs=[run("api", "success", uid="u1"), run("api", "failure", uid="u2")])
     with pytest.raises(ObservationCollectionError, match="ambiguous current receipt"):
         collect_build_observations(payload, environment=ENVIRONMENT, leader_url=LEADER_URL, state_url=STATE_URL)
 
 
+# A head mismatch must become unknown, not a fabricated build failure or merge conflict.
 def test_collect_build_observations_rejects_sha_mismatch_as_unknown_without_conflict_parsing():
     payload = state(
         expected_components=["api"],
@@ -120,6 +127,7 @@ def test_collect_build_observations_rejects_sha_mismatch_as_unknown_without_conf
     assert "conflict" not in observation["evidence"]["reason"].lower()
 
 
+# A receipt for another PR must become unknown rather than authorize an outcome.
 def test_collect_build_observations_rejects_pr_number_mismatch_as_unknown():
     payload = state(expected_components=["api"], runs=[run("api", "success")])
     payload["pull-requests"][0]["build-observations"]["pr"] = 99
@@ -129,6 +137,7 @@ def test_collect_build_observations_rejects_pr_number_mismatch_as_unknown():
     assert "PR number" in observations[0]["evidence"]["reason"]
 
 
+# Missing run identity must prevent a receipt from becoming a definitive outcome.
 def test_collect_build_observations_rejects_missing_uid_as_unknown():
     payload = state(expected_components=["api"], runs=[run("api", "success")])
     payload["pull-requests"][0]["build-observations"]["runs"][0]["uid"] = ""
@@ -138,6 +147,7 @@ def test_collect_build_observations_rejects_missing_uid_as_unknown():
     assert "UID" in observations[0]["evidence"]["reason"]
 
 
+# Cosmetic snapshot changes must not create a new observation event.
 def test_collect_build_observations_observation_id_is_stable_across_snapshot_noise():
     payload = state(expected_components=["api"], runs=[run("api", "success", uid="same-uid")])
     first = collect_build_observations(payload, environment=ENVIRONMENT, leader_url=LEADER_URL, state_url=STATE_URL)[0]
@@ -148,6 +158,7 @@ def test_collect_build_observations_observation_id_is_stable_across_snapshot_noi
     assert first["observation_id"] == second["observation_id"]
 
 
+# A changed outcome on the same run must produce a distinct event identifier.
 def test_collect_build_observations_observation_id_changes_when_status_changes_on_same_uid():
     success = state(expected_components=["api"], runs=[run("api", "pending", uid="same-uid")])
     failure = state(expected_components=["api"], runs=[run("api", "failure", uid="same-uid")])
@@ -158,8 +169,10 @@ def test_collect_build_observations_observation_id_changes_when_status_changes_o
     assert second["status"] == "failure"
 
 
+# The checked-in snapshot must normalize to the expected components and retain historical
+# provenance.
 def test_collect_build_observations_fixture_smoke():
-    fixture = Path(__file__).resolve().parent / "fixtures" / "gap_notifications" / "leader-build-snapshot.json"
+    fixture = Path(__file__).resolve().parents[1] / "fixtures" / "gap_notifications" / "leader-build-snapshot.json"
     payload = json.loads(fixture.read_text(encoding="utf-8"))
     observations = collect_build_observations(payload, environment=ENVIRONMENT, leader_url=LEADER_URL, state_url=str(fixture))
     by_component = {item["component"]: item for item in observations}

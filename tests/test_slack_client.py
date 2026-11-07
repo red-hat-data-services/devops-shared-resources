@@ -29,6 +29,8 @@ class FakeSession:
 
 
 class SlackClientTests(unittest.TestCase):
+    # A reusable Slack client must serve multiple channels while preserving each returned
+    # receipt.
     def test_client_can_be_reused_for_multiple_channels(self):
         session = FakeSession(
             responses=[
@@ -46,6 +48,7 @@ class SlackClientTests(unittest.TestCase):
         self.assertEqual(second, {"channel": "C222", "ts": "1700000000.222"})
         self.assertEqual([kwargs["json"]["channel"] for _, kwargs in session.calls], ["C111", "C222"])
 
+    # Invalid channels or message text must fail without sending a request.
     def test_post_message_rejects_invalid_channel_or_text(self):
         client = SlackClient("xoxb-reusable-token", session=FakeSession(response=FakeResponse({"ok": True, "channel": "C321", "ts": "1.2"})))
         with self.assertRaises(ValueError):
@@ -54,6 +57,7 @@ class SlackClientTests(unittest.TestCase):
             client.post_message("C321", "")
         self.assertEqual(client.session.calls, [])
 
+    # The default Slack session must be created once without sending during construction.
     def test_default_session_is_created_only_when_needed(self):
         with patch("requests.Session") as factory:
             session = SimpleNamespace(post=Mock(return_value=FakeResponse({"ok": True, "channel": "C321", "ts": "1.2"})))

@@ -44,6 +44,8 @@ def session_for(data, status=200, headers=None):
     return Mock(post=Mock(return_value=Response(data, status, headers)))
 
 
+# The pinned Slack SDK must preserve message arguments, receipts and explicit no-retry transport
+# settings.
 def test_real_sdk_post_message_request_and_receipt(monkeypatch):
     assert __version__ == "3.46.0"
     original = WebClient.chat_postMessage
@@ -71,6 +73,7 @@ def test_real_sdk_post_message_request_and_receipt(monkeypatch):
     assert kwargs["json"] == expected
 
 
+# Slack redirects must remain ambiguous and must never be followed automatically.
 @pytest.mark.parametrize("status", [301, 302, 303, 307, 308])
 def test_redirect_never_followed(status):
     session = session_for({"ok": True, "channel": "C123", "ts": "1.2"}, status,
@@ -81,6 +84,7 @@ def test_redirect_never_followed(status):
     assert session.post.call_args.kwargs["allow_redirects"] is False
 
 
+# Connection loss must produce one sanitized ambiguous send outcome without SDK log leakage.
 @pytest.mark.parametrize("error", [RemoteDisconnected("secret-after-send"), ConnectionResetError("secret-after-send"), TimeoutError("secret-after-send"), requests.Timeout("secret-after-send"), requests.ConnectionError("secret-after-send")])
 def test_connection_loss_is_one_attempt_without_sdk_logs(error, caplog):
     caplog.set_level(logging.DEBUG)
@@ -95,6 +99,8 @@ def test_connection_loss_is_one_attempt_without_sdk_logs(error, caplog):
     assert "secret" not in caplog.text
 
 
+# Slack response errors must preserve safe classification and metadata without exposing response
+# secrets.
 @pytest.mark.parametrize("data,status,kind,safe_error", [
     ({"ok": 1, "channel": "C123", "ts": "1.2"}, 200, SlackAmbiguousError, "unknown_error"),
     ({"ok": "true", "channel": "C123", "ts": "1.2"}, 200, SlackAmbiguousError, "unknown_error"),
@@ -134,6 +140,8 @@ def test_strict_outer_policy_and_no_error_leaks(data, status, kind, safe_error, 
     assert raised.value.__context__ is None and raised.value.__cause__ is None
 
 
+# Valid receipts from supported successful HTTP statuses must survive the SDK's narrower status
+# check.
 @pytest.mark.parametrize("status", [200, 201, 202, 299])
 def test_valid_2xx_receipt_preserved_despite_sdk_200_only(status):
     session = session_for({"ok": True, "channel": "C123", "ts": "1.2"}, status)
@@ -141,6 +149,7 @@ def test_valid_2xx_receipt_preserved_despite_sdk_200_only(status):
     session.post.assert_called_once()
 
 
+# Rate-limit metadata must be bounded and returned to the caller without sleeping or retrying.
 @pytest.mark.parametrize("headers,status,error,expected", [
     ({"Retry-After": "2.5"}, 429, "ratelimited", 2.5),
     ({"Retry-After": "7200"}, 429, "ratelimited", 3600),
@@ -163,6 +172,7 @@ def test_rate_limit_metadata_is_bounded_not_slept(headers, status, error, expect
     session.post.assert_called_once()
 
 
+# Unsupported Slack SDK versions must fail before any send.
 def test_pin_drift_fails_before_send(monkeypatch):
     monkeypatch.setattr(module, "_sdk_version", "future-version")
     session = session_for({"ok": True})

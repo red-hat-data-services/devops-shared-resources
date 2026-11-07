@@ -1,13 +1,16 @@
-"""Monitor notification integration: real collector/dispatcher, fake service transports."""
+"""Tests for monitor_hook responsibilities."""
+from __future__ import annotations
+
 import copy
 from dataclasses import replace
-
 import pytest
-
 from lib.gap_notifications.monitor_hook import NotificationConfig, notify_after_publish
 from gap_notification_fakes import Jira, Slack
 from gap_notification_fakes import state, run, LEADER_URL
 from scripts import gap_pr_monitor as monitor
+
+
+# Monitor
 
 PR = "https://github.com/acme/demo/pull/42"
 
@@ -36,6 +39,8 @@ def hook(tmp_path):
     return invoke, jira, slack, defaults, calls
 
 
+# The monitor must deduplicate failure, ignore unknown outcomes and close only on explicit
+# recovery.
 def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
     invoke, jira, slack, opts, calls = hook
     assert invoke()["status"] == "settled"
@@ -56,6 +61,7 @@ def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
     assert len(jira.issues) == 1 and len(slack.calls) == 2
 
 
+# A manually closed monitored failure gets a successor root instead of reopening the old issue.
 def test_manual_close_same_failure_creates_successor(hook):
     invoke, jira, slack, _, _ = hook
     invoke()
@@ -65,6 +71,7 @@ def test_manual_close_same_failure_creates_successor(hook):
     assert slack.calls[1][1]["thread_ts"] is None
 
 
+# Preview mode must avoid credentials, clients, journals and external mutations.
 def test_preview_no_clients_credentials_or_journal(hook):
     invoke, jira, slack, defaults, calls = hook
     result = invoke(config=replace(defaults["config"], mode="preview"), environ=Bomb())
@@ -79,6 +86,7 @@ class Bomb:
         raise AssertionError("must not access credentials")
 
 
+# Disabled, dry-run or otherwise ineligible hooks must not touch their service dependencies.
 @pytest.mark.parametrize("changes,status", [({"config": None}, "disabled"),
     ({"config": NotificationConfig()}, "disabled"), ({"dry_run": True}, "monitor-dry-run"),
     ({"accepted_urls": []}, "no-accepted-decisions")])
@@ -88,6 +96,7 @@ def test_noop_guards_do_not_touch_dependencies(hook, changes, status):
     assert not calls and not jira.issues and not slack.calls
 
 
+# Deferred children must not regain notification authority through stale persisted receipts.
 def test_deferred_children_never_reuse_persisted_receipts(hook):
     invoke, jira, slack, opts, _ = hook
     observed = []
@@ -111,6 +120,7 @@ def test_deferred_children_never_reuse_persisted_receipts(hook):
     assert payload == before
 
 
+# Ambiguous transport outcomes must remain visibly held rather than appear settled or resend.
 def test_transport_ambiguity_visible_not_reported_as_success(hook):
     invoke, jira, slack, _, _ = hook
     slack.fail = True
@@ -120,6 +130,7 @@ def test_transport_ambiguity_visible_not_reported_as_success(hook):
     assert len(slack.calls) == 1
 
 
+# Confirmed delivery must remain settled while cosmetic warnings stay visible and sanitized.
 def test_confirmed_core_retains_cosmetic_warning_visibility(hook, monkeypatch, capsys):
     invoke, jira, slack, _, _ = hook
     def broken_projection(key, **fields):
@@ -143,6 +154,8 @@ def test_confirmed_core_retains_cosmetic_warning_visibility(hook, monkeypatch, c
     assert len(slack.calls) == 1
 
 
+# Summary size must remain bounded even when the historical outbox is large or contains unknown
+# states.
 @pytest.mark.parametrize("historical_count", [100, 10000])
 def test_large_historical_outbox_summary_is_fixed_shape(hook, capsys, historical_count):
     import json
@@ -173,6 +186,8 @@ def test_large_historical_outbox_summary_is_fixed_shape(hook, capsys, historical
     assert outbox[-1]["state"] == "SECRET unknown state"
 
 
+# Notification failures must return a sanitized nonblocking result rather than disrupt the
+# monitor.
 def test_failure_is_sanitized_nonblocking(hook, capsys):
     invoke, _, _, _, _ = hook
     def broken(*a, **kw):
@@ -181,6 +196,7 @@ def test_failure_is_sanitized_nonblocking(hook, capsys):
     assert "SECRET" not in capsys.readouterr().err
 
 
+# Recovery without an explicit done transition must remain held and leave the issue open.
 def test_without_transition_recovery_remains_visible_hold(hook):
     invoke, jira, _, opts, _ = hook
     invoke()
@@ -189,6 +205,7 @@ def test_without_transition_recovery_remains_visible_hold(hook):
     assert result["status"] == "held" and not jira.closed("RHAI-1")
 
 
+# Missing publication identity must prevent notification delivery.
 @pytest.mark.parametrize("published_sha,leader", [(None, LEADER_URL), ("b" * 40, None), ("b" * 40, "https://evil.test/o/r/pull/1")])
 def test_incomplete_publication_identity_does_not_deliver(hook, published_sha, leader):
     invoke, jira, slack, _, _ = hook
@@ -196,6 +213,8 @@ def test_incomplete_publication_identity_does_not_deliver(hook, published_sha, l
     assert not jira.issues and not slack.calls
 
 
+# Publish first, notify second, summarize last; notification problems must not rewrite gate
+# results.
 def test_coordinator_only_invokes_after_publish_and_preserves_gate_result(tmp_path, monkeypatch):
     from lib.gap_notifications.monitor_hook import NotificationConfig
     path = tmp_path / "state.json"
@@ -240,6 +259,8 @@ def test_coordinator_only_invokes_after_publish_and_preserves_gate_result(tmp_pa
     assert result.overall_status == child.overall_status and result.notification_result["status"] == "error"
 
 
+# Tracking is a separate projection whose failures cannot resend notifications or hide valid
+# receipts.
 def test_tracking_separate_reused_pending_and_failure_isolation(hook, monkeypatch, capsys):
     invoke, jira, slack, opts, _ = hook
     tracking = {}
@@ -269,6 +290,7 @@ def test_tracking_separate_reused_pending_and_failure_isolation(hook, monkeypatc
     assert "SECRET" not in capsys.readouterr().err
 
 
+# Inactive tracking must remain unchecked without creating clients or a journal.
 @pytest.mark.parametrize("mode,dry_run", [("disabled", False), ("preview", False), ("write", True)])
 def test_tracking_noop_still_no_clients_credentials_ledger(hook, mode, dry_run):
     invoke, jira, slack, opts, calls = hook
@@ -279,5 +301,6 @@ def test_tracking_noop_still_no_clients_credentials_ledger(hook, mode, dry_run):
     assert not Path(opts["config"].ledger).exists()
 
 
+# Notifications must remain disabled unless explicitly enabled by configuration.
 def test_parser_default_disabled():
     assert monitor.build_parser().parse_args([]).notification_mode == "disabled"

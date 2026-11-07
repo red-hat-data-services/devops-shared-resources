@@ -1,16 +1,19 @@
-"""Read-only tracking and inspection of registry records seeded with fake services."""
+"""Tests for lookup_tools responsibilities."""
+from __future__ import annotations
+
 import json
 from lib.gap_notifications.lookup_tools import inspect_issue
 from lib.gap_notifications.notify_tools import section
 from gap_notification_fakes import make_runner
 import copy
-
 import pytest
-
 from lib.gap_notifications.dispatch_incidents import Dispatcher, Ledger
 from lib.gap_notifications.dispatch_incidents import incident_key
 from lib.gap_notifications.lookup_tools import project_tracking, tracking_cell
 from gap_notification_fakes import Jira, Slack, observation
+
+
+# Links
 
 PR = 'https://github.com/acme/repo/pull/42'
 
@@ -24,6 +27,7 @@ def populated(tmp_path):
     return jira, slack, observations
 
 
+# Read-only tracking must pair each component's verified Jira and Slack links without mutation.
 def test_reused_component_paired_links_and_read_only(populated, monkeypatch):
     jira, slack, observations = populated
     before = copy.deepcopy((jira.issues, jira.properties, jira.calls, slack.calls))
@@ -40,6 +44,7 @@ def test_reused_component_paired_links_and_read_only(populated, monkeypatch):
     assert project_tracking(observations, jira, trial_id='other')['rows'][PR][0]['status'] == 'not_found'
 
 
+# Closed-only history must be labeled closed, not misrepresented as pending delivery.
 def test_closed_only_fallback_is_explicit_and_not_pending(populated):
     jira, _, observations = populated
     jira.close('RHAI-1')
@@ -56,6 +61,7 @@ def test_closed_only_fallback_is_explicit_and_not_pending(populated):
     assert '(Closed)' in tracking_cell(projected, PR) and '[Slack thread]' in tracking_cell(projected, PR)
 
 
+# Prefer an open incident; otherwise show the latest valid closed episode.
 def test_open_preferred_over_newer_closed_episode(populated):
     jira, _, observations = populated
     newer = copy.deepcopy(jira.issues['RHAI-1'])
@@ -75,6 +81,7 @@ def test_open_preferred_over_newer_closed_episode(populated):
     assert projected['rows'][PR][0]['closed'] is True
 
 
+# A fresh renderer import must not pull in notification service dependencies.
 def test_renderer_fresh_import_blocks_all_service_dependencies():
     import subprocess
     import sys
@@ -105,7 +112,7 @@ projection = {'status': 'checked', 'rows': {'pr': [
     {'component': 'cpu', 'jira_key': 'RHAI-1', 'closed': True, 'status': 'closed'}]}}
 assert '(Closed)' in tracking_cell(projection, 'pr')
 """
-    root = Path(__file__).resolve().parents[1]
+    root = Path(__file__).resolve().parents[2]
     # lib/__init__ already imports requests through PRCreator. Do not broaden
     # this feature into package initialization changes: isolate this module for
     # the strongest guard and separately check ordinary package import for Jira.
@@ -114,6 +121,7 @@ assert '(Closed)' in tracking_cell(projection, 'pr')
                        cwd=root, check=True)
 
 
+# An unconfirmed Slack send must not hide a confirmed Jira key or an older confirmed thread.
 def test_pending_slack_and_held_do_not_hide_confirmed_jira(populated):
     jira, _, observations = populated
     jira.properties['RHAI-1']['delivery'].update(root=None, last_event=None)
@@ -125,6 +133,8 @@ def test_pending_slack_and_held_do_not_hide_confirmed_jira(populated):
     assert '[RHAI-2]' in cell and '[Slack thread]' in cell and 'delivery held' in cell
 
 
+# Damaged registry records must yield unavailable tracking without unsafe links or leaked
+# evidence.
 @pytest.mark.parametrize('damage', ['trial', 'identity', 'channel', 'origin', 'unconfirmed_root', 'summary', 'episode', 'duplicate', 'two-open', 'error'])
 def test_registry_damage_cannot_publish_links(populated, damage, monkeypatch):
     jira, _, observations = populated
@@ -169,6 +179,7 @@ def test_registry_damage_cannot_publish_links(populated, damage, monkeypatch):
     assert 'Unavailable' in cell and 'https://' not in cell and 'SECRET' not in cell
 
 
+# Search-lag hints must be revalidated, and mismatched issue hints must be rejected.
 def test_known_key_search_lag_revalidated_and_wrong_hints_rejected(populated, monkeypatch):
     jira, _, observations = populated
     monkeypatch.setattr(jira, 'find_by_label', lambda label: [])
@@ -179,6 +190,7 @@ def test_known_key_search_lag_revalidated_and_wrong_hints_rejected(populated, mo
     assert invalid['rows'][PR][0]['status'] == 'unavailable'
 
 
+# Condense only no-match rows while preserving distinct held, closed and unavailable details.
 def test_render_condenses_only_not_found_entries():
     empty = [{'component': f'other-{i}', 'status': 'not_found'} for i in range(16)]
     links = [
@@ -209,6 +221,7 @@ def test_render_condenses_only_not_found_entries():
     assert tracking_cell(None, PR) == 'Not checked'
 
 
+# An adapter for the wrong origin must not be queried or used to publish links.
 def test_wrong_adapter_origin_never_queries_or_publishes(populated, monkeypatch):
     jira, _, observations = populated
     jira.base_url = 'https://production.example'
@@ -218,6 +231,7 @@ def test_wrong_adapter_origin_never_queries_or_publishes(populated, monkeypatch)
     assert project_tracking(observations, jira, trial_id='trial') == {'status': 'unavailable'}
 
 
+# Distinguish unchecked, unavailable and no-match states while escaping displayed metadata.
 def test_no_match_not_checked_unavailable_and_safe_rendering():
     obs = observation(evidence={'pr_url': PR})
     projection = project_tracking([obs], Jira(), trial_id='trial')
@@ -238,6 +252,7 @@ def setup(tmp_path):
     return make_runner(tmp_path)
 
 
+# Inspection must expose the persisted retry deadline and identify a missing visible link.
 def test_inspect_retry_deadline_and_visible_missing(setup):
     runner, jira, _ = setup
     runner().run([observation()])
@@ -252,6 +267,7 @@ def test_inspect_retry_deadline_and_visible_missing(setup):
     assert report['slack_intent']['retry_at'] == 1900000000
 
 
+# Malformed incident identity fields must not pass registry inspection.
 @pytest.mark.parametrize('field,value', [('scope', 'wrong'), ('trial_id', 'different'), ('episode_id', 'not-uuid')])
 def test_inspect_rejects_malformed_identity(setup, field, value):
     runner, jira, _ = setup
@@ -260,6 +276,7 @@ def test_inspect_rejects_malformed_identity(setup, field, value):
     assert inspect_issue(jira, 'RHAI-1')['property'] == 'malformed_or_unavailable'
 
 
+# Missing or malformed properties must produce safe diagnostics without echoing their contents.
 @pytest.mark.parametrize('state', [None, {}, {'trial_id': 'SECRET', 'incident_key': 'SECRET'}])
 def test_inspect_missing_malformed_safe(setup, state):
     runner, jira, _ = setup

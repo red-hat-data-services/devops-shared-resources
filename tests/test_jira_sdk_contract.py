@@ -64,6 +64,8 @@ def client(session):
     return JiraClient(SITE, 'dummy@example.test', CANARY, session=session, timeout=0.75)
 
 
+# Pinned Jira SDK operations must preserve REST-v3 wire contracts, literal null and retry
+# isolation.
 def test_actual_sdk_native_methods_and_final_wire(monkeypatch):
     assert version('atlassian-python-api') == '5.0.5'
     creations = []
@@ -123,6 +125,7 @@ def test_actual_sdk_native_methods_and_final_wire(monkeypatch):
     assert json.loads(session.wire[7][0].body) == {'transition': {'id': '9'}}
 
 
+# SDK property serialization must preserve supported JSON values and the JSON content type.
 @pytest.mark.parametrize('value', [None, False, 0, 1.25, -1e300, '', 'text', [1, None], {'x': None}])
 def test_actual_sdk_property_json_values(value):
     session = WireSession([reply(status=204)])
@@ -131,6 +134,7 @@ def test_actual_sdk_property_json_values(value):
     assert session.wire[0][0].headers['Content-Type'] == 'application/json'
 
 
+# SDK errors must retain bounded metadata without retries, redirects or sensitive payload logs.
 @pytest.mark.parametrize('result,error,metadata', [
     pytest.param(reply({'error': 'rate_limited'}, 429, {'Retry-After': '0'}),
                  JiraRateLimitError, (429, 'rate_limited', 0, (), ()), id='rate-limit-zero'),
@@ -167,6 +171,7 @@ def test_no_retries_redirects_or_payload_logs(result, error, metadata, caplog):
     assert caught.value.__cause__ is None
 
 
+# A POST-based search timeout is a transient read failure, not an ambiguous write.
 def test_post_search_connection_loss_is_read():
     session = WireSession([requests.ConnectionError(CANARY)])
     with pytest.raises(JiraTransientError):
@@ -174,6 +179,7 @@ def test_post_search_connection_loss_is_read():
     assert len(session.wire) == 1
 
 
+# Non-finite JSON must fail before request preparation or send, without leaking payloads.
 @pytest.mark.parametrize('number', [float('nan'), float('inf'), float('-inf')],
                          ids=['nan', 'positive-infinity', 'negative-infinity'])
 @pytest.mark.parametrize('operation', ['create', 'initial-property', 'property', 'update', 'transition', 'search'])
@@ -201,6 +207,7 @@ def test_nonfinite_json_rejected_before_preparation_or_send(number, operation, c
     assert caught.value.__cause__ is None
 
 
+# Successful response content must remain available to callers but absent from SDK logs.
 def test_success_response_body_not_logged_but_preserved(caplog):
     caplog.set_level(logging.DEBUG)
     session = WireSession([reply({'key': 'OTHER-1', 'fields': {'summary': CANARY}})])

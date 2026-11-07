@@ -1,13 +1,17 @@
-"""Real relocation smoke checks, without installs, clients or service calls."""
+"""Tests for package responsibilities."""
+from __future__ import annotations
+
 from importlib.resources import files
 from pathlib import Path
 import subprocess
 import sys
-
 from lib.gap_notifications import notify_tools
 from gap_notification_fakes import observation
 
 
+# Package
+
+# Packaged templates must render outside the checkout without constructing service clients.
 def test_packaged_template_and_real_formatting_work_outside_checkout(tmp_path, monkeypatch):
     def forbidden(*args, **kwargs):
         raise AssertionError('pure formatting must not construct clients')
@@ -22,6 +26,7 @@ def test_packaged_template_and_real_formatting_work_outside_checkout(tmp_path, m
     assert notify_tools.description(observation())['type'] == 'doc'
 
 
+# Importing the package initializer must not eagerly initialize notification modules or clients.
 def test_minimal_package_import_has_no_notification_initialization():
     script = """
 import builtins
@@ -35,4 +40,4 @@ import lib.gap_notifications
 assert not hasattr(lib.gap_notifications, 'Dispatcher')
 assert not hasattr(lib.gap_notifications, 'JiraNotifier')
 """
-    subprocess.run([sys.executable, '-c', script], cwd=Path(__file__).resolve().parents[1], check=True)
+    subprocess.run([sys.executable, '-c', script], cwd=Path(__file__).resolve().parents[2], check=True)

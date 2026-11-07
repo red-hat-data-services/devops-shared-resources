@@ -16,6 +16,8 @@ def client(session):
     return JiraClient(SITE, 'fake@example.test', 'FAKE_TOKEN', session=session, timeout=7)
 
 
+# The reusable client must preserve arbitrary valid fields and atomic properties without GAP
+# restrictions.
 def test_other_site_project_type_and_unrestricted_fields_atomic_properties():
     session = FakeSession(responses={'post': [FakeResponse({'key': 'OTHER-2'}, 201)]})
     api = client(session)
@@ -36,6 +38,8 @@ def test_other_site_project_type_and_unrestricted_fields_atomic_properties():
     assert 'FAKE_TOKEN' not in repr(api) and 'fake@example.test' not in repr(api)
 
 
+# Generic reads must honor requested fields; update acknowledgements must not invent readback
+# behavior.
 def test_get_requested_fields_and_pure_acknowledgements():
     issue = {'key': 'OTHER-1', 'fields': {'customfield_2': 'value'}}
     session = FakeSession(responses={'get': [FakeResponse(issue)], 'put': [FakeResponse(None, 204)]})
@@ -47,6 +51,8 @@ def test_get_requested_fields_and_pure_acknowledgements():
     assert len(session.calls) == 2  # Generic update does not assert readback guarantees.
 
 
+# Arbitrary property names and JSON values must round-trip, with missing properties represented
+# as absent.
 def test_arbitrary_property_name_json_and_missing_property():
     envelope = {'key': 'other/app.v2', 'value': ['any', None, 3]}
     session = FakeSession(responses={'get': [FakeResponse(envelope), FakeResponse({}, 404)],
@@ -59,6 +65,7 @@ def test_arbitrary_property_name_json_and_missing_property():
     assert api.get_issue_property('OTHER-1', 'other/app.v2') is None
 
 
+# Generic transitions must support non-done targets and caller-supplied fields.
 def test_generic_transitions_are_not_done_only():
     transition = {'id': '9', 'to': {'statusCategory': {'key': 'indeterminate'}}}
     session = FakeSession(responses={'get': [FakeResponse({'transitions': [transition]})],
@@ -69,6 +76,7 @@ def test_generic_transitions_are_not_done_only():
     assert session.calls[1][2]['json'] == {'transition': {'id': '9'}, 'fields': {'customfield_3': 'value'}}
 
 
+# Search must preserve caller JQL and fields while collecting all pages.
 def test_search_is_caller_jql_fields_and_complete():
     first, second = {'key': 'OTHER-1', 'fields': {}}, {'key': 'ELSE-2', 'fields': {}}
     session = FakeSession(responses={'post': [
@@ -79,6 +87,7 @@ def test_search_is_caller_jql_fields_and_complete():
     assert session.calls[1][2]['json']['nextPageToken'] == 'next'
 
 
+# Omitting search fields must explicitly request summary on every page.
 def test_search_omitted_fields_explicitly_requests_summary_on_all_pages():
     first = {'key': 'OTHER-1', 'fields': {'summary': 'First'}}
     second = {'key': 'OTHER-2', 'fields': {'summary': 'Second'}}
@@ -92,6 +101,7 @@ def test_search_omitted_fields_explicitly_requests_summary_on_all_pages():
     assert session.calls[1][2]['json']['nextPageToken'] == 'next'
 
 
+# Malformed or incomplete pagination must fail rather than return partial search results.
 @pytest.mark.parametrize('pages', [
     [{'issues': [], 'isLast': False}],
     [{'issues': [{'key': 'OTHER-1', 'fields': {}}], 'isLast': False}],
@@ -109,6 +119,7 @@ def test_search_never_returns_partial_results(pages):
     assert len(session.calls) == len(pages)
 
 
+# Exceeding the pagination budget must stop with ambiguity rather than continue indefinitely.
 def test_pagination_budget_fails_closed():
     pages = [FakeResponse({'issues': [{'key': f'OTHER-{i}', 'fields': {}}],
              'isLast': False, 'nextPageToken': str(i)}) for i in range(20)]
@@ -118,6 +129,8 @@ def test_pagination_budget_fails_closed():
     assert len(session.calls) == 20
 
 
+# Timeouts must be classified by read/write semantics without automatic retries or credential
+# leakage.
 @pytest.mark.parametrize('method,args,verb,error_type', [
     ('get_issue', ('OTHER-1',), 'get', JiraTransientError),
     ('search', ('project = OTHER',), 'post', JiraTransientError),
@@ -134,6 +147,8 @@ def test_timeout_classification_is_semantic_and_never_retries(method, args, verb
     assert 'FAKE_TOKEN' not in str(raised.value) and 'fake@example.test' not in str(raised.value)
 
 
+# Public facade mutations must redirect subsequent requests to the updated session and
+# credentials.
 def test_gap_facade_honors_mutated_public_session_auth_timeout():
     original = FakeSession()
     replacement = FakeSession(responses={'get': [FakeResponse({'key': 'RHAI-1', 'fields': {}})]})
@@ -147,6 +162,7 @@ def test_gap_facade_honors_mutated_public_session_auth_timeout():
     assert replacement.trust_env is False
 
 
+# Invalid credentials or timeout values must fail during construction without requests.
 @pytest.mark.parametrize('email,token,timeout', [('', 'fake', 1), ('fake', '', 1), ('fake', 'fake', 0)])
 def test_constructor_validation_is_immediate(email, token, timeout):
     session = FakeSession()
@@ -158,12 +174,14 @@ def test_constructor_validation_is_immediate(email, token, timeout):
     assert not session.calls
 
 
+# GAP error exports must preserve reusable-client type identity and terminal-error inheritance.
 def test_legacy_error_exports_have_same_identity():
     assert gap.JiraAmbiguousError is JiraAmbiguousError
     assert gap.JiraPermanentError is JiraPermanentError
     assert issubclass(gap.JiraTerminalIssueError, JiraPermanentError)
 
 
+# Generic clients may use other sites but must still reject unsafe origins.
 @pytest.mark.parametrize('origin', ['http://example.test', 'https://user:secret@example.test',
     'https://example.test:443', 'https://example.test/path', 'https://example.test?q=1'])
 def test_generic_origin_safety_without_staging_restriction(origin):
@@ -171,6 +189,7 @@ def test_generic_origin_safety_without_staging_restriction(origin):
         JiraClient(origin, 'fake', 'fake', session=FakeSession())
 
 
+# Wrong issue keys and malformed property responses must fail without losing the requested key.
 def test_wrong_issue_key_and_malformed_property_fail_closed():
     session = FakeSession(responses={'get': [FakeResponse({'key': 'OTHER-2', 'fields': {}}),
                                             FakeResponse({'key': 'wrong', 'value': {}})]})

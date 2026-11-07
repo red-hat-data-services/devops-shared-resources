@@ -146,7 +146,7 @@ not be merged into those results.
 
 ## Offline validation
 
-`tests/test_gap_notification_monitor.py` runs the **real collector and existing
+`tests/gap_notifications/test_monitor_hook.py` runs the **real collector and existing
 Dispatcher** with fake Jira/Slack transports. It covers failure, repeat dedup,
 unknown non-recovery, explicit recovery/reply, recovered failure replay,
 manual-close successor, ambiguity/no-blind-retry, preview/no-op guards, sanitized
