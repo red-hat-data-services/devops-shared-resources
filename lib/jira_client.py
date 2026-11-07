@@ -1,4 +1,4 @@
-"""Explicit Jira Cloud REST v3 site-origin operations without GAP policy.
+"""Explicit JiraCloud SDK REST v3 site-origin operations without GAP policy.
 
 Use caller-supplied origin, credentials, session and timeout for issue get/search/
 create/update, named properties and transitions. Search completes bounded
@@ -15,11 +15,73 @@ policy and stronger application readbacks remain caller responsibilities.
 """
 from __future__ import annotations
 import copy
+import json
 from dataclasses import dataclass, field
 from typing import Any
 from urllib.parse import quote, urlsplit
 import re
 import requests
+from atlassian import JiraCloud
+
+
+class _SafeResponse:
+    """Keep service bodies out of SDK debug logging, retaining raw JSON access."""
+
+    def __init__(self, response):
+        self._response = response
+        self.status_code = getattr(response, "status_code", None)
+        self.headers = getattr(response, "headers", {})
+        self.text = ""
+        self.reason = ""
+
+    def json(self):
+        return self._response.json()
+
+
+class _JiraTransport:
+    """Bridge the public verb-session contract to the SDK's request protocol.
+
+    The SDK serializes bodies and builds endpoints; this boundary enforces
+    caller-owned authentication, exact timeout, and no redirects. It does not
+    implement retries, parsing or a second HTTP stack.
+    """
+
+    verify = True
+
+    def __init__(self, client):
+        self.client = client
+
+    def request(self, method, url, *, data=None, json=None, headers=None, **kwargs):
+        client = self.client
+        if not url.startswith(client.base_url + "/rest/api/3/"):
+            raise ValueError("Unexpected Jira SDK destination")
+        headers = dict(headers or {})
+        if data is None and json is None:
+            headers.pop("Content-Type", None)
+        response = getattr(client.session, method.lower())(
+            url, data=data, **({"json": json} if json is not None else {}),
+            headers=headers, timeout=client.timeout, allow_redirects=False,
+            auth=(client.email, client.token),
+        )
+        return _SafeResponse(response)
+
+
+class _QuietJiraCloud(JiraCloud):
+    """Enforce strict JSON and disable payload diagnostics for this instance."""
+
+    def request(self, *args, **kwargs):
+        # Requests' original json= path rejects NaN/Infinity before sending.
+        # The SDK's data= serializer otherwise accepts those non-JSON tokens.
+        # Preserve InvalidJSONError's semantic read/write classification.
+        for value in (kwargs.get("data"), kwargs.get("json")):
+            try:
+                json.dumps(value, allow_nan=False)
+            except ValueError:
+                raise requests.exceptions.InvalidJSONError("Invalid Jira JSON payload") from None
+        return super().request(*args, **kwargs)
+
+    def log_curl_debug(self, *args, **kwargs):
+        pass
 
 ISSUE_KEY_RE = re.compile(r"[A-Z][A-Z0-9_]*-[0-9]+\Z")
 SAFE_ERROR_CODE_RE = re.compile(r"[A-Z0-9_:-]{1,64}\Z")
@@ -192,28 +254,18 @@ class JiraClient:
 
     def _session_request(
         self,
-        method: str,
-        url: str,
         *,
         operation: str,
         write: bool,
-        params: dict[str, Any] | None = None,
-        json_body: Any = None,
-        json_null: bool = False,
+        sdk_call,
     ) -> tuple[Any, Any]:
-        request = getattr(self.session, method)
-        # requests treats json=None as no body, not the JSON literal null.
-        body = ({"data": "null", "headers": {"Content-Type": "application/json"}}
-                if json_null else {"json": json_body})
         try:
-            response = request(
-                url,
-                params=params,
-                **body,
-                timeout=self.timeout,
-                allow_redirects=False,
-                auth=(self.email, self.token),
+            sdk = _QuietJiraCloud(
+                self.base_url, api_version=3, session=_JiraTransport(self),
+                timeout=self.timeout, advanced_mode=True,
+                backoff_and_retry=False, retry_with_header=False,
             )
+            response = sdk_call(sdk)
         except requests.Timeout:
             if write:
                 raise JiraAmbiguousError(f"Jira {operation} outcome could not be established") from None
@@ -290,9 +342,9 @@ class JiraClient:
 
     def get_issue(self, key, *, fields=None):
         key = self._issue_key(key)
-        _, data = self._session_request("get", self._url(f"issue/{key}"),
+        _, data = self._session_request(
             operation="issue read", write=False,
-            params=None if fields is None else {"fields": ",".join(fields)})
+            sdk_call=lambda sdk: sdk.get_issue(key, fields=None if fields is None else ",".join(fields)))
         issue = self._issue_fields(data)
         if issue["key"] != key:
             raise JiraAmbiguousError("Jira issue response could not be verified")
@@ -308,8 +360,9 @@ class JiraClient:
                        "fields": ["summary"] if fields is None else list(fields)}
             if token is not None:
                 payload["nextPageToken"] = token
-            _, data = self._session_request("post", self._url("search/jql"),
-                operation="issue search", write=False, json_body=payload)
+            _, data = self._session_request(
+                operation="issue search", write=False,
+                sdk_call=lambda sdk: sdk.search_and_reconsile_issues_using_jql_post(data=payload))
             if not isinstance(data, dict):
                 raise JiraAmbiguousError("Jira search response could not be verified")
             batch, last, next_token = data.get("issues"), data.get("isLast"), data.get("nextPageToken")
@@ -339,8 +392,9 @@ class JiraClient:
         payload = {"fields": copy.deepcopy(fields)}
         if properties is not None:
             payload["properties"] = copy.deepcopy(properties)
-        _, data = self._session_request("post", self._url("issue"),
-            operation="issue creation", write=True, json_body=payload)
+        _, data = self._session_request(
+            operation="issue creation", write=True,
+            sdk_call=lambda sdk: sdk.create_issue(data=payload))
         if not isinstance(data, dict):
             raise JiraAmbiguousError("Jira creation outcome could not be established")
         key = data.get("key")
@@ -356,8 +410,9 @@ class JiraClient:
                 if not isinstance(value, dict):
                     raise ValueError(f"{name} must be a mapping")
                 payload[name] = copy.deepcopy(value)
-        _, data = self._session_request("put", self._url(f"issue/{key}"),
-            operation="issue update", write=True, json_body=payload)
+        _, data = self._session_request(
+            operation="issue update", write=True,
+            sdk_call=lambda sdk: sdk.edit_issue(key, data=payload))
         return data
 
     def _property_url(self, key, name):
@@ -367,9 +422,10 @@ class JiraClient:
         return self._url(f"issue/{key}/properties/{quote(name, safe='')}")
 
     def get_issue_property(self, key, name):
-        url = self._property_url(key, name)
+        self._property_url(key, name)  # Validate key/name before constructing SDK.
         try:
-            _, data = self._session_request("get", url, operation="issue property read", write=False)
+            _, data = self._session_request(operation="issue property read", write=False,
+                sdk_call=lambda sdk: sdk.get_issue_property(key, quote(name, safe="")))
         except JiraPermanentError as exc:
             if exc.status_code == 404:
                 return None
@@ -379,15 +435,21 @@ class JiraClient:
         return data
 
     def put_issue_property(self, key, name, value):
-        _, data = self._session_request("put", self._property_url(key, name),
-            operation="issue property write", write=True, json_body=copy.deepcopy(value),
-            json_null=value is None)
+        self._property_url(key, name)
+        _, data = self._session_request(
+            operation="issue property write", write=True,
+            # files={} selects the SDK's raw-body path without multipart data.
+            # Unlike data=None (no body), this sends the JSON literal null.
+            sdk_call=lambda sdk: sdk.set_issue_property(key, quote(name, safe=""),
+                data="null" if value is None else copy.deepcopy(value),
+                **({"files": {}} if value is None else {})))
         return data
 
     def transitions(self, key):
         key = self._issue_key(key)
-        _, data = self._session_request("get", self._url(f"issue/{key}/transitions"),
-            operation="issue transitions", write=False, params={"expand": "transitions.fields"})
+        _, data = self._session_request(
+            operation="issue transitions", write=False,
+            sdk_call=lambda sdk: sdk.get_transitions(key, expand="transitions.fields"))
         if not isinstance(data, dict) or not isinstance(data.get("transitions"), list):
             raise JiraAmbiguousError("Jira transitions response could not be verified")
         return data["transitions"]
@@ -401,6 +463,7 @@ class JiraClient:
             if not isinstance(fields, dict):
                 raise ValueError("fields must be a mapping")
             payload["fields"] = copy.deepcopy(fields)
-        _, data = self._session_request("post", self._url(f"issue/{key}/transitions"),
-            operation="issue transition", write=True, json_body=payload)
+        _, data = self._session_request(
+            operation="issue transition", write=True,
+            sdk_call=lambda sdk: sdk.do_transition(key, data=payload))
         return data

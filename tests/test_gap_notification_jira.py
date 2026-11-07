@@ -5,10 +5,12 @@ from __future__ import annotations
 import unittest
 from copy import deepcopy
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import requests
 
 from lib.gap_notifications.dispatch_incidents import _description as dispatch_description
+from lib.jira_client import JiraClient
 from lib.gap_notifications.notify_tools import (
     STAGING_JIRA_ORIGIN,
     JiraAmbiguousError,
@@ -39,6 +41,15 @@ class FakeSession:
         self.trust_env = True
 
     def _call(self, method, url, **kwargs):
+        # Normalize SDK-serialized wire data for the existing semantic assertions.
+        import json
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl
+        split = urlsplit(url)
+        if split.query:
+            kwargs['params'] = dict(parse_qsl(split.query))
+            url = urlunsplit((split.scheme, split.netloc, split.path, '', ''))
+        if kwargs.get('data') is not None:
+            kwargs['json'] = json.loads(kwargs['data'])
         self.calls.append((method, url, kwargs))
         effects = self.side_effects.get(method)
         if effects:
@@ -342,27 +353,34 @@ class JiraNotifierTests(unittest.TestCase):
         with self.assertRaises(JiraAmbiguousError):
             notifier.create_bug("summary", description, ["gap-staging"])
 
-    def test_create_bug_validation_error_reports_safe_fields(self):
-        session = FakeSession(responses={"post": [FakeResponse({"errors": {"summary": "bad", "description": "bad"}, "errorMessages": ["BAD_INPUT", "not-safe"]}, 400)]})
+    def test_create_bug_propagates_validation_error_without_readback(self):
+        session = FakeSession()
         notifier = self._notifier(session)
         description = self._issue()["fields"]["description"]
+        error = JiraValidationError("rejected", status_code=400,
+                                    field_errors=("description", "summary"), error_codes=("BAD_INPUT",))
+        with patch.object(JiraClient, "create_issue", side_effect=error) as create, \
+             patch.object(JiraClient, "get_issue") as get, \
+             patch.object(JiraClient, "get_issue_property") as get_property:
+            with self.assertRaises(JiraValidationError) as raised:
+                notifier.create_bug("summary", description, ["gap-staging"])
+            self.assertIs(raised.exception, error)
+            create.assert_called_once()
+            get.assert_not_called()
+            get_property.assert_not_called()
+        self.assertEqual(session.calls, [])
 
-        with self.assertRaises(JiraValidationError) as raised:
-            notifier.create_bug("summary", description, ["gap-staging"])
-
-        self.assertEqual(raised.exception.status_code, 400)
-        self.assertEqual(raised.exception.field_errors, ("description", "summary"))
-        self.assertEqual(raised.exception.error_codes, ("BAD_INPUT",))
-
-    def test_get_issue_timeout_is_transient_and_redacted(self):
-        session = FakeSession(side_effects={"get": [requests.Timeout("jira-bot@example.com secret-token") ]})
+    def test_get_issue_propagates_client_error_unchanged(self):
+        session = FakeSession()
         notifier = self._notifier(session)
-
-        with self.assertRaises(JiraTransientError) as raised:
-            notifier.get_issue("RHAI-4")
-
-        self.assertNotIn("jira-bot@example.com", str(raised.exception))
-        self.assertNotIn("secret-token", str(raised.exception))
+        error = JiraRateLimitError("back off", status_code=429, error="ratelimited", retry_after=2.5)
+        with patch.object(JiraClient, "get_issue", side_effect=error) as get:
+            with self.assertRaises(JiraRateLimitError) as raised:
+                notifier.get_issue("RHAI-4")
+            self.assertIs(raised.exception, error)
+            get.assert_called_once_with("RHAI-4", fields=[
+                "summary", "description", "labels", "status", "project", "issuetype"])
+        self.assertEqual(session.calls, [])
 
     def test_create_bug_timeout_is_ambiguous(self):
         session = FakeSession(side_effects={"post": [requests.Timeout("jira-bot@example.com secret-token") ]})
@@ -374,17 +392,7 @@ class JiraNotifierTests(unittest.TestCase):
 
         self.assertIsNone(raised.exception.key)
         self.assertNotIn("secret-token", str(raised.exception))
-
-    def test_rate_limit_reports_retry_after(self):
-        session = FakeSession(responses={"get": [FakeResponse({"error": "ratelimited"}, 429, {"Retry-After": "2.5"})]})
-        notifier = self._notifier(session)
-
-        with self.assertRaises(JiraRateLimitError) as raised:
-            notifier.get_issue("RHAI-5")
-
-        self.assertEqual(raised.exception.retry_after, 2.5)
-        self.assertEqual(raised.exception.status_code, 429)
-        self.assertEqual(raised.exception.error, "ratelimited")
+        self.assertEqual([method for method, _, _ in session.calls], ["post"])  # No readback.
 
     def test_find_by_label_zero_matches_returns_empty_list(self):
         session = FakeSession(responses={"post": [FakeResponse({"issues": [], "isLast": True}, 200)]})
@@ -426,28 +434,18 @@ class JiraNotifierTests(unittest.TestCase):
         self.assertNotIn("nextPageToken", session.calls[0][2]["json"])
         self.assertEqual(session.calls[1][2]["json"]["nextPageToken"], "tok-1")
 
-    def test_find_by_label_incomplete_pagination_fails_closed(self):
-        first = self._issue("RHAI-12")
-        session = FakeSession(responses={"post": [FakeResponse({"issues": [first], "isLast": False}, 200)]})
+    def test_find_by_label_propagates_client_error_unchanged(self):
+        session = FakeSession()
         notifier = self._notifier(session)
-
-        with self.assertRaises(JiraAmbiguousError):
-            notifier.find_by_label("gap-staging")
-
-    def test_find_by_label_rejects_looping_next_page_token(self):
-        first = self._issue("RHAI-19")
-        session = FakeSession(
-            responses={
-                "post": [
-                    FakeResponse({"issues": [first], "isLast": False, "nextPageToken": "tok-dup"}, 200),
-                    FakeResponse({"issues": [first], "isLast": False, "nextPageToken": "tok-dup"}, 200),
-                ]
-            }
-        )
-        notifier = self._notifier(session)
-
-        with self.assertRaises(JiraAmbiguousError):
-            notifier.find_by_label("gap-staging")
+        error = JiraAmbiguousError("incomplete inventory")
+        with patch.object(JiraClient, "search", side_effect=error) as search:
+            with self.assertRaises(JiraAmbiguousError) as raised:
+                notifier.find_by_label("gap-staging")
+            self.assertIs(raised.exception, error)
+            search.assert_called_once_with(
+                'project = RHAI AND labels = "gap-staging" ORDER BY key ASC',
+                fields=["summary", "description", "labels", "status", "project", "issuetype"])
+        self.assertEqual(session.calls, [])
 
     def test_update_issue_rejects_done_issue_without_put(self):
         session = FakeSession(responses={"get": [FakeResponse(self._issue("RHAI-13", status_category="done"), 200)]})

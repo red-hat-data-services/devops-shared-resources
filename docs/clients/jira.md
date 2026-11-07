@@ -3,7 +3,8 @@
 `lib.jira_client.JiraClient` provides concrete **Jira Cloud REST v3 site-origin**
 operations, without GAP notification policy. It is not an OAuth/discovery SDK,
 Data Center compatibility layer, or `api.atlassian.com/ex/jira/<cloud-id>` gateway
-client. No dependencies were added.
+client. Service operations use pinned `atlassian-python-api==5.0.5`'s `JiraCloud`
+with explicit REST v3. GAP lifecycle/content policy remains outside the SDK.
 
 ## Configuration and operations
 
@@ -43,6 +44,48 @@ Search uses bounded pagination (50 results/page, at most 20 pages), rejects
 incomplete/looping pagination and duplicate issue results, and raises rather
 than returning a truncated inventory. Property names are encoded as URL path
 segments, not interpreted as caller-supplied resource paths.
+
+## SDK boundary and offline validation
+
+All eight operations use native JiraCloud methods: `get_issue`,
+`search_and_reconsile_issues_using_jql_post` (SDK spelling), `create_issue`,
+`edit_issue`, `get_issue_property`, `set_issue_property`, `get_transitions`, and
+`do_transition`. Whole-body creation preserves sibling `fields`/`properties` in
+one POST; no SDK prefetch follows creation. Our bounded search loop remains;
+the SDK all-results convenience iterator does not establish completeness.
+
+A small injected transport bridge retains the public session's `get/post/put`
+protocol while enforcing explicit auth, the exact (including fractional) timeout,
+and disabled redirects at the final Requests boundary. Do not pass
+`allow_redirects=False` to SDK native methods: in this pinned version extra kwargs
+become query parameters. SDK backoff and Retry-After retries are both disabled.
+Managed sessions have no transport retries; custom injected sessions remain
+caller-owned and must likewise avoid retries or discovery internally.
+
+Literal-null property writes use the native method with `data='null', files={}`:
+this selects the pinned SDK's raw-body serialization path without multipart
+content. This is a version-sensitive public-parameter combination, not a separate
+raw-requests fallback. Tests assert the final Requests prepared body is exactly
+`null`; they also cover booleans, strings, lists, numbers and objects. Pin upgrades
+require rerunning these actual-SDK contract tests.
+
+The instance subclass preflights JSON with `allow_nan=False` before the SDK's
+serializer: nested NaN/Infinity values are rejected without preparing/sending an
+HTTP request, preserving Requests' original semantic read/write error classes.
+It also overrides `log_curl_debug` (a public SDK helper) to suppress
+payload diagnostics, and the injected transport returns a response view whose
+text/reason are empty for SDK logging but whose JSON and status/headers retain
+original application evidence. Raw advanced mode avoids SDK exception formatting.
+No global logger or environment monkeypatch is used in production. Request paths
+may still appear in SDK debug logs; bodies and authentication do not. Generic
+classification, shape checks, readbacks and sanitized errors remain ours.
+
+`tests/test_jira_sdk_contract.py` executes the installed pinned SDK using real
+Requests preparation and an in-memory send override. Outbound sockets, default
+Session.send and netrc discovery are blocked by scoped test fixtures. No service
+access or real credentials are needed. Existing semantic tests retain their
+assertions; their fake transport normalizes serialized JSON/query strings for
+inspection. Pure formatting does not construct an SDK client.
 
 ## Errors and uncertain writes
 

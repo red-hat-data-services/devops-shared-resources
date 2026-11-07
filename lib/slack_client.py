@@ -15,9 +15,13 @@ record confirmed receipts and decide how to reconcile or hold failed sends.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import json
+import logging
 from typing import Any
 
 import requests
+from slack_sdk import WebClient
+from slack_sdk.version import __version__ as _sdk_version
 
 SLACK_CHAT_POST_MESSAGE = "https://slack.com/api/chat.postMessage"
 SLACK_MAX_RETRY_AFTER = 3600.0
@@ -66,6 +70,47 @@ class SlackPermanentError(SlackError):
     """The request was rejected in a non-retryable way."""
 
 
+class _SessionWebClient(WebClient):
+    """Bounded slack_sdk 3.46.0 bridge, only for chat.postMessage.
+
+    Initialize the BaseClient fields directly: its public constructor discovers
+    environment proxies even for proxy="". Keep SDK method/payload construction,
+    JSON serialization, retry loop (disabled), and response validation, replacing
+    only the final HTTP boundary with the caller's requests-style session.
+    Review this private coupling before changing the exact dependency pin.
+    """
+
+    def __init__(self, token, session, timeout):
+        if _sdk_version != "3.46.0":
+            raise RuntimeError("Unsupported Slack SDK version")
+        self.token, self.timeout = token, timeout
+        self.base_url = "https://slack.com/api/"
+        self.ssl = self.proxy = None
+        self.headers = {"User-Agent": "gap-slack/slack_sdk-3.46.0"}
+        self.default_params = {}
+        self.retry_handlers = []
+        self._logger = logging.Logger("gap.slack.transport")
+        self._logger.disabled = True
+        self._logger.propagate = False
+        self._session = session
+        self.response = None
+
+    def _perform_urllib_http_request_internal(self, url, req):
+        if url != SLACK_CHAT_POST_MESSAGE or req.get_method() != "POST":
+            raise ValueError("Unsupported Slack operation")
+        # SDK has serialized the JSON already. Decode only to preserve the public
+        # injected session.post(json=...) contract; requests does final encoding.
+        self.response = self._session.post(
+            url, headers=dict(req.header_items()), json=json.loads(req.data),
+            timeout=self.timeout, allow_redirects=False,
+        )
+        return {
+            "status": getattr(self.response, "status_code", None),
+            "headers": getattr(self.response, "headers", {}),
+            "body": json.dumps(SlackClient._response_json(self.response)),
+        }
+
+
 @dataclass
 class SlackClient:
     token: str = field(repr=False)
@@ -90,31 +135,19 @@ class SlackClient:
         if not isinstance(text, str) or not text:
             raise ValueError("text must be a non-empty string")
 
-        payload: dict[str, Any] = {
-            "channel": channel,
-            "text": text,
-            "unfurl_links": False,
-            "unfurl_media": False,
-        }
-        if thread_ts is not None:
-            payload["thread_ts"] = thread_ts
-        if client_msg_id is not None:
-            payload["client_msg_id"] = client_msg_id
-
-        headers = {"Authorization": f"Bearer {self.token}"}
+        sdk = _SessionWebClient(self.token, self.session, self.timeout)
         try:
-            response = self.session.post(
-                SLACK_CHAT_POST_MESSAGE,
-                headers=headers,
-                json=payload,
-                timeout=self.timeout,
-                allow_redirects=False,
+            sdk.chat_postMessage(
+                channel=channel, text=text, thread_ts=thread_ts,
+                client_msg_id=client_msg_id, unfurl_links=False, unfurl_media=False,
             )
-        except requests.RequestException:
-            raise SlackAmbiguousError("Slack delivery outcome could not be established") from None
         except Exception:
-            raise SlackAmbiguousError("Slack delivery outcome could not be established") from None
-
+            # SDK validates only HTTP 200 and truthy ok, and can reject malformed
+            # response shapes itself. Classify a captured response independently;
+            # no response means uncertainty, never permission to retry.
+            if sdk.response is None:
+                raise SlackAmbiguousError("Slack delivery outcome could not be established") from None
+        response = sdk.response
         status_code = getattr(response, "status_code", None)
         data = self._response_json(response)
         if status_code == 429:

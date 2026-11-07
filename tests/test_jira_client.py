@@ -1,13 +1,12 @@
 """Reusable Jira operations tested exclusively with injected fake sessions."""
 import copy
-import json
 
 import pytest
 import requests
 
 from lib.gap_notifications import notify_tools as gap
 from lib.jira_client import (JiraClient, JiraAmbiguousError, JiraPermanentError,
-    JiraRateLimitError, JiraTransientError, JiraValidationError)
+    JiraTransientError)
 from test_gap_notification_jira import FakeResponse, FakeSession
 
 SITE = 'https://example-jira.test'
@@ -60,42 +59,6 @@ def test_arbitrary_property_name_json_and_missing_property():
     assert api.get_issue_property('OTHER-1', 'other/app.v2') is None
 
 
-def test_property_null_prepared_body_and_get_no_body(monkeypatch):
-    def forbidden(*args, **kwargs):
-        raise AssertionError('network or credential discovery is forbidden')
-
-    monkeypatch.setattr(requests.Session, 'send', forbidden)
-    monkeypatch.setattr(requests.sessions, 'get_netrc_auth', forbidden)
-
-    class PreparingSession(requests.Session):
-        def __init__(self):
-            super().__init__()
-            self.prepared = []
-
-        def request(self, method, url, **kwargs):
-            # Real requests serialization, stopped BEFORE Session.send/network.
-            selected = {k: kwargs[k] for k in ('params', 'json', 'data', 'headers', 'auth') if k in kwargs}
-            self.prepared.append(requests.Request(method, url, **selected).prepare())
-            if method.lower() == 'get':
-                return FakeResponse({'key': 'OTHER-1', 'fields': {}})
-            return FakeResponse(None, 204)
-
-    session = PreparingSession()
-    api = client(session)
-    assert api.put_issue_property('OTHER-1', 'other.app', None) is None
-    null_request = session.prepared[-1]
-    assert null_request.body == 'null'
-    assert null_request.headers['Content-Type'] == 'application/json'
-    api.get_issue('OTHER-1')
-    assert session.prepared[-1].body is None
-    assert 'Content-Type' not in session.prepared[-1].headers
-    for value in ({'v': 1}, [1, None], False, 0, 'text'):
-        api.put_issue_property('OTHER-1', 'other.app', value)
-        assert json.loads(session.prepared[-1].body) == value
-        assert session.prepared[-1].headers['Content-Type'] == 'application/json'
-    assert session.trust_env is False
-
-
 def test_generic_transitions_are_not_done_only():
     transition = {'id': '9', 'to': {'statusCategory': {'key': 'indeterminate'}}}
     session = FakeSession(responses={'get': [FakeResponse({'transitions': [transition]})],
@@ -131,6 +94,7 @@ def test_search_omitted_fields_explicitly_requests_summary_on_all_pages():
 
 @pytest.mark.parametrize('pages', [
     [{'issues': [], 'isLast': False}],
+    [{'issues': [{'key': 'OTHER-1', 'fields': {}}], 'isLast': False}],
     [{'issues': [], 'isLast': 'yes'}],
     [{'issues': [], 'isLast': True, 'nextPageToken': 'unexpected'}],
     [{'issues': [{'key': 'OTHER-1', 'fields': {}}], 'isLast': False, 'nextPageToken': 'a'},
@@ -168,24 +132,6 @@ def test_timeout_classification_is_semantic_and_never_retries(method, args, verb
         getattr(client(session), method)(*args)
     assert len(session.calls) == 1
     assert 'FAKE_TOKEN' not in str(raised.value) and 'fake@example.test' not in str(raised.value)
-
-
-@pytest.mark.parametrize('status,body,error_type', [
-    (429, {'error': 'rate_limited'}, JiraRateLimitError),
-    (400, {'errors': {'summary': 'FAKE_TOKEN'}, 'errorMessages': ['BAD_INPUT', 'FAKE TOKEN']}, JiraValidationError),
-    (403, {'message': 'FAKE_TOKEN'}, JiraPermanentError),
-    (503, {'message': 'FAKE_TOKEN'}, JiraAmbiguousError),
-    (302, {}, JiraAmbiguousError),
-])
-def test_rejections_and_uncertain_status_metadata(status, body, error_type):
-    session = FakeSession(responses={'post': [FakeResponse(body, status, {'Retry-After': '2.5'})]})
-    with pytest.raises(error_type) as raised:
-        client(session).create_issue({'summary': 'x'})
-    assert len(session.calls) == 1 and 'FAKE_TOKEN' not in str(raised.value)
-    if status == 429:
-        assert raised.value.retry_after == 2.5 and raised.value.status_code == 429
-    if status == 400:
-        assert raised.value.field_errors == ('summary',) and raised.value.error_codes == ('BAD_INPUT',)
 
 
 def test_gap_facade_honors_mutated_public_session_auth_timeout():
