@@ -1017,5 +1017,96 @@ def test_format_failure_does_not_leave_a_slack_inflight_intent(tmp_path, monkeyp
     assert not slack.calls
 
 
+# Unknown selectors must fail explicitly rather than silently fall back to staging or production.
+@pytest.mark.parametrize('value', ['', 'prod', 'Stage', ' production ', None, {}, True])
+def test_jira_environment_selector_rejects_invalid_values(value):
+    from lib.gap_notifications.notify_tools import jira_target
+    with pytest.raises(ValueError, match='environment'):
+        jira_target(value)
+
+
+# Production requires explicit opt-in and must use the selected HTTPS origin with Bug by name.
+def test_production_jira_facade_uses_explicit_destination():
+    from lib.gap_notifications.notify_tools import jira_target
+    target = jira_target('production')
+    issue = issue_for(description={'type': 'doc', 'version': 1, 'content': []})
+    issue['fields']['issuetype']['id'] = '99999'
+    session = FakeSession(responses={'get': [FakeResponse(issue)]})
+    notifier = JiraNotifier(target.url, 'RHAI', 'Bug', 'dummy@example.test', 'dummy',
+                            session=session, **target.options)
+    assert notifier.get_issue('RHAI-1') == issue
+    assert session.calls[0][1] == target.url + '/rest/api/3/issue/RHAI-1'
+    assert session.trust_env is False
+    with pytest.raises(ValueError, match='environment'):
+        JiraNotifier(target.url, 'RHAI', 'Bug', 'dummy@example.test', 'dummy', session=session)
+    with pytest.raises(ValueError):
+        JiraNotifier(target.url, 'RHAI', '10016', 'dummy@example.test', 'dummy', session=session, **target.options)
+    assert len(session.calls) == 1
+
+
+# Environment mismatch or a staging-only type introduced by mutation must not reach HTTP.
+def test_mutated_production_facade_revalidates_target_and_issue_type():
+    session = FakeSession()
+    notifier = JiraNotifier('https://redhat.atlassian.net', 'RHAI', 'Bug', 'dummy@example.test', 'dummy',
+                            session=session, jira_environment='production')
+    notifier.issue_type = '10016'
+    with pytest.raises(ValueError): notifier.get_issue('RHAI-1')
+    notifier.issue_type = 'Bug'
+    notifier.base_url = 'https://stage-redhat.atlassian.net'
+    with pytest.raises(ValueError): notifier.get_issue('RHAI-1')
+    assert not session.calls
+
+
+# Production content must name its destination without discarding synthetic/snapshot caveats.
+def test_production_presentation_is_labeled_without_claiming_global_recovery():
+    from lib.gap_notifications.notify_tools import jira_target, slack_message
+    target = jira_target('production')
+    obs = observation(environment=target.scope, evidence={'synthetic': True, 'historical_snapshot': True})
+    markdown = render_markdown(obs, **target.options)
+    assert markdown.startswith('# GAP PRODUCTION') and 'Staging notification only' not in markdown
+    assert 'synthetic evidence: True' in markdown
+    text = slack_message(dict(obs, status='success'), jira_url=target.url + '/browse/RHAI-1', **target.options)
+    assert 'production Jira' in text and 'staging test' not in text
+    assert 'Synthetic evidence' in text and 'Recorded snapshot' in text
+    assert 'not a claim that the whole promotion is healthy' in text
+
+
+# Production creates must use Bug by name and atomically verify initial properties on that site.
+def test_production_create_readback_accepts_site_specific_bug_id():
+    from lib.gap_notifications.notify_tools import jira_target
+    target = jira_target('production')
+    obs = observation(environment=target.scope)
+    body = _description(obs, **target.options)
+    summary = _summary(obs, **target.options)
+    state = {'scope': target.scope, 'test': True}
+    issue = issue_for(description=body, summary=summary, labels=['gap-test'])
+    issue['fields']['issuetype']['id'] = '99999'
+    session = FakeSession(responses={
+        'post': [FakeResponse({'key': 'RHAI-1'}, status_code=201)],
+        'get': [FakeResponse(issue), FakeResponse({'key': 'gap.notification.v1', 'value': state})],
+    })
+    notifier = JiraNotifier(target.url, 'RHAI', 'Bug', 'dummy@example.test', 'dummy',
+                            session=session, **target.options)
+    assert notifier.create_bug(summary, body, ['gap-test'], notification_state=state) == {
+        'key': 'RHAI-1', 'url': target.url + '/browse/RHAI-1'}
+    assert [method for method, _, _ in session.calls] == ['post', 'get', 'get']
+    assert all(url.startswith(target.url + '/') for _, url, _ in session.calls)
+    payload = session.calls[0][2]['json']
+    assert payload['fields']['issuetype'] == {'name': 'Bug'}
+    assert payload['properties'] == [{'key': 'gap.notification.v1', 'value': state}]
+
+
+# A managed metadata link from the other site must be treated as edited, not silently rewritten.
+@pytest.mark.parametrize('selected,other', [('stage', 'production'), ('production', 'stage')])
+def test_managed_metadata_remains_environment_scoped(selected, other):
+    from lib.gap_notifications.notify_tools import jira_target
+    correct = metadata_url('RHAI-1', jira_environment=selected)
+    foreign = metadata_url('RHAI-1', jira_environment=other)
+    body = {'type': 'doc', 'version': 1, 'content': section(foreign, metadata=True)}
+    assert visible_link_status(body, correct, metadata=True, jira_environment=selected) == 'ambiguous_or_edited'
+    with pytest.raises(ValueError, match='edited'):
+        project_body(body, None, metadata=correct, **jira_target(selected).options)
+
+
 if __name__ == "__main__":
     unittest.main()

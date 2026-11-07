@@ -19,7 +19,7 @@ def test_packaged_template_and_real_formatting_work_outside_checkout(tmp_path, m
     monkeypatch.setattr(notify_tools, 'SlackClient', forbidden)
     monkeypatch.chdir(tmp_path)
     template = files('lib.gap_notifications').joinpath('templates/issue.md.j2')
-    assert template.is_file() and template.read_text().startswith('# GAP STAGING TEST')
+    assert template.is_file() and template.read_text().startswith('# {{ notification_heading }}')
     markdown = notify_tools.render_markdown(observation())
     assert '# GAP STAGING TEST' in markdown
     assert 'Repository: ' + notify_tools.literal('acme/repo') in markdown

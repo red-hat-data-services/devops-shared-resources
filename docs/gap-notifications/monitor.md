@@ -52,7 +52,7 @@ inventing observations for those categories.
   in the same trial; changing only the journal does not isolate remote incidents.
 - `--notification-transition-id ID` and
   `--notification-transition-fields '{"resolution":{"id":"VERIFIED_ID"}}'`:
-  explicitly verified staging done transition/required fields. Without a done
+  explicitly verified done transition/required fields for the selected Jira site. Without a done
   transition, positive recovery holds visibly instead of guessing how to close.
 
 Preview collects/validates and prints observation counts; it does **not** access
@@ -61,14 +61,51 @@ It is a notification preview only: the **ordinary monitor may still publish
 GitHub state/statuses**. Monitor `--dry-run` suppresses this hook altogether;
 use the mocked tests below for a fully offline integration preview.
 
-Write mode is explicitly staging-only: fixed Jira
-`https://stage-redhat.atlassian.net`, project `RHAI`, issue type `Bug`, and Slack
-channel `C0883L8FARE`. There is no destination override. Only this explicit mode
-reads `JIRA_USER_EMAIL`/`JIRA_API_EMAIL`, `JIRA_API_TOKEN`, and
-`SLACK_TOKEN`/`SLACK_BOT_TOKEN`, using the existing service adapters. Operators
-must provide staging-authorized credentials; configuring an opt-in hook is not
-authorization to run a live trial or mutate production. No credentials or live
-services were used to validate this change.
+Jira selection is explicit through `GAP_JIRA_ENVIRONMENT`: `stage` (the default)
+uses `https://stage-redhat.atlassian.net`; `production` uses
+`https://redhat.atlassian.net`. Other values, including an explicitly empty value,
+are invalid. Project `RHAI`, issue type `Bug`, and Slack channel `C0883L8FARE` remain
+fixed. Production does not inherit staging's numeric issue-type or transition IDs.
+
+Only explicit write mode reads `JIRA_USER_EMAIL`/`JIRA_API_EMAIL`, `JIRA_API_TOKEN`,
+and `SLACK_TOKEN`/`SLACK_BOT_TOKEN`. Operators must supply credentials authorized
+for the selected site. Selecting production does not enable notification mode,
+change the Slack channel, switch credentials, or authorize live execution.
+No credentials or live services were used to validate environment selection.
+
+### Workflow environment variable
+
+A workflow running a shared-code revision that supports this selector can pass:
+
+```yaml
+env:
+  GAP_JIRA_ENVIRONMENT: ${{ vars.GAP_JIRA_ENVIRONMENT || 'stage' }}
+```
+
+The repository variable is not a secret. The workflow expression defaults a missing
+or empty repository variable to staging; the Python entry points reject an explicitly
+empty process variable. The monitor entry point resolves the selector only when
+notifications are enabled, then passes immutable configuration to the hook. Invalid
+enabled configuration suppresses notifications with a sanitized warning without
+changing the ordinary monitor's gate behavior. The standalone notification CLI
+returns a failing exit status for invalid selection.
+
+For direct Python calls, use `NotificationConfig(..., jira_environment="production")`.
+The hook does not implicitly reread process configuration or credential variables in
+preview/disabled mode. Production preview collects production-scoped observations
+without credentials, clients or journal access. Existing staging callers retain
+their defaults and injected-factory call shape.
+
+Use an isolated production journal and a stable namespace for that environment.
+Unbound older journals are staging-only, and retained outbox/create identities are
+validated before draining work. Cross-environment observations, properties, adapter
+origins and journals fail closed. Production recovery still requires an explicitly
+verified transition and its required fields; absence remains a visible hold.
+
+This snippet is documentation, not rollout: the promoter workflow files, shared-code
+pin, repository variables/secrets and notification activation are unchanged. An older
+pinned shared-code revision will not honor this selector; update the pin as a separate
+reviewed rollout step before relying on production selection.
 
 Example flags to append to an **already authorized** normal publishing monitor
 command with an explicit Leader URL:

@@ -285,3 +285,32 @@ def test_inspect_missing_malformed_safe(setup, state):
     report = inspect_issue(jira, 'RHAI-1')
     assert report['property'] == ('missing' if state is None else 'malformed_or_unavailable')
     assert 'SECRET' not in json.dumps(report)
+
+
+# Production tracking and inspection must use production links and reject staging adapters.
+def test_environment_scoped_tracking_and_inspection(tmp_path):
+    from lib.gap_notifications.notify_tools import jira_target
+    target = jira_target('production')
+    jira, slack = Jira(), Slack()
+    jira.base_url = target.url
+    obs = observation(environment=target.scope, evidence={'pr_url': PR})
+    Dispatcher(Ledger(tmp_path / 'p.json'), jira, slack, trial_id='trial', **target.options).run([obs])
+    tracking = project_tracking([obs], jira, trial_id='trial', **target.options)
+    cell = tracking_cell(tracking, PR)
+    assert target.url + '/browse/RHAI-1' in cell and 'stage-redhat' not in cell
+    inspected = inspect_issue(jira, 'RHAI-1', **target.options)
+    assert inspected['property'] == 'valid'
+    assert inspected['visible_metadata_link'] == 'match'
+    assert inspected['metadata_url'].startswith(target.url + '/')
+    jira.base_url = 'https://stage-redhat.atlassian.net'
+    jira.get_issue = lambda *a: (_ for _ in ()).throw(AssertionError('wrong-origin query'))
+    assert project_tracking([obs], jira, trial_id='trial', **target.options) == {'status': 'unavailable'}
+    with pytest.raises(ValueError, match='environment'):
+        inspect_issue(jira, 'RHAI-1', **target.options)
+
+
+# A display projection may select only the two known Jira origins, never an arbitrary link host.
+def test_tracking_renderer_rejects_untrusted_jira_origin():
+    tracking = {'status': 'checked', 'jira_origin': 'https://evil.example',
+                'rows': {PR: [{'component': 'cpu', 'status': 'confirmed', 'jira_key': 'RHAI-1'}]}}
+    assert tracking_cell(tracking, PR) == 'Unavailable'

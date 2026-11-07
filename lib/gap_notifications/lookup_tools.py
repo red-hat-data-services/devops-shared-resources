@@ -1,7 +1,7 @@
 """Read-only registry inspection, tracking lookup and dependency-light rendering.
 
 Inspection and current-observation projection receive an explicit Jira adapter
-and validate trial/incident/episode/staging metadata with shared dispatch helpers.
+and validate trial/incident/episode/environment metadata with shared dispatch helpers.
 Only search/GET service calls occur; Slack URLs derive from confirmed stored
 root receipts, never history queries. Hints are revalidated, ambiguity stays
 unavailable, and closed fallbacks are explicitly marked.
@@ -19,7 +19,7 @@ import re
 import json
 
 
-def project_tracking(observations, jira, *, trial_id, known_keys=None):
+def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_environment="stage"):
     """Search/GET only; hints require the same fresh identity/property validation.
 
     Absence is not proof that no ticket exists (search may lag). Nothing here
@@ -27,10 +27,12 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None):
     """
     from lib.gap_notifications.dispatch_incidents import discussion_url, validated_property
     from lib.gap_notifications.dispatch_incidents import incident_key
-    from lib.gap_notifications.dispatch_incidents import STAGE, bind_trial, incident_label, validate_observations
-    bind_trial({}, trial_id)
-    validate_observations(observations)
-    if getattr(jira, "base_url", STAGE) != STAGE:
+    from lib.gap_notifications.dispatch_incidents import bind_trial, incident_label, validate_observations
+    from lib.gap_notifications.notify_tools import jira_target
+    target = jira_target(jira_environment)
+    bind_trial({}, trial_id, **target.options)
+    validate_observations(observations, **target.options)
+    if getattr(jira, "base_url", target.url) != target.url:
         return {"status": "unavailable"}
     rows = {}
     cache = {}
@@ -56,7 +58,7 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None):
                     if issue.get("key") != key:
                         raise ValueError("issue mismatch")
                     state = validated_property(issue, jira.get_notification_state(key),
-                                               trial=trial_id, identity=identity)
+                                               trial=trial_id, identity=identity, **target.options)
                     records.append((issue, state))
                 if len({s["episode_id"] for _, s in records}) != len(records):
                     raise ValueError("duplicate episodes")
@@ -82,7 +84,7 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None):
         entry.update(cache[identity])
         if entry not in rows.setdefault(pr, []):
             rows[pr].append(entry)
-    return {"status": "checked", "rows": rows}
+    return {"status": "checked", "rows": rows, "jira_origin": target.url}
 
 
 def _text(value):
@@ -102,6 +104,10 @@ def tracking_cell(tracking, pr_url):
     parts = []
     unmatched = 0
     try:
+        # Display-only allowlist: keep this renderer free of service-module imports.
+        origin = tracking.get("jira_origin", "https://stage-redhat.atlassian.net")
+        if origin not in {"https://stage-redhat.atlassian.net", "https://redhat.atlassian.net"}:
+            raise ValueError("invalid Jira display origin")
         for entry in entries:
             label = _text(entry["component"])
             if entry.get("pipeline"):
@@ -116,7 +122,7 @@ def tracking_cell(tracking, pr_url):
             else:
                 if not re.fullmatch(r"RHAI-[1-9][0-9]*", key):
                     raise ValueError("invalid issue")
-                value = f"[{key}](https://stage-redhat.atlassian.net/browse/{key})"
+                value = f"[{key}]({origin}/browse/{key})"
                 closed = entry.get("closed", False)
                 if not isinstance(closed, bool):
                     raise ValueError("invalid issue status")
@@ -141,10 +147,13 @@ def tracking_cell(tracking, pr_url):
     return "<br>".join(parts)
 
 
-def inspect_issue(jira, key, *, trial=None):
+def inspect_issue(jira, key, *, trial=None, jira_environment="stage"):
     """GET only. Output allowlisted fields; malformed properties never leak raw values."""
     from lib.gap_notifications.dispatch_incidents import validated_property, discussion_url, metadata_url
-    from lib.gap_notifications.notify_tools import visible_link_status
+    from lib.gap_notifications.notify_tools import visible_link_status, jira_target
+    target = jira_target(jira_environment)
+    if getattr(jira, "base_url", target.url) != target.url:
+        raise ValueError("Jira adapter environment mismatch")
     issue = jira.get_issue(key)
     category = issue.get("fields", {}).get("status", {}).get("statusCategory", {}).get("key")
     result = {"issue": key, "status_category": category if category in {"new", "indeterminate", "done"} else "unavailable",
@@ -156,7 +165,7 @@ def inspect_issue(jira, key, *, trial=None):
             result["property"] = "missing"
             return result
         # Validate stored trial first so omitted --trial-id does not compare default.
-        checked = validated_property(issue, state)
+        checked = validated_property(issue, state, **target.options)
         if trial is not None and trial != checked["trial_id"]:
             result.update(property="trial_mismatch", trial_match=False)
             return result
@@ -170,8 +179,8 @@ def inspect_issue(jira, key, *, trial=None):
         result.update(property="valid", scope=checked["scope"], trial_id=checked["trial_id"],
                       trial_match=True if trial is not None else None, incident_identity=json.loads(checked["incident_key"]),
                       identity_match=True, recorded_outcome=checked["last_outcome"], root=root, discussion_url=url,
-                      metadata_url=metadata_url(issue["key"]), metadata_note="Jira permissions required.",
-                      visible_metadata_link=visible_link_status(issue["fields"].get("description"), metadata_url(issue["key"]), metadata=True),
+                      metadata_url=metadata_url(issue["key"], **target.options), metadata_note="Jira permissions required.",
+                      visible_metadata_link=visible_link_status(issue["fields"].get("description"), metadata_url(issue["key"], **target.options), metadata=True, **target.options),
                       visible_link=visible_link_status(issue["fields"].get("description"), url) if url else "no_confirmed_root",
                       jira_intent=intent(checked["jira_intent"]), slack_intent=intent(delivery["intent"]))
     except Exception:

@@ -304,3 +304,76 @@ def test_tracking_noop_still_no_clients_credentials_ledger(hook, mode, dry_run):
 # Notifications must remain disabled unless explicitly enabled by configuration.
 def test_parser_default_disabled():
     assert monitor.build_parser().parse_args([]).notification_mode == "disabled"
+
+
+# Production config must drive collection, factories, registry scope and tracking together.
+def test_production_hook_passes_explicit_target_without_changing_delivery_rules(hook):
+    from lib.gap_notifications.notify_tools import jira_target
+    invoke, jira, slack, opts, calls = hook
+    target = jira_target('production')
+    jira.base_url = target.url
+    def factory(*args, **kwargs):
+        calls.append((args, kwargs))
+        assert args[:3] == (target.url, 'RHAI', 'Bug')
+        assert kwargs == target.options
+        return jira
+    config = replace(opts['config'], jira_environment='production', transition_id=None)
+    tracking = {}
+    changes = dict(config=config, jira_factory=factory, tracking=tracking)
+    first = invoke(**changes)
+    assert first['status'] == 'settled' and first['presentation_warning_count'] == 0
+    assert jira.properties['RHAI-1']['scope'] == target.scope
+    assert tracking['jira_origin'] == target.url
+    replay = invoke(**changes)
+    assert replay['status'] == 'settled' and replay['presentation_warning_count'] == 0 and len(slack.calls) == 1
+    recovery = state(expected_components=['api'], runs=[run('api', 'success', uid='passing')])
+    assert invoke(recovery, **changes)['status'] == 'held' and not jira.closed('RHAI-1')
+    changes['config'] = replace(config, transition_id='999', transition_fields={'resolution': {'id': '999'}})
+    assert invoke(recovery, **changes)['status'] == 'settled' and jira.closed('RHAI-1')
+    assert len(slack.calls) == 2
+
+
+# Production preview must collect the right scope without reading credentials or a journal.
+def test_production_preview_has_no_clients_credentials_or_journal_access(hook):
+    from pathlib import Path
+    from lib.gap_notifications.analyze_leader_state import collect_build_observations
+    from lib.gap_notifications.notify_tools import jira_target
+    invoke, _, _, opts, calls = hook
+    seen = []
+    def collector(payload, **kwargs):
+        seen.append(kwargs['environment'])
+        return collect_build_observations(payload, **kwargs)
+    journal = Path(opts['config'].ledger)
+    journal.write_text('not a valid journal')
+    config = replace(opts['config'], mode='preview', jira_environment='production')
+    result = invoke(config=config, environ=Bomb(), collector=collector)
+    assert result['status'] == 'preview' and seen == [jira_target('production').scope]
+    assert not calls and journal.read_text() == 'not a valid journal'
+
+
+# Invalid selectors must hold notification work before credentials or factories are touched.
+def test_invalid_hook_environment_fails_before_dependencies(hook):
+    invoke, _, _, opts, calls = hook
+    result = invoke(config=replace(opts['config'], jira_environment='prod'), environ=Bomb())
+    assert result == {'status': 'error', 'error_type': 'ValueError'} and not calls
+
+
+# The workflow-facing environment variable must reach config, but must not enable notifications.
+@pytest.mark.parametrize('selector,mode,expected', [(None, 'preview', 'stage'), ('stage', 'preview', 'stage'),
+    ('production', 'preview', 'production'), ('production', 'disabled', None), ('typo', 'preview', None)])
+def test_monitor_cli_reads_jira_environment_only_for_enabled_notifications(tmp_path, monkeypatch, selector, mode, expected):
+    if selector is None: monkeypatch.delenv('GAP_JIRA_ENVIRONMENT', raising=False)
+    else: monkeypatch.setenv('GAP_JIRA_ENVIRONMENT', selector)
+    path = tmp_path / 'state.json'
+    captured = []
+    monkeypatch.setattr(monitor, 'resolve_inputs_for_cli', lambda **kw: (str(path), None, [], None))
+    monkeypatch.setattr(monitor, 'resolve_state_file', lambda **kw: path)
+    monkeypatch.setattr(monitor, 'append_github_output', lambda *a: None)
+    monkeypatch.setattr(monitor, 'should_run_schedule_mode', lambda **kw: False)
+    def coordinator(*args, **kwargs):
+        captured.append(kwargs.get('notification_config'))
+        return monitor.MonitorResult(path, [], [], [], [], True)
+    monkeypatch.setattr(monitor, 'run_monitor_publish_and_signal', coordinator)
+    assert monitor.main(['--repo-root', str(tmp_path), '--notification-mode', mode]) == 0
+    assert len(captured) == 1
+    assert (captured[0].jira_environment if captured[0] else None) == expected

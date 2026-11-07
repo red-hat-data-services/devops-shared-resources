@@ -1,13 +1,36 @@
-# GAP staging notifications: Jira registry v2
+# GAP notifications: Jira registry v2
 
-**Local CLI, explicit normalized observations, staging tests only.** No production
-writes, automatic Leader selection, monitor mutation, reopen transitions or claim of
-exactly-once delivery. Every issue/message is marked `[GAP STAGING TEST]` and visibly
-identifies test-only, historical/synthetic evidence and the supplied note.
+**Explicit normalized observations; staging by default.** There is no automatic
+Leader selection, monitor mutation from the standalone CLI, reopening of closed
+issues, or claim of exactly-once delivery. Staging issues retain the
+`[GAP STAGING TEST]` marker. Explicit production selection uses `[GAP PRODUCTION]`;
+this identifies the Jira destination, not proof of live production build health.
+Historical/synthetic evidence remains labeled in both environments.
 
-Destinations are fixed: Jira `https://stage-redhat.atlassian.net`, project `RHAI`,
-Bug (`10016`), Slack `C0883L8FARE`. Observation `environment` must be exactly
-`stage-redhat.atlassian.net/RHAI/C0883L8FARE`.
+`GAP_JIRA_ENVIRONMENT` selects one allowlisted Jira destination:
+
+| Value | Jira origin | Required observation `environment` |
+| --- | --- | --- |
+| `stage` (default when unset) | `https://stage-redhat.atlassian.net` | `stage-redhat.atlassian.net/RHAI/C0883L8FARE` |
+| `production` | `https://redhat.atlassian.net` | `redhat.atlassian.net/RHAI/C0883L8FARE` |
+
+Unknown, empty, or misspelled values fail closed. Project `RHAI`, issue type `Bug`,
+and Slack channel `C0883L8FARE` remain fixed. Only staging also accepts its legacy
+numeric issue-type ID `10016`. The existing `--jira-url` option is an assertion
+that must match the selector, not a way to override it.
+
+Selection alone never enables writes: standalone CLI writes require `--write`,
+and monitor notifications remain disabled by default. Supply credentials authorized
+for the selected site through the existing explicit variables; there is no credential
+discovery, automatic credential switching, or fallback to another Jira site.
+
+Use separate journals for stage and production. New journals record their scope;
+unbound legacy schema2 journals remain readable only as staging journals. Pending
+work, registry properties, labels and incident identities cannot cross environments.
+Existing staging identities and remote receipts are unchanged. Do not rewrite an
+old journal or observation file to migrate incidents. Production recovery requires
+explicit transition IDs/fields verified for that site; staging IDs are not defaults.
+For workflow configuration and the Python API, see [monitor.md](monitor.md).
 
 ## Package boundaries
 
@@ -78,7 +101,7 @@ the verified fixed workspace `https://redhat-internal.slack.com`, validated chan
 and receipt timestamp; no Slack lookup/API scope is needed.
 
 The separate managed **Notification metadata** section links directly to the
-issue's `gap.notification.v1` JSON API using the fixed staging origin, validated
+issue's `gap.notification.v1` JSON API using the explicitly selected origin, validated
 actual issue key, and fixed property name. Its label is “View notification metadata
 (JSON — source of truth)” with a Jira-permissions-required note. Opening the link
 requires the viewer's Jira authentication/permissions; no credentials are embedded.
@@ -115,7 +138,8 @@ uv run --no-project --python /Users/ckodama/code/devops-shared-resources/.venv/b
 Inspection requires only explicitly supplied Jira environment authentication
 (`JIRA_USER_EMAIL` or `JIRA_API_EMAIL`, plus `JIRA_API_TOKEN`). It does not discover
 credentials, read observations/ledger, acquire lockfiles, construct Slack clients,
-acknowledge receipts, repair, or mutate anything. It remains staging-only. Inspect
+acknowledge receipts, repair, or mutate anything. It honors `GAP_JIRA_ENVIRONMENT`
+with the same default and validation as write/preview mode. Inspect
 is exclusive with write/observation/ledger/receipt/transition options. JSON reports
 actual Jira status category, validated property scope/trial/incident identity,
 recorded outcome, confirmed root/link, actual managed visible-link match/missing,

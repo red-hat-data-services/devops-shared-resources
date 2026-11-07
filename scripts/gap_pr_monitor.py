@@ -1446,7 +1446,7 @@ def run_monitor_publish_and_signal(
         except Exception as exc:
             notification_tracking = {"status": "unavailable"}
             notification_result = {"status": "error", "error_type": type(exc).__name__}
-            print("WARNING: GAP staging notification hook failed: " + type(exc).__name__, file=sys.stderr)
+            print("WARNING: GAP notification hook failed: " + type(exc).__name__, file=sys.stderr)
 
     leader_url = (leader_pr_url or "").strip() or None
     leader_status_posted = False
@@ -2436,11 +2436,11 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: {ENV_LEADER_LABEL} or {DEFAULT_LEADER_LABEL!r})."
         ),
     )
-    notifications = parser.add_argument_group("opt-in staging notifications (disabled by default)")
+    notifications = parser.add_argument_group("opt-in notifications (disabled; GAP_JIRA_ENVIRONMENT defaults to stage)")
     notifications.add_argument("--notification-mode", choices=("disabled", "preview", "write"), default="disabled")
     notifications.add_argument("--notification-ledger", help="Isolated schema2 journal OUTSIDE monitored checkout")
     notifications.add_argument("--notification-trial-id", default="default")
-    notifications.add_argument("--notification-transition-id", help="Explicit verified staging done transition")
+    notifications.add_argument("--notification-transition-id", help="Explicit verified done transition for the selected Jira environment")
     notifications.add_argument("--notification-transition-fields", default="{}", help="JSON fields for recovery transition")
     return parser
 
@@ -2452,14 +2452,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.notification_mode != "disabled":
         try:
             from lib.gap_notifications.monitor_hook import NotificationConfig
+            from lib.gap_notifications.notify_tools import jira_target
+            target = jira_target(os.environ.get("GAP_JIRA_ENVIRONMENT", "stage"))
             notification_config = NotificationConfig(
                 mode=args.notification_mode, ledger=args.notification_ledger,
                 trial_id=args.notification_trial_id,
+                jira_environment=target.name,
                 transition_id=args.notification_transition_id,
                 transition_fields=json.loads(args.notification_transition_fields),
             )
         except Exception as exc:
-            print("WARNING: Invalid staging notification configuration: " + type(exc).__name__, file=sys.stderr)
+            print("WARNING: Invalid notification configuration: " + type(exc).__name__, file=sys.stderr)
 
     if should_run_schedule_mode(schedule_flag=args.schedule):
         label = (

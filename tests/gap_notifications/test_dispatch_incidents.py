@@ -875,3 +875,112 @@ def test_query_failure_with_existing_registry_holds(tmp_path):
     assert result["outbox"][0]["state"] in {"pending", "reconciliation_required"}
     assert result["outbox"][0]["hold"] == "registry_or_delivery_unavailable"
     assert (jira.issues, jira.notification_state, slack.calls) == before
+
+
+# Explicit production selection must isolate identity while retaining replay and recovery rules.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+def test_environment_scoped_lifecycle(tmp_path, environment):
+    from lib.gap_notifications.notify_tools import jira_target
+    target = jira_target(environment)
+    jira, slack = Jira(), Slack()
+    jira.base_url = target.url
+    obs = observation(environment=target.scope)
+    def runner(name, transition=None):
+        return Dispatcher(Ledger(tmp_path / (name + '.json')), jira, slack,
+                          trial_id='same-trial', transition_id=transition, **target.options)
+    first = runner('first').run([obs])
+    assert first['outbox'][0]['state'] == 'confirmed'
+    assert not first['outbox'][0].get('presentation_warning')
+    assert jira.properties['RHAI-1']['scope'] == target.scope
+    original = copy.deepcopy(jira.properties)
+    root = original['RHAI-1']['delivery']['root']
+    replay = runner('fresh').run([obs])
+    assert not replay['outbox'][0].get('presentation_warning')
+    assert jira.properties == original and len(slack.calls) == 1
+    assert target.url + '/browse/RHAI-1' in slack.calls[0][0]
+    assert target.url + '/rest/api/3/issue/RHAI-1/properties/' in json.dumps(jira.issues)
+    assert target.banner in jira.issues['RHAI-1']['fields']['summary']
+    success = dict(obs, status='success', observation_id='passing-run')
+    held = runner('no-transition').run([success])
+    assert held['outbox'][0]['state'] != 'confirmed' and not jira.closed('RHAI-1')
+    runner('recovery', '999').run([success])
+    assert jira.closed('RHAI-1') and slack.calls[-1][1]['thread_ts'] == root['ts']
+    runner('recurrence').run([dict(obs, observation_id='new-failure')])
+    assert len(jira.issues) == 2 and slack.calls[-1][1]['thread_ts'] is None
+
+
+# Stage and production must never share incident labels, even with the same trial and event.
+def test_environment_is_part_of_incident_identity():
+    from lib.gap_notifications.notify_tools import jira_target
+    keys = [incident_key(observation(environment=jira_target(env).scope)) for env in ('stage', 'production')]
+    assert keys[0] != keys[1]
+    assert incident_label(keys[0], 'trial') != incident_label(keys[1], 'trial')
+
+
+# A selected target must reject foreign observations before any service lookup or write.
+@pytest.mark.parametrize('selected,observed', [('stage', 'production'), ('production', 'stage')])
+def test_cross_environment_observation_rejected_before_services(tmp_path, selected, observed):
+    from lib.gap_notifications.notify_tools import jira_target
+    class NoServices:
+        def __getattr__(self, name):
+            if name == 'base_url': return jira_target(selected).url
+            raise AssertionError('service access')
+    runner = Dispatcher(Ledger(tmp_path / 'journal.json'), NoServices(), NoServices(), jira_environment=selected)
+    with pytest.raises(ValueError, match='scope'):
+        runner.run([observation(environment=jira_target(observed).scope)])
+    assert not runner.ledger.path.exists()
+
+
+# Rebinding a journal must not let pending or confirmed staging work drain into production.
+@pytest.mark.parametrize('tamper', ['none', 'scope-only', 'create-only'])
+def test_cross_environment_journal_rejected(tmp_path, tamper):
+    from lib.gap_notifications.dispatch_incidents import bind_trial
+    from lib.gap_notifications.notify_tools import jira_target
+    data = ingest({}, [observation()], trial_id='trial')
+    if tamper != 'none': data['scope'] = jira_target('production').scope
+    if tamper == 'create-only':
+        data['creates'] = {data['outbox'][0]['incident_key']: {'state': 'inflight'}}
+        data['outbox'] = []
+    with pytest.raises(ValueError, match='scope|environment'):
+        bind_trial(data, 'trial', jira_environment='production')
+
+
+# Unbound legacy journals remain staging-only and retain their existing delivery receipts.
+def test_legacy_stage_journal_remains_compatible(tmp_path):
+    from lib.gap_notifications.dispatch_incidents import bind_trial
+    runner, jira, slack = make_runner(tmp_path)
+    first = runner().run([observation()])
+    first.pop('scope')
+    before = copy.deepcopy(jira.properties)
+    assert bind_trial(first, 'trial')['scope'] == observation()['environment']
+    with pytest.raises(ValueError, match='environment'):
+        bind_trial(first, 'trial', jira_environment='production')
+    ledger = Ledger(tmp_path / 'legacy.json')
+    ledger.save(first)
+    result = Dispatcher(ledger, jira, slack, trial_id='trial').run([observation()])
+    assert result['outbox'][0]['state'] == 'confirmed'
+    assert jira.properties == before and len(slack.calls) == 1
+
+
+# A forged property scope cannot hide a foreign environment inside its stored incident identity.
+def test_cross_environment_property_is_rejected(tmp_path):
+    from lib.gap_notifications.notify_tools import jira_target
+    runner, jira, _ = make_runner(tmp_path)
+    runner().run([observation()])
+    state = copy.deepcopy(jira.properties['RHAI-1'])
+    state['scope'] = jira_target('production').scope
+    with pytest.raises(ValueError, match='scope'):
+        validated_property(jira.issues['RHAI-1'], state, jira_environment='production')
+
+
+# A mismatched or later-mutated adapter origin must fail before the dispatcher can query it.
+def test_adapter_origin_must_match_explicit_environment(tmp_path):
+    jira, slack = Jira(), Slack()
+    jira.base_url = 'https://stage-redhat.atlassian.net'
+    with pytest.raises(ValueError, match='environment'):
+        Dispatcher(Ledger(tmp_path / 'p.json'), jira, slack, jira_environment='production')
+    runner = Dispatcher(Ledger(tmp_path / 's.json'), jira, slack)
+    jira.base_url = 'https://redhat.atlassian.net'
+    with pytest.raises(ValueError, match='environment'):
+        runner.run([])
+    assert not jira.calls and not slack.calls

@@ -1,4 +1,4 @@
-"""Single-writer staging notification lifecycle backed by the Jira registry.
+"""Single-writer environment-scoped notification lifecycle backed by the Jira registry.
 
 Ingest explicit normalized observations into a trial-scoped local outbox, then
 resolve incidents through validated Jira labels/properties and issue status.
@@ -21,7 +21,7 @@ Cosmetic ADF mechanics live in notify_tools; delivery never imports lookup_tools
 from __future__ import annotations
 
 from lib.gap_notifications.notify_tools import (JiraNotifier, category_labels, description,
-    project_body, slack_message, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
+    project_body, slack_message, jira_target, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
 import copy
 import json
 from typing import Any
@@ -155,25 +155,37 @@ def _stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def validate_observations(observations):
+def validate_observations(observations, *, jira_environment="stage"):
+    target = jira_target(jira_environment)
     if not isinstance(observations, list) or len(observations) > 1000:
         raise ValueError("expected at most 1000 normalized observations")
     for obs in observations:
         incident_key(obs)
-        if obs["environment"] != ENVIRONMENT:
-            raise ValueError("incorrect staging scope")
+        if obs["environment"] != target.scope:
+            raise ValueError("incorrect Jira environment scope")
         if len(json.dumps(obs, allow_nan=False).encode()) > 65536:
             raise ValueError("observation exceeds 64 KiB")
     return observations
 
 
-def bind_trial(ledger, trial_id):
+def bind_trial(ledger, trial_id, *, jira_environment="stage"):
     if not isinstance(trial_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", trial_id):
         raise ValueError("invalid trial ID")
     if ledger and (ledger.get("schema") != 2 or ledger.get("trial_id") != trial_id):
         raise ValueError("registry v2 requires a new schema2 ledger with matching trial")
+    target = jira_target(jira_environment)
+    # Journals without a binding predate production support and are staging-only.
+    if ledger and ledger.get("scope", ENVIRONMENT) != target.scope:
+        raise ValueError("journal Jira environment mismatch")
+    for task in ledger.get("outbox", []):
+        validate_observations([task["observation"]], **target.options)
+        if task["incident_key"] != incident_key(task["observation"]):
+            raise ValueError("journal incident identity mismatch")
+    for identity in ledger.get("creates", {}):
+        if json.loads(identity).get("environment") != target.scope:
+            raise ValueError("journal create environment mismatch")
     result = copy.deepcopy(ledger)
-    result.update(schema=2, trial_id=trial_id)
+    result.update(schema=2, trial_id=trial_id, scope=target.scope)
     return result
 
 
@@ -181,9 +193,10 @@ def incident_label(key, trial_id="default"):
     return "gap-registry-" + _hash(trial_id + ":" + key)[:40]
 
 
-def ingest(ledger, observations, *, trial_id="default"):
-    validate_observations(observations)
-    data = bind_trial(ledger, trial_id)
+def ingest(ledger, observations, *, trial_id="default", jira_environment="stage"):
+    target = jira_target(jira_environment)
+    validate_observations(observations, **target.options)
+    data = bind_trial(ledger, trial_id, **target.options)
     for obs in observations:
         key = incident_key(obs)
         task_id = _hash(trial_id + ":" + key + ":" + obs["observation_id"])
@@ -249,17 +262,18 @@ def _closed(issue):
     return issue.get("fields", {}).get("status", {}).get("statusCategory", {}).get("key") == "done"
 
 
-def _summary(observation):
-    return f"[GAP STAGING TEST] {observation['category']} failure: {observation['repository']}"[:250]
+def _summary(observation, *, jira_environment="stage"):
+    return f"[{jira_target(jira_environment).banner}] {observation['category']} failure: {observation['repository']}"[:250]
 
 
-def _verify_issue(issue, episode):
+def _verify_issue(issue, episode, *, jira_environment="stage"):
     fields = issue.get("fields", {})
     _key(issue.get("key"))
     if (fields.get("project", {}).get("key") != "RHAI"
-            or not (fields.get("issuetype", {}).get("name") == "Bug" or fields.get("issuetype", {}).get("id") == "10016")
+            or not (fields.get("issuetype", {}).get("name") == "Bug"
+                    or (jira_environment == "stage" and fields.get("issuetype", {}).get("id") == "10016"))
             or episode["label"] not in fields.get("labels", [])
-            or fields.get("summary") != _summary(episode["latest"])
+            or fields.get("summary") != _summary(episode["latest"], jira_environment=jira_environment)
             or fields.get("status", {}).get("statusCategory", {}).get("key") not in {"new", "indeterminate", "done"}):
         raise ValueError("Jira episode identity could not be verified")
     return _key(issue["key"])
@@ -271,13 +285,15 @@ def _key(value):
     return value
 
 
-def _description(observation, *, discussion_url=None, metadata_url=None):
-    return description(observation, discussion_url=discussion_url, metadata_url=metadata_url)
+def _description(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
+    return description(observation, discussion_url=discussion_url, metadata_url=metadata_url,
+                       **jira_target(jira_environment).options)
 
 
-def _presentation(observation, existing_labels, *, discussion_url=None, metadata_url=None):
+def _presentation(observation, existing_labels, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
     """Finish deterministic rendering/adapter validation before durable write intent."""
-    body = _description(observation, discussion_url=discussion_url, metadata_url=metadata_url)
+    body = _description(observation, discussion_url=discussion_url, metadata_url=metadata_url,
+                        **jira_target(jira_environment).options)
     labels = sorted(set(existing_labels) | set(category_labels(observation["category"])))
     JiraNotifier._validate_adf(body)
     JiraNotifier._validate_labels(labels)
@@ -300,13 +316,15 @@ def _receipt(value):
     return {"channel": CHANNEL, "ts": value["ts"]}
 
 
-def _validate_state(value, key, trial, label):
+def _validate_state(value, key, trial, label, *, jira_environment="stage"):
     if not isinstance(value, dict):
         raise ValueError("registry property missing")
     _bounded(value)
     if not {"schema", "scope", "trial_id", "incident_key", "episode_id", "seen_event_ids", "last_event", "last_outcome", "jira_intent", "delivery"}.issubset(value):
         raise ValueError("incomplete registry property")
-    if (value.get("schema") != 1 or value.get("scope") != ENVIRONMENT
+    target = jira_target(jira_environment)
+    if (value.get("schema") != 1 or value.get("scope") != target.scope
+            or json.loads(key).get("environment") != target.scope
             or value.get("trial_id") != trial or value.get("incident_key") != key
             or incident_label(key, trial) != label):
         raise ValueError("registry scope/identity mismatch")
@@ -346,8 +364,11 @@ class RegistryHold(RuntimeError):
 
 class Dispatcher:
     """Single writer only: Jira properties are not compare-and-swap locks."""
-    def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default"):
-        bind_trial({}, trial_id)
+    def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default", jira_environment="stage"):
+        self.target = jira_target(jira_environment)
+        if getattr(jira, "base_url", self.target.url) != self.target.url:
+            raise ValueError("Jira adapter environment mismatch")
+        bind_trial({}, trial_id, **self.target.options)
         self.ledger, self.jira, self.slack = ledger, jira, slack
         self.trial_id = trial_id
         self.transition_id, self.transition_fields = transition_id, transition_fields
@@ -373,8 +394,8 @@ class Dispatcher:
             issues.append(self.jira.get_issue(known))  # Known key beats eventual JQL visibility.
         records = []
         for issue in issues:
-            _verify_issue(issue, {"label": label, "latest": obs})
-            state = _validate_state(self.jira.get_notification_state(issue["key"]), identity, self.trial_id, label)
+            _verify_issue(issue, {"label": label, "latest": obs}, **self.target.options)
+            state = _validate_state(self.jira.get_notification_state(issue["key"]), identity, self.trial_id, label, **self.target.options)
             if "gap-episode-" + uuid.UUID(state["episode_id"]).hex not in issue["fields"]["labels"]:
                 raise RegistryHold("episode property/label mismatch")
             records.append((issue, state))
@@ -387,7 +408,7 @@ class Dispatcher:
 
     def _new_state(self, task, previous):
         return _bounded({
-            "schema": 1, "scope": ENVIRONMENT, "trial_id": self.trial_id,
+            "schema": 1, "scope": self.target.scope, "trial_id": self.trial_id,
             "incident_key": task["incident_key"], "episode_id": str(uuid.uuid4()),
             "seen_event_ids": copy.deepcopy(previous.get("seen_event_ids", {})),
             "last_event": None, "last_outcome": None, "jira_intent": None,
@@ -406,12 +427,12 @@ class Dispatcher:
         state["seen_event_ids"][event] = "failure"
         state.update(last_event=event, last_outcome="failure")
         label = incident_label(identity, self.trial_id)
-        body, labels = _presentation(obs, [label, "gap-episode-" + uuid.UUID(state["episode_id"]).hex])
+        body, labels = _presentation(obs, [label, "gap-episode-" + uuid.UUID(state["episode_id"]).hex], **self.target.options)
         self.data.setdefault("creates", {})[identity] = {"state": "inflight", "episode_id": state["episode_id"]}
         task["operation"] = "create"
         self._save()  # Local intent BEFORE Jira create; property is atomic with issue.
         try:
-            result = self.jira.create_bug(_summary(obs), body, labels,
+            result = self.jira.create_bug(_summary(obs, **self.target.options), body, labels,
                 notification_state=_bounded(state))
             key = _key(result["key"])
             self.data["creates"][identity].update(state="confirmed", key=key)
@@ -424,8 +445,8 @@ class Dispatcher:
             self._save()
             raise
         issue = self.jira.get_issue(key)
-        _verify_issue(issue, {"label": label, "latest": obs})
-        actual = _validate_state(self.jira.get_notification_state(key), identity, self.trial_id, label)
+        _verify_issue(issue, {"label": label, "latest": obs}, **self.target.options)
+        actual = _validate_state(self.jira.get_notification_state(key), identity, self.trial_id, label, **self.target.options)
         if actual != state:
             raise RegistryHold("atomic create property mismatch")
         return issue, actual
@@ -441,8 +462,8 @@ class Dispatcher:
         issue = self.jira.get_issue(key)
         identity = task["incident_key"]
         label = incident_label(identity, self.trial_id)
-        _verify_issue(issue, {"label": label, "latest": task["observation"]})
-        state = _validate_state(self.jira.get_notification_state(key), identity, self.trial_id, label)
+        _verify_issue(issue, {"label": label, "latest": task["observation"]}, **self.target.options)
+        state = _validate_state(self.jira.get_notification_state(key), identity, self.trial_id, label, **self.target.options)
         if "gap-episode-" + uuid.UUID(state["episode_id"]).hex not in issue["fields"]["labels"]:
             raise ValueError("receipt episode identity mismatch")
         if task.get("jira_key") not in (None, key):
@@ -470,9 +491,11 @@ class Dispatcher:
         self._save()
 
     def run(self, observations, *, receipt=None):
-        validate_observations(observations)
+        if getattr(self.jira, "base_url", self.target.url) != self.target.url:
+            raise ValueError("Jira adapter environment mismatch")
+        validate_observations(observations, **self.target.options)
         with self.ledger.locked():
-            self.data = ingest(self.ledger.read(), observations, trial_id=self.trial_id)
+            self.data = ingest(self.ledger.read(), observations, trial_id=self.trial_id, **self.target.options)
             self._save()
             if receipt:
                 self._resolve(receipt)
@@ -542,9 +565,9 @@ class Dispatcher:
         if event not in state["seen_event_ids"]:
             if obs["status"] == "failure":
                 root = state["delivery"]["root"]  # Jira registry only, never evidence.
-                validated_property(issue, state, trial=self.trial_id, identity=task["incident_key"])
+                validated_property(issue, state, trial=self.trial_id, identity=task["incident_key"], **self.target.options)
                 body, labels = _presentation(obs, [], discussion_url=discussion_url(root) if root else None,
-                                             metadata_url=metadata_url(key))
+                                             metadata_url=metadata_url(key, **self.target.options), **self.target.options)
             if obs["status"] == "success" and not _closed(issue) and not self.transition_id:
                 raise RegistryHold("explicit done transition required")
             state["jira_intent"] = {"event_id": event, "outcome": obs["status"]}
@@ -576,10 +599,11 @@ class Dispatcher:
             if _closed(issue):
                 return
             state = validated_property(issue, self.jira.get_notification_state(key),
-                                       trial=self.trial_id, identity=task["incident_key"])
+                                       trial=self.trial_id, identity=task["incident_key"], **self.target.options)
             root = state["delivery"]["root"]
             current = issue["fields"].get("description")
-            projected = project_body(current, discussion_url(root) if root else None, metadata=metadata_url(key))
+            projected = project_body(current, discussion_url(root) if root else None,
+                                     metadata=metadata_url(key, **self.target.options), **self.target.options)
             if JiraNotifier._adf_signature(current) != JiraNotifier._adf_signature(projected):
                 self.jira.update_issue(key, description=projected)
             task.pop("presentation_warning", None)
@@ -596,7 +620,8 @@ class Dispatcher:
             delivery["last_event"] = event
             self._put(key, state)
             return  # No unrelated recovery root.
-        text = slack_message(obs, jira_url=f"{STAGE}/browse/{key}", reply=delivery["root"] is not None)
+        text = slack_message(obs, jira_url=f"{self.target.url}/browse/{key}", reply=delivery["root"] is not None,
+                             **self.target.options)
         intent = {"id": str(uuid.uuid4()), "event_id": event, "outcome": obs["status"], "state": "inflight"}
         delivery["intent"] = intent
         _bounded(state)
@@ -629,7 +654,7 @@ def discussion_url(root):
     return f"{SLACK_ORIGIN}/archives/{receipt['channel']}/p{receipt['ts'].replace('.', '')}"
 
 
-def validated_property(issue, state, *, trial=None, identity=None):
+def validated_property(issue, state, *, trial=None, identity=None, jira_environment="stage"):
     """Validate full stored scope/identity before using routing data; never description."""
     if not isinstance(state, dict):
         raise ValueError("missing property")
@@ -643,17 +668,18 @@ def validated_property(issue, state, *, trial=None, identity=None):
     if incident_key(obs) != stored_identity or (identity is not None and identity != stored_identity):
         raise ValueError("incident mismatch")
     label = incident_label(stored_identity, stored_trial)
-    checked = _validate_state(state, stored_identity, stored_trial, label)
+    target = jira_target(jira_environment)
+    checked = _validate_state(state, stored_identity, stored_trial, label, **target.options)
     # Summary retains caller repository spelling; identity canonicalizes it.
     # Validate that spelling against the stored identity, never against body links.
-    prefix = f"[GAP STAGING TEST] {obs['category']} failure: "
+    prefix = f"[{target.banner}] {obs['category']} failure: "
     summary = issue.get("fields", {}).get("summary", "")
     if not isinstance(summary, str) or not summary.startswith(prefix):
         raise ValueError("summary identity mismatch")
     summary_obs = dict(obs, repository=summary[len(prefix):])
     if incident_key(summary_obs) != stored_identity:
         raise ValueError("summary repository mismatch")
-    _verify_issue(issue, {"label": label, "latest": summary_obs})
+    _verify_issue(issue, {"label": label, "latest": summary_obs}, **target.options)
     if "gap-episode-" + uuid.UUID(checked["episode_id"]).hex not in issue["fields"]["labels"]:
         raise ValueError("episode mismatch")
     if checked["delivery"]["root"] is not None and checked["delivery"]["last_event"] is None:
@@ -661,5 +687,5 @@ def validated_property(issue, state, *, trial=None, identity=None):
     return checked
 
 
-def metadata_url(key):
-    return f"{STAGE}/rest/api/3/issue/{_key(key)}/properties/gap.notification.v1"
+def metadata_url(key, *, jira_environment="stage"):
+    return f"{jira_target(jira_environment).url}/rest/api/3/issue/{_key(key)}/properties/gap.notification.v1"

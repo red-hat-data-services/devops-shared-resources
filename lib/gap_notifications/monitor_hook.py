@@ -1,9 +1,9 @@
-"""Opt-in staging notifications after accepted monitor state publication.
+"""Opt-in environment-scoped notifications after accepted monitor state publication.
 
 Filter the published Leader snapshot to this pass's accepted child decisions,
 collect normalized observations, then invoke the existing dispatcher only in
 explicit write mode. Disabled/preview/monitor-dry-run paths avoid notification
-credentials, clients and ledger access. Write mode uses fixed staging adapters,
+credentials, clients and ledger access. Write mode uses explicit allowlisted adapters,
 an explicit stable trial and a journal outside the monitored checkout.
 
 Return/log bounded delivery counts, never a historical task/evidence dump.
@@ -33,8 +33,11 @@ class NotificationConfig:
     trial_id: str = "default"
     transition_id: str | None = None
     transition_fields: dict = field(default_factory=dict)
+    jira_environment: str = "stage"
 
     def validate(self):
+        from lib.gap_notifications.notify_tools import jira_target
+        jira_target(self.jira_environment)
         if self.mode not in {"disabled", "preview", "write"}:
             raise ValueError("invalid notification mode")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.trial_id):
@@ -99,15 +102,18 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         if collector is None:
             from lib.gap_notifications.analyze_leader_state import collect_build_observations
             collector = collect_build_observations
-        from lib.gap_notifications.dispatch_incidents import ENVIRONMENT, CHANNEL, STAGE, Ledger, Dispatcher, validate_observations
-        observations = collector(filtered, environment=ENVIRONMENT, leader_url=leader_url, state_url=link)
-        validate_observations(observations)
+        from lib.gap_notifications.dispatch_incidents import CHANNEL, Ledger, Dispatcher, validate_observations, bind_trial
+        from lib.gap_notifications.notify_tools import jira_target
+        target = jira_target(config.jira_environment)
+        observations = collector(filtered, environment=target.scope, leader_url=leader_url, state_url=link)
+        validate_observations(observations, **target.options)
         counts = {s: sum(o["status"] == s for o in observations) for s in ("failure", "success", "unknown")}
         if config.mode == "preview" or not observations:
             result = {"status": "preview" if config.mode == "preview" else "no-observations", "counts": counts}
         else:
             # Runtime opt-in only. Workers never execute this branch with real
             # credentials; tests supply fake environment and fake adapters.
+            bind_trial(Ledger(config.ledger).read(), config.trial_id, **target.options)
             if environ is None:
                 import os
                 environ = os.environ
@@ -115,18 +121,18 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
             token = environ.get("JIRA_API_TOKEN")
             slack_token = environ.get("SLACK_TOKEN") or environ.get("SLACK_BOT_TOKEN")
             if not all(isinstance(v, str) and v.strip() for v in (email, token, slack_token)):
-                raise ValueError("explicit staging notification credentials required")
+                raise ValueError("explicit notification credentials for the selected Jira environment required")
             if jira_factory is None:
                 from lib.gap_notifications.notify_tools import JiraNotifier
                 jira_factory = JiraNotifier
             if slack_factory is None:
                 from lib.gap_notifications.notify_tools import SlackNotifier
                 slack_factory = SlackNotifier
-            jira = jira_factory(STAGE, "RHAI", "Bug", email, token)
+            jira = jira_factory(target.url, "RHAI", "Bug", email, token, **target.options)
             dispatcher = (dispatcher_factory or Dispatcher)(Ledger(config.ledger),
                 jira, slack_factory(slack_token, CHANNEL),
                 trial_id=config.trial_id, transition_id=config.transition_id,
-                transition_fields=config.transition_fields)
+                transition_fields=config.transition_fields, **target.options)
             data = dispatcher.run(observations)
             if tracking is not None:
                 try:
@@ -140,7 +146,7 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
                         if ((identity, obs.get("observation_id")) in current
                                 and incident_key(obs) == identity and task.get("jira_key")):
                             hints.setdefault(identity, []).append(task["jira_key"])
-                    tracking.update(project_tracking(observations, jira, trial_id=config.trial_id, known_keys=hints))
+                    tracking.update(project_tracking(observations, jira, trial_id=config.trial_id, known_keys=hints, **target.options))
                 except Exception:
                     tracking.clear()
                     tracking.update(status="unavailable")
@@ -158,12 +164,12 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
                       "counts": counts, "delivery_state_counts": state_counts,
                       "delivery_task_count": sum(state_counts.values()),
                       "presentation_warning_count": warning_count}
-        print("GAP staging notifications: " + json.dumps(result, sort_keys=True), file=sys.stderr)
+        print("GAP notifications: " + json.dumps(result, sort_keys=True), file=sys.stderr)
         return result
     except Exception as exc:
         if tracking is not None:
             tracking.clear()
             tracking.update(status="unavailable")
         result = {"status": "error", "error_type": type(exc).__name__}
-        print("WARNING: GAP staging notifications isolated failure: " + type(exc).__name__, file=sys.stderr)
+        print("WARNING: GAP notifications isolated failure: " + type(exc).__name__, file=sys.stderr)
         return result

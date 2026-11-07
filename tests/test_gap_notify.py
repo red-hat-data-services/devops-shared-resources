@@ -140,9 +140,71 @@ def test_inspect_jira_only_no_ledger_or_slack(setup, monkeypatch, tmp_path):
     assert inspect_issue(jira, 'RHAI-1')['open'] is False
 
 
-# Inspection must reject write-oriented options and production destinations.
+# Inspection must reject write options and production URLs without explicit environment selection.
 @pytest.mark.parametrize('extra', [['--write'], ['--ledger', '/not/read'], ['--resolve-receipt', '/not/read'], ['--jira-url', 'https://redhat.atlassian.net']])
 def test_inspect_rejects_mutating_or_production_args(extra):
     def forbidden(*a, **kw):
         raise AssertionError('client created')
     assert main(['--inspect', 'RHAI-1'] + extra, environ={}, jira_factory=forbidden, stdout=io.StringIO()) == 1
+
+
+# The selector alone must not enable writes, construct clients or create a journal.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+def test_environment_selection_keeps_cli_preview_read_only(tmp_path, environment):
+    from lib.gap_notifications.notify_tools import jira_target
+    constructed = []
+    def forbidden(*a, **kw):
+        constructed.append(True)
+        raise AssertionError('client construction')
+    out = io.StringIO()
+    obs = observation(environment=jira_target(environment).scope)
+    result = main(args(tmp_path, [obs]), environ={'GAP_JIRA_ENVIRONMENT': environment},
+                  jira_factory=forbidden, slack_factory=forbidden, stdout=out)
+    assert result == 0 and json.loads(out.getvalue())['dry_run'] is True
+    assert not constructed and not (tmp_path / 'ledger.json').exists()
+
+
+# Unknown values, foreign observations and stale journals must fail before either factory.
+@pytest.mark.parametrize('problem', ['typo', 'empty', 'foreign-observation', 'old-journal', 'url', 'issue-type'])
+def test_invalid_environment_configuration_fails_before_clients(tmp_path, problem):
+    from lib.gap_notifications.notify_tools import jira_target
+    obs = observation(environment=jira_target('production').scope)
+    env = {'GAP_JIRA_ENVIRONMENT': 'production', 'JIRA_USER_EMAIL': 'dummy@example.test',
+           'JIRA_API_TOKEN': 'dummy', 'SLACK_TOKEN': 'dummy'}
+    if problem in {'typo', 'empty'}: env['GAP_JIRA_ENVIRONMENT'] = 'typo' if problem == 'typo' else ''
+    if problem == 'foreign-observation': obs = observation()
+    values = args(tmp_path, [obs]) + ['--write']
+    if problem == 'old-journal':
+        (tmp_path / 'ledger.json').write_text(json.dumps({'schema': 2, 'trial_id': 'default'}))
+    if problem == 'url': values += ['--jira-url', 'https://stage-redhat.atlassian.net']
+    if problem == 'issue-type': values += ['--issue-type', '10016']
+    constructed = []
+    def forbidden(*a, **kw):
+        constructed.append(True)
+        raise AssertionError('client construction')
+    assert main(values, environ=env, jira_factory=forbidden, slack_factory=forbidden, stdout=io.StringIO()) == 1
+    assert not constructed
+
+
+# Explicit production write and inspect must use the same target, with no Slack access on inspect.
+def test_production_cli_write_then_read_only_inspect(tmp_path):
+    from gap_notification_fakes import Jira, Slack
+    from lib.gap_notifications.notify_tools import jira_target
+    target = jira_target('production')
+    jira, slack = Jira(), Slack()
+    jira.base_url = target.url
+    env = {'GAP_JIRA_ENVIRONMENT': 'production', 'JIRA_USER_EMAIL': 'dummy@example.test',
+           'JIRA_API_TOKEN': 'dummy', 'SLACK_TOKEN': 'dummy'}
+    def factory(*a, **kw):
+        assert a[:3] == (target.url, 'RHAI', 'Bug') and kw == target.options
+        return jira
+    values = args(tmp_path, [observation(environment=target.scope)]) + ['--write']
+    assert main(values, environ=env, jira_factory=factory, slack_factory=lambda *a: slack, stdout=io.StringIO()) == 0
+    assert len(slack.calls) == 1 and jira.properties['RHAI-1']['scope'] == target.scope
+    env.pop('SLACK_TOKEN')
+    def forbidden(*a): raise AssertionError('inspect must not construct Slack')
+    out = io.StringIO()
+    assert main(['--inspect', 'RHAI-1'], environ=env, jira_factory=factory, slack_factory=forbidden, stdout=out) == 0
+    report = json.loads(out.getvalue())
+    assert report['property'] == 'valid' and report['scope'] == target.scope
+    assert report['metadata_url'].startswith(target.url + '/') and len(slack.calls) == 1

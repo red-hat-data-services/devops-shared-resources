@@ -1,6 +1,6 @@
 """GAP service facades, bounded issue content and pure managed ADF sections.
 
-JiraNotifier enforces staging origin/project/Bug scope, atomic initial properties,
+JiraNotifier enforces explicitly selected origin/project/Bug scope, atomic initial properties,
 restricted content and stronger readbacks; completed issues are not reopened or
 content-edited. SlackNotifier preserves explicit-channel sends and mutable
 configuration; its callers own the fixed staging-channel policy. Generic Jira,
@@ -41,6 +41,29 @@ from importlib.resources import files
 from jinja2 import Environment, StrictUndefined
 
 
+@dataclass(frozen=True)
+class JiraTarget:
+    """Allowlisted destination; evidence never selects credentials or routing."""
+    name: str
+    url: str
+    scope: str
+    banner: str
+
+    @property
+    def options(self):
+        # Preserve the default call shape for existing injected staging factories.
+        return {} if self.name == "stage" else {"jira_environment": self.name}
+
+
+def jira_target(name="stage"):
+    """Resolve an explicit selector without reading environment variables or secrets."""
+    if not isinstance(name, str) or name not in {"stage", "production"}:
+        raise ValueError("Jira environment must be stage or production")
+    host = "stage-redhat.atlassian.net" if name == "stage" else "redhat.atlassian.net"
+    return JiraTarget(name, "https://" + host, host + "/RHAI/C0883L8FARE",
+                      "GAP STAGING TEST" if name == "stage" else "GAP PRODUCTION")
+
+
 STAGING_JIRA_ORIGIN = "https://stage-redhat.atlassian.net"
 STAGING_JIRA_PROJECT = "RHAI"
 STAGING_JIRA_ISSUE_TYPE_BUG = "Bug"
@@ -75,10 +98,12 @@ class JiraNotifier:
     session: Any = None
     timeout: int = 20
 
+    jira_environment: str = "stage"
+
     def __post_init__(self) -> None:
-        self.base_url = self._normalize_base_url(self.base_url)
+        self.base_url = self._normalize_base_url(self.base_url, jira_environment=self.jira_environment)
         self._validate_project(self.project)
-        self._validate_issue_type(self.issue_type)
+        self._validate_issue_type(self.issue_type, jira_environment=self.jira_environment)
         self._validate_credential(self.email, "email")
         self._validate_credential(self.token, "token")
         self._validate_timeout(self.timeout)
@@ -88,7 +113,8 @@ class JiraNotifier:
     def _client(self):
         # Public session/auth/timeout fields were mutable in the original facade.
         # Derive a lightweight delegate from current values, not stale copies.
-        return JiraClient(self._normalize_base_url(self.base_url), self.email, self.token,
+        self._validate_issue_type(self.issue_type, jira_environment=self.jira_environment)
+        return JiraClient(self._normalize_base_url(self.base_url, jira_environment=self.jira_environment), self.email, self.token,
                           session=self.session, timeout=self.timeout)
 
     @staticmethod
@@ -107,12 +133,17 @@ class JiraNotifier:
             raise ValueError("project must be RHAI")
 
     @staticmethod
-    def _validate_issue_type(issue_type: Any) -> None:
-        if issue_type not in {STAGING_JIRA_ISSUE_TYPE_BUG, STAGING_JIRA_ISSUE_TYPE_ID}:
-            raise ValueError("issue_type must be Bug or 10016")
+    def _validate_issue_type(issue_type: Any, *, jira_environment="stage") -> None:
+        target = jira_target(jira_environment)
+        allowed = {STAGING_JIRA_ISSUE_TYPE_BUG}
+        if target.name == "stage":
+            allowed.add(STAGING_JIRA_ISSUE_TYPE_ID)
+        if issue_type not in allowed:
+            raise ValueError("issue_type must be Bug; only staging also accepts 10016")
 
     @staticmethod
-    def _normalize_base_url(base_url: Any) -> str:
+    def _normalize_base_url(base_url: Any, *, jira_environment="stage") -> str:
+        target = jira_target(jira_environment)
         if not isinstance(base_url, str) or not base_url.strip():
             raise ValueError("base_url must be a non-empty string")
         split = urlsplit(base_url.strip())
@@ -120,15 +151,15 @@ class JiraNotifier:
             raise ValueError("base_url must use https")
         if split.username or split.password:
             raise ValueError("base_url must not include credentials")
-        if split.hostname != "stage-redhat.atlassian.net":
-            raise ValueError("base_url must target the staging Jira origin")
+        if split.hostname != urlsplit(target.url).hostname:
+            raise ValueError("base_url must match the selected Jira environment")
         if split.port is not None:
             raise ValueError("base_url must not include a port")
         if split.query or split.fragment:
             raise ValueError("base_url must not include query or fragment components")
         if split.path not in {"", "/"}:
             raise ValueError("base_url must not include a path")
-        return STAGING_JIRA_ORIGIN
+        return target.url
 
     @staticmethod
     def _issue_key(key: Any) -> str:
@@ -633,8 +664,8 @@ def _slack_link(value, label):
     return f"<{url}|{label}>"
 
 
-def slack_message(observation, *, jira_url, reply=False):
-    """Render a staging notification without clients, lookups or delivery-state changes.
+def slack_message(observation, *, jira_url, reply=False, jira_environment="stage"):
+    """Render an explicitly scoped notification without clients, lookups or delivery-state changes.
 
     Only selected evidence is displayed; this is not a general secret scrubber.
     Existing roots/receipts, not message content, determine threading and replay.
@@ -647,7 +678,9 @@ def slack_message(observation, *, jira_url, reply=False):
     if status not in {"failure", "success"}:
         raise ValueError("Slack notifications require a definitive outcome")
     heading = success[category] if status == "success" else ("Failure update" if reply else failure[category])
-    lines = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading} — staging test*"]
+    target = jira_target(jira_environment)
+    destination = "staging test" if target.name == "stage" else "production Jira"
+    lines = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading} — {destination}*"]
     if category == "build":
         lines.append(f"*Component:* `{_slack_text(observation.get('component'))}`")
     if not reply:
@@ -686,7 +719,8 @@ def slack_message(observation, *, jira_url, reply=False):
         pass
     lines.extend(["", " · ".join(provenance)])
     if status == "success":
-        lines.append("Staging result only; does not establish production recovery.")
+        lines.append("Staging result only; does not establish production recovery." if target.name == "stage"
+                     else "Reported component outcome only; not a claim that the whole promotion is healthy.")
     return "\n".join(lines)
 
 
@@ -720,13 +754,18 @@ def category_labels(category):
             "feasibility": ["gap-sync-failure", "gap-feasibility-failure"]}[category]
 
 
-def render_markdown(observation, *, discussion_url=None, metadata_url=None):
+def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
+    target = jira_target(jira_environment)
     e = observation["evidence"]
     run = e.get("selected-run") or {}
     creator = e.get("creator-outcome") or {}
     context = {key: literal(observation.get(key)) for key in (
         "repository", "category", "source_branch", "destination_branch", "component", "pipeline", "observation_id")}
-    context.update(pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
+    context.update(notification_heading=target.banner,
+                   destination_notice=("Staging notification only. This does not establish production failure or recovery."
+                                       if target.name == "stage" else
+                                       "Production Jira destination. Outcomes reflect only the explicitly supplied evidence."),
+                   pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
                    synthetic=literal(e.get("synthetic")), historical=literal(e.get("historical_snapshot")),
@@ -753,8 +792,9 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None):
     return rendered
 
 
-def description(observation, *, discussion_url=None, metadata_url=None):
-    return markdown_to_adf(render_markdown(observation, discussion_url=discussion_url, metadata_url=metadata_url))
+def description(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
+    return markdown_to_adf(render_markdown(observation, discussion_url=discussion_url, metadata_url=metadata_url,
+                                         **jira_target(jira_environment).options))
 
 
 SLACK_ORIGIN = "https://redhat-internal.slack.com"
@@ -772,7 +812,7 @@ def section(url, *, metadata=False):
     return [heading, {"type": "paragraph", "content": content}]
 
 
-def _managed_indices(body, *, metadata=False):
+def _managed_indices(body, *, metadata=False, jira_environment="stage"):
     if not isinstance(body, dict) or body.get("type") != "doc" or not isinstance(body.get("content"), list):
         raise ValueError("description unavailable")
     nodes = body["content"]
@@ -787,7 +827,7 @@ def _managed_indices(body, *, metadata=False):
         paragraph = nodes[i + 1]
         try:
             url = paragraph["content"][0]["marks"][0]["attrs"]["href"]
-            pattern = (r"https://stage-redhat\.atlassian\.net/rest/api/3/issue/RHAI-[1-9][0-9]*/properties/gap\.notification\.v1"
+            pattern = (re.escape(jira_target(jira_environment).url) + r"/rest/api/3/issue/RHAI-[1-9][0-9]*/properties/gap\.notification\.v1"
                        if metadata else re.escape(SLACK_ORIGIN) + r"/archives/C0883L8FARE/p[0-9]+")
             if not re.fullmatch(pattern, url) or paragraph != section(url, metadata=metadata)[1]:
                 raise ValueError("edited discussion section")
@@ -796,13 +836,13 @@ def _managed_indices(body, *, metadata=False):
     return indices
 
 
-def project_body(body, url, *, metadata=None):
+def project_body(body, url, *, metadata=None, jira_environment="stage"):
     updated = copy.deepcopy(body)
     # Plan both sections before returning any mutation; edits/duplicates fail closed.
     for value, is_metadata in ((url, False), (metadata, True)):
         if value is None:
             continue
-        indices = _managed_indices(updated, metadata=is_metadata)
+        indices = _managed_indices(updated, metadata=is_metadata, **jira_target(jira_environment).options)
         nodes = section(value, metadata=is_metadata)
         if indices:
             updated["content"][indices[0]:indices[0] + 2] = nodes
@@ -812,9 +852,9 @@ def project_body(body, url, *, metadata=None):
     return updated
 
 
-def visible_link_status(body, url, *, metadata=False):
+def visible_link_status(body, url, *, metadata=False, jira_environment="stage"):
     try:
-        indices = _managed_indices(body, metadata=metadata)
+        indices = _managed_indices(body, metadata=metadata, **jira_target(jira_environment).options)
         if not indices:
             return "missing"
         return "match" if body["content"][indices[0] + 1] == section(url, metadata=metadata)[1] else "mismatch"
