@@ -992,11 +992,12 @@ def test_slack_template_layout(category, status, reply, environment, synthetic):
         expected.append(f"*Build {'failed' if status == 'failure' else 'completed'} at:* Unavailable")
     expected.append("*Reported reason:* `A useful reason`")
     if category == "feasibility" and not reply:
-        expected.extend(["", "*Main-to-release feasibility:* Dry-runs the normal sync from the current source branch "
-                         "(usually `main`) to configured active release branches. It does not test the proposed "
-                         "stable PR contents or push changes."])
+        explanation = ('This job dry-runs the normal sync from the current configured source branch to configured '
+                       'active release branches (It does not test the proposed stable PR contents or actually push changes).')
         if status == "failure":
-            expected.append("Inspect the feasibility job for merge conflicts or configuration/workflow errors.")
+            explanation = ('The main to release feasibility job has failed. ' + explanation
+                           + ' Please inspect the feasibility job for merge conflicts or configuration/workflow errors.')
+        expected.extend(["", "*Main-to-release feasibility:* " + explanation])
     expected.extend(["", f"<{JIRA}|Jira RHAI-177>"])
     if synthetic:
         expected.extend(["", "Synthetic evidence"])
@@ -1006,6 +1007,24 @@ def test_slack_template_layout(category, status, reply, environment, synthetic):
     assert slack_message(observation(category=category, status=status,
                          evidence={"reason": "A useful reason", "synthetic": synthetic}),
                          jira_url=JIRA, reply=reply, jira_environment=environment) == "\n".join(expected)
+
+
+# Failure roots share the user's Jira paragraph verbatim; recovery does not report failure.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+def test_slack_feasibility_wording_matches_jira(environment):
+    obs = observation(category='feasibility')
+    markdown = render_markdown(obs, jira_environment=environment)
+    jira_paragraph = next(line for line in markdown.splitlines()
+                          if line.startswith('The main to release feasibility job has failed.'))
+    failure = slack_message(obs, jira_url=JIRA, jira_environment=environment)
+    assert '*Main-to-release feasibility:* ' + jira_paragraph in failure
+    assert 'usually' not in failure
+    recovery = slack_message(dict(obs, status='success'), jira_url=JIRA, jira_environment=environment)
+    assert 'This job dry-runs the normal sync from the current configured source branch' in recovery
+    assert 'has failed' not in recovery and 'Please inspect' not in recovery
+    for status in ('failure', 'success'):
+        reply = slack_message(dict(obs, status=status), jira_url=JIRA, reply=True, jira_environment=environment)
+        assert 'This job dry-runs' not in reply
 
 
 # Template expressions supplied as evidence remain literal, never a second rendering pass.

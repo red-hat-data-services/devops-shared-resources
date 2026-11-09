@@ -87,12 +87,14 @@ validation, truncation and escaping. Template changes do not change delivery,
 threading or replay identity. Both templates are included by the existing
 `templates/*.md.j2` package-data rule.
 
-Feasibility root messages explain that the check dry-runs the normal sync from the
-current source branch (usually `main`) to configured active release branches,
-without testing the proposed stable PR contents or pushing changes. Failed roots
-point readers to the feasibility job for merge conflicts or configuration/workflow errors;
-a failed feasibility result alone does not prove a merge conflict. Threaded updates
-omit this explanation to avoid repeating root context.
+Feasibility failure roots reuse the Jira feasibility paragraph, explaining that
+the job dry-runs the normal sync from the current configured source branch to
+configured active release branches, without testing the proposed stable PR contents
+or pushing changes. They point readers to the feasibility job for merge conflicts
+or configuration/workflow errors; a failed result alone does not prove a merge
+conflict. Success roots retain only the neutral explanation, not failure claims or
+failure-specific guidance. Threaded updates omit this explanation to avoid repeating
+root context.
 
 Jira descriptions use the packaged `lib/gap_notifications/templates/issue.md.j2`
 with Jinja2 StrictUndefined, independent of the current directory. Feasibility
