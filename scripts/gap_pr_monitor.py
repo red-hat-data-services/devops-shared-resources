@@ -63,6 +63,7 @@ from lib.gap_promotion_gates import (
     strip_legacy_overall_status,
     waiting_for_early_gate,
 )
+from lib.early_gate_generation import early_gate_generation, has_child_sha_tracking
 from lib.gap_check_selection import (
     FeasibilityRun,
     TriggerParseError,
@@ -138,9 +139,10 @@ BATCH_FAILURE_CHILD_PENDING_DESCRIPTION = (
 WAITING_FOR_EARLY_GATE_DESCRIPTION = (
     "GAP: waiting for Early Gate (auto-merge held)"
 )
-# PaC on-comment in gated-artifacts-promoter: ^/early-gate(-build)?$
 EARLY_GATE_COMMENT_BODY = "/early-gate"
-EARLY_GATE_COMMENT_RE = re.compile(r"^/early-gate(-build)?\s*$")
+EARLY_GATE_COMMENT_RE = re.compile(
+    r"^/early-gate(-build)?(?:\s+GAP_GENERATION=[0-9a-f]{64})?\s*$"
+)
 # overall-status values that allow Leader green (final).
 FINAL_OVERALL_STATUSES = frozenset(
     {OVERALL_STATUS_SUCCESS, OVERALL_STATUS_FAILURE}
@@ -614,6 +616,7 @@ def provisional_payload_with_updates(
 def early_gate_comment_already_present(
     leader_pr_url: str,
     *,
+    generation: str | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
     """True when the Leader already has an Early Gate trigger comment."""
@@ -637,7 +640,12 @@ def early_gate_comment_already_present(
         if not isinstance(comment, dict):
             continue
         body = str(comment.get("body") or "").strip()
-        if EARLY_GATE_COMMENT_RE.match(body):
+        match = EARLY_GATE_COMMENT_RE.match(body)
+        if not match:
+            continue
+        if generation is None:
+            return True
+        if re.search(rf"\bGAP_GENERATION={re.escape(generation)}\b", body):
             return True
     return False
 
@@ -647,6 +655,7 @@ def post_early_gate_trigger_comment(
     *,
     dry_run: bool = False,
     allow_repeat: bool = False,
+    generation: str | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
     """Comment ``/early-gate`` on the Leader once (RHAI-10942).
@@ -655,13 +664,18 @@ def post_early_gate_trigger_comment(
     Idempotent: skips if a matching comment already exists.
     """
     run = gh_runner or _run_gh
+    body = (
+        f"{EARLY_GATE_COMMENT_BODY} GAP_GENERATION={generation}"
+        if generation
+        else EARLY_GATE_COMMENT_BODY
+    )
     if not allow_repeat and early_gate_comment_already_present(
-        leader_pr_url, gh_runner=run
+        leader_pr_url, generation=generation, gh_runner=run
     ):
         return False
     if dry_run:
         print(
-            f"[dry-run] would comment {EARLY_GATE_COMMENT_BODY!r} on {leader_pr_url}"
+            f"[dry-run] would comment {body!r} on {leader_pr_url}"
         )
         return True
     ref = parse_pr_url(leader_pr_url)
@@ -673,7 +687,7 @@ def post_early_gate_trigger_comment(
             "-R",
             f"{ref.owner}/{ref.repo}",
             "--body",
-            EARLY_GATE_COMMENT_BODY,
+            body,
         ]
     )
     return True
@@ -1545,15 +1559,24 @@ def run_monitor_publish_and_signal(
 
     if early_gate and leader_url:
         try:
-            early_gate_comment_posted = post_early_gate_trigger_comment(
-                leader_url,
-                dry_run=dry_run,
-                allow_repeat=(
-                    result.child_head_changed
-                    or previous_component_build_status != GATE_STATUS_SUCCESS
-                ),
-                gh_runner=gh_runner,
-            )
+            generation = early_gate_generation(state_payload)
+            if generation is None and has_child_sha_tracking(state_payload):
+                print(
+                    "WARNING: child head-SHA state is incomplete; skipped "
+                    "Early Gate trigger until every child SHA is known.",
+                    file=sys.stderr,
+                )
+            else:
+                early_gate_comment_posted = post_early_gate_trigger_comment(
+                    leader_url,
+                    dry_run=dry_run,
+                    generation=generation,
+                    allow_repeat=(
+                        result.child_head_changed
+                        or previous_component_build_status != GATE_STATUS_SUCCESS
+                    ),
+                    gh_runner=gh_runner,
+                )
         except (GhCommandError, ValueError, RuntimeError) as exc:
             raise GapPrMonitorError(
                 f"Failed to post Early Gate trigger comment on {leader_url}: {exc}"

@@ -36,6 +36,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from lib.leader_lifecycle import retired_outcome
 from lib.leader_history import history_state_outcome, is_history_state
+from lib.early_gate_generation import early_gate_generation, has_child_sha_tracking
 
 from lib.gap_promotion_gates import (
     GATE_COMPONENT_BUILDS,
@@ -100,6 +101,7 @@ EARLY_GATE_JOB_COMPLETE_MARKER = "early-gate-job-complete"
 # Default Early Gate reporting identity (override via GAP_EG_TRUSTED_AUTHORS).
 DEFAULT_TRUSTED_EG_AUTHORS = frozenset({"rhods-ci-bot"})
 ENV_TRUSTED_AUTHORS = "GAP_EG_TRUSTED_AUTHORS"
+EARLY_GATE_GENERATION_RE = re.compile(r"\bGAP_GENERATION=([0-9a-f]{64})\b")
 
 # Visible headlines / Status row — build comments (early-gate-build-complete).
 _BUILD_PASSED_PATTERNS = (
@@ -281,6 +283,7 @@ def select_latest_early_gate_outcome(
     *,
     trusted_authors: frozenset[str] | None = None,
     gate: str = GATE_EARLY_GATE_BUILD,
+    generation: str | None = None,
 ) -> EarlyGateCommentOutcome | None:
     """Pick the latest trusted comment for one EG gate (build or test)."""
     allowed = (
@@ -302,6 +305,10 @@ def select_latest_early_gate_outcome(
         if not is_trusted_early_gate_author(login, trusted=allowed):
             continue
         body = str(comment.get("body") or "")
+        if generation is not None:
+            match = EARLY_GATE_GENERATION_RE.search(body)
+            if match is None or match.group(1) != generation:
+                continue
         outcome = parse(body)
         if outcome is None:
             continue
@@ -332,16 +339,22 @@ def resolve_eg_gate_status(
     comments: Sequence[dict[str, Any]],
     labels: Sequence[str],
     trusted_authors: frozenset[str] | None = None,
+    generation: str | None = None,
 ) -> tuple[str | None, str]:
     """Resolve one EG gate from comments (preferred) or Leader labels."""
     selected = select_latest_early_gate_outcome(
-        comments, trusted_authors=trusted_authors, gate=gate
+        comments,
+        trusted_authors=trusted_authors,
+        gate=gate,
+        generation=generation,
     )
     if selected is not None:
         return (
             selected.overall_status,
             f"comment id={selected.comment_id} author={selected.author}",
         )
+    if generation is not None:
+        return None, "no trusted terminal comment for current child generation"
     if gate == GATE_EARLY_GATE_BUILD:
         from_labels = gate_status_from_labels(
             labels,
@@ -491,6 +504,9 @@ def decide_overall_from_comments(
     migrate_legacy_overall_status(working)
 
     builds = get_gate_status(working, GATE_COMPONENT_BUILDS)
+    generation = early_gate_generation(working)
+    if generation is None and has_child_sha_tracking(working):
+        generation = ""
     current_snap = {
         GATE_EARLY_GATE_BUILD: get_gate_status(working, GATE_EARLY_GATE_BUILD),
         GATE_EARLY_GATE_TEST: get_gate_status(working, GATE_EARLY_GATE_TEST),
@@ -531,12 +547,14 @@ def decide_overall_from_comments(
         comments=comments,
         labels=label_list,
         trusted_authors=trusted_authors,
+        generation=generation,
     )
     test_status, test_src = resolve_eg_gate_status(
         gate=GATE_EARLY_GATE_TEST,
         comments=comments,
         labels=label_list,
         trusted_authors=trusted_authors,
+        generation=generation,
     )
     if build_status is not None:
         set_gate_status(working, GATE_EARLY_GATE_BUILD, build_status)

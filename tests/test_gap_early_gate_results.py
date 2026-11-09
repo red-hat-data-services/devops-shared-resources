@@ -30,7 +30,19 @@ def _bot_comment(
     cid: int = 1,
     created: str = "2026-10-29T12:00:00Z",
     login: str = "rhods-ci-bot",
+    generation: str | None = None,
 ) -> dict[str, Any]:
+    token = generation or DEFAULT_TEST_GENERATION
+    if "GAP_GENERATION=" not in body:
+        body = body.replace(
+            "<!-- early-gate-build-complete",
+            f"<!-- early-gate-build-complete GAP_GENERATION={token}",
+            1,
+        ).replace(
+            "<!-- early-gate-job-complete",
+            f"<!-- early-gate-job-complete GAP_GENERATION={token}",
+            1,
+        )
     return {
         "id": cid,
         "created_at": created,
@@ -197,6 +209,18 @@ def _state(tmp_path: Path, *, overall: str | None, trigger: str = "gap-egtest01"
     path = folder / "state.json"
     path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+DEFAULT_TEST_GENERATION = eg.early_gate_generation(
+    {
+        "pull-requests": [
+            {
+                "pr-url": "https://github.com/example/kserve-branch/pull/1",
+                "head-sha": "b" * 40,
+            }
+        ]
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -668,6 +692,100 @@ def test_run_applies_success_without_publish(
     assert gates["early-gate-test"] == "success"
 
 
+def test_run_ignores_terminal_results_from_old_child_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _state(tmp_path, overall="early-gate-triggered")
+    payload = json.loads(path.read_text())
+    payload["pull-requests"][0]["head-sha"] = "a" * 40
+    path.write_text(json.dumps(payload))
+    current = eg.early_gate_generation(payload)
+    stale = "b" * 64
+    comments = [
+        _bot_comment(
+            PASSED_BARE_MARKER.replace(
+                "<!-- early-gate-build-complete -->",
+                f"<!-- early-gate-build-complete\nGAP_GENERATION={stale}\n-->",
+            ),
+            cid=10,
+        ),
+        _bot_comment(
+            TESTS_PASSED.replace(
+                "<!-- early-gate-job-complete",
+                f"<!-- early-gate-job-complete GAP_GENERATION={stale}",
+            ),
+            cid=11,
+        ),
+        _bot_comment(
+            PASSED_BARE_MARKER.replace(
+                "<!-- early-gate-build-complete -->",
+                f"<!-- early-gate-build-complete\nGAP_GENERATION={current}\n-->",
+            ),
+            cid=12,
+        ),
+    ]
+    monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: comments)
+
+    result = eg.run_early_gate_results(
+        repo_root=tmp_path,
+        leader_pr_url="https://github.com/acme/gap/pull/9",
+        trigger_id="gap-egtest01",
+        labels=[eg.LABEL_EG_TEST_SUCCESS],
+        publish=False,
+    )
+
+    assert result.applied is False
+    assert result.eg_build_status == "success"
+    assert result.eg_test_status is None
+    saved = json.loads(path.read_text())
+    gates = {g["id"]: g["status"] for g in saved["promotion-gates"]}
+    assert gates["early-gate-build"] == "success"
+    assert gates["early-gate-test"] == "pending"
+
+
+def test_generation_scopes_latest_terminal_comment() -> None:
+    expected = "a" * 64
+    comments = [
+        _bot_comment(
+            PASSED_BARE_MARKER.replace(
+                "<!-- early-gate-build-complete -->",
+                f"<!-- early-gate-build-complete\nGAP_GENERATION={expected}\n-->",
+            ),
+            cid=1,
+        ),
+        _bot_comment(FAILED_BARE_MARKER, cid=2),
+    ]
+
+    selected = eg.select_latest_early_gate_outcome(
+        comments, generation=expected
+    )
+
+    assert selected is not None
+    assert selected.overall_status == "success"
+
+
+def test_partial_head_sha_state_does_not_fall_back_to_labels(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _state(tmp_path, overall="early-gate-triggered")
+    payload = json.loads(path.read_text())
+    payload["pull-requests"][0]["head-sha"] = "not-a-full-sha"
+    path.write_text(json.dumps(payload))
+    monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: [])
+
+    result = eg.run_early_gate_results(
+        repo_root=tmp_path,
+        leader_pr_url="https://github.com/acme/gap/pull/9",
+        trigger_id="gap-egtest01",
+        labels=[eg.LABEL_EG_BUILD_SUCCESS, eg.LABEL_EG_TEST_SUCCESS],
+        publish=False,
+    )
+
+    assert result.applied is False
+    assert result.eg_build_status is None
+    assert result.eg_test_status is None
+
+
 def test_run_applies_failure_without_publish(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -955,6 +1073,7 @@ def test_run_publish_eg_failure_fails_build_ok_children(
             },
             {
                 "repo": "bad",
+                "head-sha": "c" * 40,
                 "pr-url": "https://github.com/ex/bad/pull/2",
                 "pr-status": "build-failure",
                 "builds": [],
@@ -962,6 +1081,7 @@ def test_run_publish_eg_failure_fails_build_ok_children(
         ],
     }
     (folder / "state.json").write_text(json.dumps(payload) + "\n", encoding="utf-8")
+    generation = eg.early_gate_generation(payload)
     holder: dict[str, _RecordingUpdater] = {}
 
     def factory(**kwargs: Any) -> _RecordingUpdater:
@@ -971,7 +1091,10 @@ def test_run_publish_eg_failure_fails_build_ok_children(
     monkeypatch.setattr(
         eg,
         "list_leader_pr_comments",
-        lambda *a, **k: [_bot_comment(FAILED_BARE_MARKER), _bot_comment(TESTS_FAILED)],
+        lambda *a, **k: [
+            _bot_comment(FAILED_BARE_MARKER, generation=generation),
+            _bot_comment(TESTS_FAILED, generation=generation),
+        ],
     )
     monkeypatch.setattr(eg, "checkout_leader_branch", lambda *a, **k: None)
     monkeypatch.setattr(
