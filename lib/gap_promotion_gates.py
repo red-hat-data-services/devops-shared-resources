@@ -5,16 +5,9 @@
 that still want a single string (logs / MonitorResult) should use
 ``derive_legacy_overall_status`` — do not write it back.
 
-Phase-1 defaults:
-  - ``component-builds`` required=True
-  - ``early-gate-build`` / ``early-gate-test`` required=False (failure still
-    allows child green once EG has *concluded*; flip ``required`` later to
-    demand EG *success* before green)
-
-Child green policy:
-  - builds failure → green good children (no EG)
-  - builds success → wait for EG to conclude, then green with an EG note
-  - EG build failure ⇒ EG pair done (do not wait for a test that never runs)
+Child approval requires successful component builds and Early Gate build/tests.
+Failed batches remain active until replaced by a verified newer Leader.
+The persisted required flags are retained for compatibility.
 """
 
 from __future__ import annotations
@@ -203,33 +196,12 @@ def mark_eg_test_skipped_after_build_failure(payload: dict[str, Any]) -> bool:
 
 
 def children_ready_for_success_status(payload: dict[str, Any]) -> bool:
-    """True when passing children may receive GitHub ``success`` (auto-merge).
-
-    - ``component-builds`` failure → ready (green good kids; no EG).
-    - ``component-builds`` success → ready only after EG has concluded.
-    - Phase-1 (EG ``required: false``): EG failure still greens children once
-      concluded, so the check can carry a short EG status note.
-    - If either EG gate is ``required: true``, EG pair must be *success*
-      before children green (future mandate).
-    """
+    """Approve children only after the batch and Early Gate build/tests pass."""
     if retired_outcome(payload):
         return False
     ensure_promotion_gates(payload)
-    builds = get_gate_status(payload, GATE_COMPONENT_BUILDS)
-    if builds == GATE_STATUS_PENDING:
-        return False
-    if builds == GATE_STATUS_FAILURE:
-        return True
-    # builds == success → wait for Early Gate.
-    if not early_gate_concluded(payload):
-        return False
-    mark_eg_test_skipped_after_build_failure(payload)
-    eg_required = get_gate_required(payload, GATE_EARLY_GATE_BUILD) or get_gate_required(
-        payload, GATE_EARLY_GATE_TEST
-    )
-    if eg_required:
-        return early_gate_pair_overall(payload) == GATE_STATUS_SUCCESS
-    return True
+    return (get_gate_status(payload, GATE_COMPONENT_BUILDS) == GATE_STATUS_SUCCESS
+            and early_gate_pair_overall(payload) == GATE_STATUS_SUCCESS)
 
 
 def should_trigger_early_gate(payload: dict[str, Any]) -> bool:
@@ -241,8 +213,9 @@ def should_trigger_early_gate(payload: dict[str, Any]) -> bool:
 
 
 def should_green_leader_for_build_failure(payload: dict[str, Any]) -> bool:
-    """Stage-1 Leader green (RHAI-8079) when required builds failed (no EG)."""
-    return get_gate_status(payload, GATE_COMPONENT_BUILDS) == GATE_STATUS_FAILURE
+    """A failed batch must wait for replacement rather than authorizing its merge."""
+    # Failure stays active until a verified newer Leader replaces this batch.
+    return False
 
 
 def waiting_for_early_gate(payload: dict[str, Any]) -> bool:

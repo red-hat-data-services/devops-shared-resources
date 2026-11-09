@@ -133,35 +133,59 @@ def test_multi_leader_write_preflight(tmp_path, monkeypatch, count, mode, expect
     assert configs == [expected] * count
 
 
-# Optional notifications execute after either Leader signal and before summary even on errors.
-@pytest.mark.parametrize('signal', ['early', 'conclusion'])
+# Notifications follow applicable signals; retained failures never emit a Leader conclusion.
+# A synthetic relocated publisher result also guards against loading the obsolete active path.
+@pytest.mark.parametrize('signal', ['early', 'retained-failure'])
 @pytest.mark.parametrize('broken', [False, True])
-def test_hook_after_leader_signal(tmp_path, monkeypatch, signal, broken):
-    from types import SimpleNamespace
+@pytest.mark.parametrize('relocated', [False, True])
+def test_hook_after_publish_and_applicable_signal(tmp_path, monkeypatch, signal, broken, relocated):
     from scripts import gap_pr_monitor as monitor
     from lib.gap_notifications.monitor_hook import NotificationConfig
     path = tmp_path / 'state.json'
-    monitor.save_state(path, state(expected_components=['api'], runs=[run('api', 'failure')]))
-    result = monitor.MonitorResult(path, [], [], [], [], False)
+    payload = state(expected_components=['api'], runs=[run('api', 'failure')])
+    monitor.save_state(path, payload)
+    accepted = (payload['pull-requests'][0]['pr-url'],)
+    result = monitor.MonitorResult(path, [], [], [], [], False, notification_urls=accepted)
     monkeypatch.setattr(monitor, 'run_monitor', lambda *a, **kw: result)
     order = []
-    monkeypatch.setattr(monitor, 'publish_state', lambda *a, **kw: order.append('publish') or monitor.PublishResult('b' * 40, True))
+    signal_shas = []
+    published_path = tmp_path / 'GAP History/unsuccessful/fixture/state.json' if relocated else path
+    def publish(*a, **kw):
+        assert kw['archive'] is False  # Actual failed-batch policy remains active.
+        order.append('publish')
+        if relocated:
+            published_path.parent.mkdir(parents=True)
+            published_path.write_bytes(path.read_bytes())
+            path.unlink()
+        return monitor.PublishResult('b' * 40, True, state_path=published_path)
+    monkeypatch.setattr(monitor, 'publish_state', publish)
     monkeypatch.setattr(monitor, 'should_trigger_early_gate', lambda *a: signal == 'early')
     monkeypatch.setattr(monitor, 'early_gate_concluded', lambda *a: False)
-    monkeypatch.setattr(monitor, 'should_green_leader_for_build_failure', lambda *a: signal == 'conclusion')
-    monkeypatch.setattr(monitor, 'verify_leader_head', lambda *a, **kw: None)
-    monkeypatch.setattr(monitor, 'PRStatusUpdater', lambda **kw: object())
-    monkeypatch.setattr(monitor, 'post_early_gate_trigger_comment', lambda *a, **kw: order.append('signal') or True)
-    monkeypatch.setattr(monitor, 'post_leader_conclusion', lambda *a, **kw: order.append('signal') or SimpleNamespace(skipped=False))
-    def notify(*a, **kw):
+    def signal_callback(*a, **kw):
+        signal_shas.append(kw['leader_commit'])
+        assert kw['leader_commit'] == 'b' * 40
+        order.append('signal')
+        return True
+    monkeypatch.setattr(monitor, 'post_early_gate_trigger_comment', signal_callback)
+    def forbidden(*a, **kw):
+        raise AssertionError('retained failure must not conclude/green the Leader')
+    monkeypatch.setattr(monitor, 'post_leader_conclusion', forbidden)
+    def notify(saved, **kw):
+        assert kw['state_path'] == published_path
+        assert saved == monitor.load_state(published_path)
+        assert kw['accepted_urls'] == accepted and kw['published_sha'] == 'b' * 40
+        assert path.exists() is (not relocated)
+        assert signal_shas == ([kw['published_sha']] if signal == 'early' else [])
         order.append('notify')
         if broken:
             raise RuntimeError('fixture')
         return {'status': 'preview'}
     monkeypatch.setattr('lib.gap_notifications.monitor_hook.notify_after_publish', notify)
     monkeypatch.setattr(monitor, '_post_leader_failure_summary', lambda **kw: order.append('summary'))
-    monitor.run_monitor_publish_and_signal(path, repo_root=tmp_path, publish=True, head_ref='leader', leader_pr_url=LEADER_URL, notification_config=NotificationConfig('preview'))
-    assert order == ['publish', 'signal', 'notify', 'summary']
+    output = monitor.run_monitor_publish_and_signal(path, repo_root=tmp_path, publish=True,
+        head_ref='leader', leader_pr_url=LEADER_URL, notification_config=NotificationConfig('preview'))
+    assert output.state_path == published_path and not output.leader_status_posted
+    assert order == ['publish'] + (['signal'] if signal == 'early' else []) + ['notify', 'summary']
 
 
 # A known key or discoverable episode is adopted even before the retry deadline.

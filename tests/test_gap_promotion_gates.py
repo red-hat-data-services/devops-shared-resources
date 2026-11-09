@@ -102,8 +102,8 @@ def test_gate_status_from_labels_prefers_failed() -> None:
     )
 
 
-def test_phase1_children_wait_for_eg_after_builds_success() -> None:
-    """Builds success → hold green until EG concludes; then green even if EG failed."""
+def test_children_remain_blocked_after_eg_failure() -> None:
+    """A finished failure still blocks child approval."""
     from lib.gap_promotion_gates import early_gate_concluded, waiting_for_early_gate
 
     payload: dict = {}
@@ -117,26 +117,26 @@ def test_phase1_children_wait_for_eg_after_builds_success() -> None:
     set_gate_status(payload, GATE_EARLY_GATE_BUILD, GATE_STATUS_SUCCESS)
     set_gate_status(payload, GATE_EARLY_GATE_TEST, GATE_STATUS_FAILURE)
     assert early_gate_concluded(payload) is True
-    assert children_ready_for_success_status(payload) is True
+    assert children_ready_for_success_status(payload) is False
 
 
-def test_children_ready_on_eg_build_failure_without_test() -> None:
+def test_children_blocked_on_eg_build_failure_without_test() -> None:
     from lib.gap_promotion_gates import mark_eg_test_skipped_after_build_failure
 
     payload: dict = {}
     set_gate_status(payload, GATE_COMPONENT_BUILDS, GATE_STATUS_SUCCESS)
     set_gate_status(payload, GATE_EARLY_GATE_BUILD, GATE_STATUS_FAILURE)
-    assert children_ready_for_success_status(payload) is True
-    assert mark_eg_test_skipped_after_build_failure(payload) is False  # already applied
+    assert children_ready_for_success_status(payload) is False
+    assert mark_eg_test_skipped_after_build_failure(payload) is False  # pair evaluation marked it skipped
     assert get_gate_status(payload, GATE_EARLY_GATE_TEST) == GATE_STATUS_FAILURE
 
 
-def test_children_ready_on_build_failure_too() -> None:
+def test_children_and_leader_blocked_on_component_failure() -> None:
     payload: dict = {}
     set_gate_status(payload, GATE_COMPONENT_BUILDS, GATE_STATUS_FAILURE)
-    assert children_ready_for_success_status(payload) is True
+    assert children_ready_for_success_status(payload) is False
     assert should_trigger_early_gate(payload) is False
-    assert should_green_leader_for_build_failure(payload) is True
+    assert should_green_leader_for_build_failure(payload) is False
 
 
 def test_making_eg_required_demands_eg_success() -> None:

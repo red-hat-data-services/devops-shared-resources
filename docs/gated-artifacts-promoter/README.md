@@ -41,45 +41,32 @@ later runs stay on the main→stable PR path.
 
 ## Run history and Leader outcomes
 
-A newer daily run no longer closes an older Leader or deletes its branch.
-The scheduled monitors continue to process open Leaders until each run has a
-terminal outcome. A pending run is not recorded as failed merely because a
-newer run started.
+An active failed Leader remains open so its child builds and Early Gate can be
+retried. Only a verified newer Leader on the same target branch may retire an
+unsuccessful batch. Retirement records the replacement URL and preserves actual
+build/test results; it does not approve child PRs.
 
-Both terminal outcomes use normal GitHub auto-merge to preserve the run record
-in the Leader repository. The exact published head is supplied with
-`--match-head-commit`; repository checks, approvals and merge rules still apply.
-No admin override is used. A blocked merge leaves the PR and branch available.
+Successful Leaders may finalize once component builds and EG build/tests pass.
+Both successful finalization and verified retirement use normal GitHub auto-merge
+with `--match-head-commit`. Repository checks, approvals and merge rules apply.
 
 | Run result | Leader label | Title prefix | State retained |
 | --- | --- | --- | --- |
-| Success | `result-gap-success` | `[GAP passed]` | Original path plus successful-history snapshot |
-| Failure | `result-gap-failure` | `[GAP failed]` | Original path plus unsuccessful-history snapshot |
+| Success | `result-gap-success` | `[GAP passed]` | `GAP History/successful/<run>/state.json` |
+| Replaced failure | `result-gap-failure` | `[GAP failed]` | `GAP History/unsuccessful/<run>/state.json` |
+| Replaced incomplete run | `result-gap-superseded` | `[GAP superseded]` | `GAP History/unsuccessful/<run>/state.json` |
 
-Both outcomes get a history snapshot committed **with** the canonical state update:
+With coordinated `GAP_MOVE_FINAL_STATE=true` deployment, each finalized run has
+one history record and its active `GAP Leaders/<run>/state.json` is removed in
+the same commit. Failed active runs remain under `GAP Leaders` until replacement.
+A Leader's green archival check permits merging its record; the failure title,
+label and saved gate outcomes retain its actual result.
 
-```text
-GAP History/
-  successful/<UTC-date>_<trigger-id>/state.json
-  unsuccessful/<UTC-date>_<trigger-id>/state.json
-```
-
-The canonical `GAP Leaders/<UTC-date>_<trigger-id>/state.json` remains where
-the monitors expect it. Both copies retain the actual `overall-status` and
-individual child statuses/builds. History is outside monitor discovery, so
-snapshots cannot trigger duplicate runs. A future dashboard can read both
-history folders for completed runs and the open Leaders for in-progress runs.
-Count each trigger once; its canonical file and history snapshot are the same run.
-
-The green Leader conclusion check permits merging the **record**, not passing
-the product gate. Existing component checks and the distinction between Early
-Gate success and failure are unchanged. An incomplete run has no history
-snapshot and is not queued for merge by this finalization path.
-
-This change applies to future finalizations. It does not automatically reopen
-or recover previously closed Leader PRs. The Leader repository's GitHub App
-needs label/title write and pull-request auto-merge permissions. If those
-operations fail, the error is surfaced; the run is not silently deleted.
+Legacy failed history copies without retirement metadata resume active monitoring
+on the next publishing pass. Successful and retired archives remain immutable.
+Already merged Leaders are not reopened automatically. The GitHub App requires
+label/title write and pull-request auto-merge permissions; blocked operations
+surface an error and leave the record available for retry.
 
 ## Config
 
@@ -150,3 +137,20 @@ reported separately and does not itself fail a successful PR creation.
 Same-trigger partial retries preserve unattempted child state and observations.
 See [the reporter documentation](../gap-failure-reporter/README.md) for the
 data contract, dashboard columns and recovery behavior.
+
+### Leader finalization and child merge approval
+
+A Leader is successful only after its component builds and Early Gate build/tests
+pass. Failed component or EG checks keep the Leader open for retry and do not
+approve passing siblings for merge. A failure alone never requests Leader
+history auto-merge.
+
+When a genuine newer Leader in the same repository and target branch opens, the
+monitor validates that replacement, records its URL in `leader-lifecycle`, and
+retires the previous batch into `GAP History/unsuccessful`. That merge preserves
+the run record; retirement never approves child PRs. Successful batches move to
+`GAP History/successful` without requiring a replacement.
+
+Legacy failed history copies without a retirement receipt resume active
+monitoring on a publishing monitor pass. A history copy by itself is not evidence
+that a replacement exists. Already merged records remain historical records.

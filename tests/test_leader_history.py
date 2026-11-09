@@ -244,7 +244,7 @@ def test_conclusion_prepares_history_before_the_leader_status(outcome):
             calls.append(["status", url, status, kwargs["head_sha"], kwargs["description"]])
             return "posted"
     assert post_leader_conclusion(LEADER, SHA, overall_status=outcome,
-                                  updater=Updater(), gh_runner=gh) == "posted"
+                                  updater=Updater(), gh_runner=gh, replacement_verified=outcome == "failure") == "posted"
     assert calls[-1] == ["status", LEADER, "completed", SHA, f"GAP: overall {outcome}"]
 
 
@@ -257,7 +257,7 @@ def test_moved_head_cannot_receive_a_leader_green_from_history_finalization():
         def post_status_for_pr(self, *args, **kwargs):
             pytest.fail("Must not green a moved Leader")
     with pytest.raises(RuntimeError, match="head moved"):
-        post_leader_conclusion(LEADER, SHA, overall_status="failure",
+        post_leader_conclusion(LEADER, SHA, overall_status="success",
                               updater=Updater(), gh_runner=lambda args: json.dumps(pull))
 
 

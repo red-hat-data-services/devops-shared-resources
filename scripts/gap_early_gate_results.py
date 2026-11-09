@@ -6,15 +6,13 @@ Also imported as the Early Gate results monitor. After Stage-1 sets
 terminal Leader comments and labels. This script wakes on those labels (or
 comments), reconciles comment history, and updates ``promotion-gates``.
 
-Phase-1 contract (``promotion-gates`` is SoT; ``overall-status`` is not written):
+Merge contract (``promotion-gates`` is the source of truth):
 
-1. Require ``component-builds=success`` (EG was triggered).
-2. Record EG build + test gate statuses from comments (labels as fallback).
-3. When EG has **concluded** (both gates terminal, or EG build failed so
-   tests never run): publish ``promotion-gates``, green the Leader
-   (RHAI-8079), and post ``gated artifacts promoter`` **success** on
-   build-passing children with a short description noting the EG outcome.
-   Stage-1 holds those children pending until this step.
+1. Require successful component builds before triggering Early Gate.
+2. Record EG build and test evidence from trusted comments and labels.
+3. Only passing component builds and EG build/tests approve child merges and
+   successful Leader archival. Failed outcomes remain active for retry until
+   a verified newer Leader retires the batch.
 
 Progress comments and untrusted authors are ignored. A label/comment wake-up
 is only a signal; the script always reconciles current comment + label state
@@ -92,7 +90,7 @@ CHILD_EG_SUCCESS_DESCRIPTION = (
     "GAP: Early Gate build+tests passed — cleared for auto-merge"
 )
 CHILD_EG_FAILURE_DESCRIPTION = (
-    "GAP: Early Gate build/tests failed — phase-1 still cleared for auto-merge"
+    "GAP: Early Gate build/tests failed — merge blocked"
 )
 
 # HTML markers used by rhods-ci-bot terminal EG reports.
@@ -102,6 +100,7 @@ EARLY_GATE_JOB_COMPLETE_MARKER = "early-gate-job-complete"
 # Default Early Gate reporting identity (override via GAP_EG_TRUSTED_AUTHORS).
 DEFAULT_TRUSTED_EG_AUTHORS = frozenset({"rhods-ci-bot"})
 ENV_TRUSTED_AUTHORS = "GAP_EG_TRUSTED_AUTHORS"
+EARLY_GATE_COMMIT_RE = re.compile(r"\bGAP_PR_COMMIT=([0-9a-f]{40})\b")
 
 # Visible headlines / Status row — build comments (early-gate-build-complete).
 _BUILD_PASSED_PATTERNS = (
@@ -283,6 +282,7 @@ def select_latest_early_gate_outcome(
     *,
     trusted_authors: frozenset[str] | None = None,
     gate: str = GATE_EARLY_GATE_BUILD,
+    leader_commit: str | None = None,
 ) -> EarlyGateCommentOutcome | None:
     """Pick the latest trusted comment for one EG gate (build or test)."""
     allowed = (
@@ -304,6 +304,10 @@ def select_latest_early_gate_outcome(
         if not is_trusted_early_gate_author(login, trusted=allowed):
             continue
         body = str(comment.get("body") or "")
+        if leader_commit is not None:
+            match = EARLY_GATE_COMMIT_RE.search(body)
+            if match is None or match.group(1) != leader_commit:
+                continue
         outcome = parse(body)
         if outcome is None:
             continue
@@ -334,16 +338,22 @@ def resolve_eg_gate_status(
     comments: Sequence[dict[str, Any]],
     labels: Sequence[str],
     trusted_authors: frozenset[str] | None = None,
+    leader_commit: str | None = None,
 ) -> tuple[str | None, str]:
     """Resolve one EG gate from comments (preferred) or Leader labels."""
     selected = select_latest_early_gate_outcome(
-        comments, trusted_authors=trusted_authors, gate=gate
+        comments,
+        trusted_authors=trusted_authors,
+        gate=gate,
+        leader_commit=leader_commit,
     )
     if selected is not None:
         return (
             selected.overall_status,
             f"comment id={selected.comment_id} author={selected.author}",
         )
+    if leader_commit is not None:
+        return None, "no trusted terminal comment for current GAP PR commit"
     if gate == GATE_EARLY_GATE_BUILD:
         from_labels = gate_status_from_labels(
             labels,
@@ -467,6 +477,20 @@ def fetch_leader_head_ref(
     return head
 
 
+def fetch_leader_head_sha(
+    leader_pr_url: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> str:
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    sha = run(["api", f"repos/{ref.slug}/pulls/{ref.number}", "--jq", ".head.sha"])
+    sha = (sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise GapPrMonitorError(f"Could not resolve current Leader commit for {leader_pr_url}.")
+    return sha
+
+
 def decide_overall_from_comments(
     *,
     current_overall: str | None = None,
@@ -475,6 +499,7 @@ def decide_overall_from_comments(
     labels: Sequence[str] | None = None,
     payload: dict[str, Any] | None = None,
     eg_already_concluded: bool | None = None,
+    leader_commit: str | None = None,
 ) -> tuple[str | None, str, dict[str, str | None]]:
     """Update EG gates from comments/labels; return derived overall when both done.
 
@@ -507,7 +532,7 @@ def decide_overall_from_comments(
         if eg_already_concluded is None
         else bool(eg_already_concluded)
     )
-    if already and early_gate_concluded(working):
+    if already and early_gate_pair_overall(working) == GATE_STATUS_SUCCESS:
         mark_eg_test_skipped_after_build_failure(working)
         return (
             None,
@@ -533,12 +558,14 @@ def decide_overall_from_comments(
         comments=comments,
         labels=label_list,
         trusted_authors=trusted_authors,
+        leader_commit=leader_commit,
     )
     test_status, test_src = resolve_eg_gate_status(
         gate=GATE_EARLY_GATE_TEST,
         comments=comments,
         labels=label_list,
         trusted_authors=trusted_authors,
+        leader_commit=leader_commit,
     )
     if build_status is not None:
         set_gate_status(working, GATE_EARLY_GATE_BUILD, build_status)
@@ -615,16 +642,12 @@ def child_pass_pr_urls(payload: dict[str, Any]) -> list[str]:
 
 
 def child_check_for_overall(overall_status: str) -> tuple[str, str]:
-    """Map final overall-status to child commit-status state + description.
-
-    Phase-1: always post GitHub ``success`` once both EG gates are done so
-    children can auto-merge; description notes EG failure when overall failed.
-    """
+    """Only a successful Early Gate may approve child merges."""
     if overall_status == OVERALL_STATUS_SUCCESS:
         return "success", CHILD_EG_SUCCESS_DESCRIPTION
     if overall_status == OVERALL_STATUS_FAILURE:
-        # Phase-1: still green the check; note EG failure in the description.
-        return "success", CHILD_EG_FAILURE_DESCRIPTION
+        # Preserve failure as a blocking child status.
+        return "failure", CHILD_EG_FAILURE_DESCRIPTION
     raise GapPrMonitorError(
         f"Cannot post child Early Gate checks for overall-status={overall_status!r}"
     )
@@ -638,7 +661,7 @@ def post_child_statuses_for_early_gate(
     continue_on_error: bool = True,
     pinned_only: bool = False,
 ) -> tuple[str, ...]:
-    """Post phase-1 conclusion onto build-passing children; leave build-failures.
+    """Post blocking or passing EG conclusions onto build-passing children.
 
     Returns the tuple of child PR URLs that received a status post (not skipped).
     """
@@ -732,6 +755,8 @@ def run_early_gate_results(
         labels=resolved_labels,
         root=root,
     )
+    if publish and not dry_run:
+        state_path = gpm.resume_unsuccessful_leader(root, state_path, git_runner=git_runner)
     state_path = gpm.resolve_finalized_state(root, state_path, git_runner=git_runner)
     payload = load_state(state_path)
     retired = retired_outcome(payload)
@@ -769,6 +794,14 @@ def run_early_gate_results(
     migrate_legacy_overall_status(payload)
     previous = derive_legacy_overall_status(payload)
     eg_already = early_gate_concluded(payload)
+    leader_commit = fetch_leader_head_sha(leader_url, gh_runner=gh_runner)
+    if publish and not dry_run and (root / ".git").exists():
+        run_git = git_runner or (lambda args, cwd=root: gpm._run_git(args, cwd=cwd))
+        checked_out = run_git(["rev-parse", "HEAD"], cwd=root).strip()
+        if checked_out != leader_commit:
+            raise GapPrMonitorError(
+                "Leader head moved while loading Early Gate results; rerun for the current commit."
+            )
 
     # Always reconcile full comment + label history (wake-up may be stale).
     comments = list_leader_pr_comments(leader_url, gh_runner=gh_runner)
@@ -782,6 +815,7 @@ def run_early_gate_results(
         labels=leader_labels,
         payload=payload,
         eg_already_concluded=eg_already,
+        leader_commit=leader_commit,
     )
     strip_legacy_overall_status(payload)
     derived = derive_legacy_overall_status(payload)
@@ -864,8 +898,9 @@ def run_early_gate_results(
         commit_message=(
             f"Update GAP promotion-gates from merge-orchestrator ({new_overall})"
         ),
+        rebase_on_conflict=False,
         git_runner=git_runner,
-        archive=True,
+        archive=new_overall == OVERALL_STATUS_SUCCESS,
     )
 
     state_path = published.state_path or state_path
@@ -873,13 +908,12 @@ def run_early_gate_results(
     factory = updater_factory or PRStatusUpdater
     updater = factory(check_name=check_name, dry_run=False)
     verify_leader_head(leader_url, published.sha, updater=updater)
-    leader_result = post_leader_conclusion(
-        leader_url,
-        published.sha,
-        overall_status=new_overall,
-        updater=updater,
-        gh_runner=gh_runner,
-    )
+    leader_result = None
+    if new_overall == OVERALL_STATUS_SUCCESS:
+        leader_result = post_leader_conclusion(
+            leader_url, published.sha, overall_status=new_overall,
+            updater=updater, gh_runner=gh_runner,
+        )
     # Reload after publish so child list matches committed state.
     payload = load_state(state_path)
     child_posted = post_child_statuses_for_early_gate(
@@ -887,14 +921,14 @@ def run_early_gate_results(
         overall_status=new_overall,
         updater=updater,
         # The first publication must honor the same frozen receipt as retries.
-        pinned_only=is_history_state(state_path),
+        pinned_only=True,
     )
     return EarlyGateResultsResult(
         state_path=state_path,
         previous_overall=previous,
         overall_status=new_overall,
         applied=True,
-        leader_status_posted=not leader_result.skipped,
+        leader_status_posted=bool(leader_result and not leader_result.skipped),
         published_sha=published.sha,
         dry_run=False,
         reason=reason,
