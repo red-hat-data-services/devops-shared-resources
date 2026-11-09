@@ -15,16 +15,9 @@
 {% if category == 'feasibility' %}
 ## Main-to-release feasibility
 
-Dry-runs the normal sync from the current configured source branch to configured active release branches. It does not test the proposed stable PR contents or push changes.
-
-Inspect the feasibility job for merge conflicts or configuration/workflow errors.
+The main to release feasibility job has failed. This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes). Please inspect the feasibility job for merge conflicts or configuration/workflow errors.
 {% endif %}
 
-## Explicitly affected targets
-
-{% for target in targets %}- {{ target.branch }}: {{ target.reason }}; component: {{ target.component }}; pipeline: {{ target.pipeline }}
-{% else %}Unavailable. No targets inferred from the promotion destination or prose.
-{% endfor %}
 ## Evidence links
 
 {% for link in links %}- [{{ link.label }}]({{ link.url }})
@@ -42,5 +35,5 @@ Inspect the feasibility job for merge conflicts or configuration/workflow errors
 {% if metadata_url %}
 ## Notification metadata
 
-[View notification metadata (JSON — source of truth)]({{ metadata_url }}) Jira permissions required.
+[View notification metadata (JSON — source of truth)]({{ metadata_url }}) (Jira permissions required)
 {% endif %}

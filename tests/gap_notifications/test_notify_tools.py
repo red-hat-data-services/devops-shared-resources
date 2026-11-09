@@ -715,9 +715,10 @@ def test_jira_feasibility_explanation(category, status, environment):
     adf = _description(obs, jira_environment=environment)
     JiraNotifier._validate_adf(adf)
     text = json.dumps(adf)
-    explanation = ('Dry-runs the normal sync from the current configured source branch to configured active release branches. '
-                   'It does not test the proposed stable PR contents or push changes.')
-    guidance = 'Inspect the feasibility job for merge conflicts or configuration/workflow errors.'
+    explanation = ('The main to release feasibility job has failed. This job dry-runs the normal sync from the '
+                   'current configured source branch to configured active release branches (It does not test the '
+                   'proposed stable PR contents or actually push changes).')
+    guidance = 'Please inspect the feasibility job for merge conflicts or configuration/workflow errors.'
     assert ('## Main-to-release feasibility' in markdown) == (category == 'feasibility')
     assert (explanation in markdown) == (category == 'feasibility')
     assert (explanation in text) == (category == 'feasibility')
@@ -747,19 +748,17 @@ def test_jira_omits_provenance_boilerplate(environment, flags):
     assert markdown.startswith('# GAP STAGING TEST' if environment == 'stage' else '# GAP PRODUCTION')
 
 
-# Grouped targets must stay explicit, and injected Markdown or template text must remain
-# literal.
-def test_grouped_targets_and_literal_injection(monkeypatch, tmp_path):
+# Injected Markdown or template text must remain literal.
+def test_literal_injection(monkeypatch, tmp_path):
     obs = observation(evidence={'synthetic': True, 'reason': '# injected\n[evil](https://evil.test) <script> {{ missing }}',
-        'affected_targets': [{'branch': 'rhoai-3.2', 'reason': 'conflict'}, {'branch': 'rhoai-3.3', 'component': 'cpu'}],
         'leader_url': 'https://example.test/pr/1'})
     monkeypatch.chdir(tmp_path)
     md = render_markdown(obs)
     adf = _description(obs)
     JiraNotifier._validate_adf(adf)
     headings = [n for n in adf['content'] if n['type'] == 'heading']
-    assert len(headings) == 5
-    assert r'rhoai\-3' in md and 'Actual promotion stream: main → stable' in md
+    assert len(headings) == 4
+    assert 'Actual promotion stream: main → stable' in md
     raw = json.dumps(adf)
     assert '# injected [evil](https://evil.test) <script> {{ missing }}' in raw
     assert raw.count('"href"') == 1
@@ -773,11 +772,26 @@ def test_bad_urls_fail(url):
         _description(observation(evidence={'leader_url': url}))
 
 
-# Never invent affected targets; reject malformed or excessive target lists.
-def test_explicit_targets_only_and_bounded():
-    assert 'rhoai-' not in render_markdown(observation(destination_branch='stable', evidence={'reason': 'plain'}))
-    with pytest.raises(ValueError):
-        _description(observation(evidence={'affected_targets': [{'branch': 'stable'}]}))
+# The removed affected-targets section must not appear, even with legacy supplied evidence.
+@pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
+@pytest.mark.parametrize('evidence', [{}, {'affected_targets': []},
+                                   {'affected_targets': [{'branch': 'rhoai-3.2', 'reason': 'target-only reason'}]}])
+def test_jira_omits_affected_targets(category, evidence):
+    obs = observation(category=category, evidence=evidence)
+    markdown = render_markdown(obs)
+    adf = _description(obs)
+    JiraNotifier._validate_adf(adf)
+    for text in (markdown, json.dumps(adf)):
+        assert 'Explicitly affected targets' not in text
+        assert 'No targets inferred' not in text
+        assert 'rhoai' not in text
+        assert 'target-only reason' not in text
+        assert 'FEEDBACK' not in text
+        assert 'Evidence links' in text and 'Diagnostics' in text
+
+
+# Presentation text remains bounded after removal of affected-targets rendering.
+def test_jira_reason_is_bounded():
     with pytest.raises(ValueError):
         _description(observation(evidence={'reason': 'x' * 2001}))
 
@@ -897,6 +911,38 @@ def test_both_sections_preserve_body_idempotent_and_reject_edited_metadata():
     updated['content'][-1]['content'][-1]['text'] = 'human changed note'
     with pytest.raises(ValueError):
         project_body(updated, slack, metadata=meta)
+
+
+# Exact old/new metadata suffixes are supported; unrelated edits still fail closed.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+@pytest.mark.parametrize('suffix', [' Jira permissions required.', ' (Jira permissions required)'])
+def test_metadata_wording_compatibility(environment, suffix):
+    meta = metadata_url('RHAI-123', jira_environment=environment)
+    obs = observation()
+    body = _description(obs, metadata_url=meta, jira_environment=environment)
+    assert body['content'][-1]['content'][-1]['text'] == ' (Jira permissions required)'
+    body['content'][-1]['content'][-1]['text'] = suffix
+    original = copy.deepcopy(body)
+    assert visible_link_status(body, meta, metadata=True, jira_environment=environment) == 'match'
+    other = metadata_url('RHAI-124', jira_environment=environment)
+    assert visible_link_status(body, other, metadata=True, jira_environment=environment) == 'mismatch'
+    projected = project_body(body, None, metadata=meta, jira_environment=environment)
+    assert body == original
+    assert projected['content'][:-2] == body['content'][:-2]
+    assert projected['content'][-2:] == section(meta, metadata=True)
+    assert project_body(projected, None, metadata=meta, jira_environment=environment) == projected
+    for field in ('suffix', 'label', 'extra'):
+        edited = copy.deepcopy(body)
+        content = edited['content'][-1]['content']
+        if field == 'suffix':
+            content[-1]['text'] += ' edited'
+        elif field == 'label':
+            content[0]['text'] = 'edited label'
+        else:
+            content.append({'type': 'text', 'text': 'extra text'})
+        assert visible_link_status(edited, meta, metadata=True, jira_environment=environment) == 'ambiguous_or_edited'
+        with pytest.raises(ValueError):
+            project_body(edited, None, metadata=meta, jira_environment=environment)
 
 
 # Cosmetic projection must preserve user nodes and refuse edited or duplicated managed sections.

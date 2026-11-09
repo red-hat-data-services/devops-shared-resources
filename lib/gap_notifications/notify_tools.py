@@ -865,16 +865,9 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
-                   revision=literal(e.get("head_sha") or e.get("head-sha")), targets=[], links=[],
+                   revision=literal(e.get("head_sha") or e.get("head-sha")), links=[],
                    discussion_url=https_url(discussion_url) if discussion_url else None,
                    metadata_url=https_url(metadata_url) if metadata_url else None)
-    targets = e.get("affected_targets", [])
-    if not isinstance(targets, list) or len(targets) > 40:
-        raise ValueError("affected_targets must be a list of at most 40 entries")
-    for target in targets:
-        if not isinstance(target, dict) or not re.fullmatch(r"rhoai-[A-Za-z0-9._-]+", str(target.get("branch", ""))):
-            raise ValueError("affected target requires an explicit rhoai-X branch")
-        context["targets"].append({k: literal(target.get(k)) for k in ("branch", "reason", "component", "pipeline")})
     for label, value in [("Child PR", e.get("pr_url")), ("Leader", e.get("leader_url")),
                          ("Build logs or PipelineRun", e.get("build_url")), ("State snapshot", e.get("state_url")),
                          ("Feasibility run" if observation.get("category") == "feasibility" else "Creator workflow",
@@ -905,8 +898,19 @@ def section(url, *, metadata=False):
     content = [{"type": "text", "text": "View notification metadata (JSON — source of truth)" if metadata else "Open Slack discussion",
                 "marks": [{"type": "link", "attrs": {"href": url}}]}]
     if metadata:
-        content.append({"type": "text", "text": " Jira permissions required."})
+        content.append({"type": "text", "text": " (Jira permissions required)"})
     return [heading, {"type": "paragraph", "content": content}]
+
+
+def _matches_section(paragraph, url, *, metadata=False):
+    """Recognize exact managed content, including the original metadata suffix."""
+    expected = section(url, metadata=metadata)[1]
+    if paragraph == expected:
+        return True
+    if metadata:
+        expected["content"][-1]["text"] = " Jira permissions required."
+        return paragraph == expected
+    return False
 
 
 def _managed_indices(body, *, metadata=False, jira_environment="stage", channel=None):
@@ -926,7 +930,7 @@ def _managed_indices(body, *, metadata=False, jira_environment="stage", channel=
             url = paragraph["content"][0]["marks"][0]["attrs"]["href"]
             pattern = (re.escape(jira_target(jira_environment).url) + r"/rest/api/3/issue/RHAI-[1-9][0-9]*/properties/gap\.notification\.v1"
                        if metadata else re.escape(SLACK_ORIGIN) + r"/archives/" + re.escape(configured_channel(channel)) + r"/p[0-9]+")
-            if not re.fullmatch(pattern, url) or paragraph != section(url, metadata=metadata)[1]:
+            if not re.fullmatch(pattern, url) or not _matches_section(paragraph, url, metadata=metadata):
                 raise ValueError("edited discussion section")
         except (KeyError, IndexError, TypeError):
             raise ValueError("edited discussion section") from None
@@ -954,6 +958,6 @@ def visible_link_status(body, url, *, metadata=False, jira_environment="stage", 
         indices = _managed_indices(body, metadata=metadata, **routing_target(jira_environment, channel).options)
         if not indices:
             return "missing"
-        return "match" if body["content"][indices[0] + 1] == section(url, metadata=metadata)[1] else "mismatch"
+        return "match" if _matches_section(body["content"][indices[0] + 1], url, metadata=metadata) else "mismatch"
     except ValueError:
         return "ambiguous_or_edited"

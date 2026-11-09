@@ -113,10 +113,9 @@ Allowlisted text fields such as reason and note are rendered literally, without
 automatic secret detection or redaction. Only allowlisted diagnostic fields and
 evidence links appear, not full JSON.
 
-Optional `evidence.affected_targets` is a list (at most 40) of objects with an
-explicit `branch` matching `rhoai-[A-Za-z0-9._-]+`, plus optional `reason`,
-`component`, `pipeline`. Each supplied branch is displayed together with its details.
-Targets are never inferred from the actual promotion destination or arbitrary prose.
+Jira descriptions omit the affected-targets section: automatic observations do not
+supply authoritative release-impact data. Legacy `evidence.affected_targets` values
+are ignored by presentation; release impact is not inferred from promotion branches.
 The historical fixture fields `reason`, `head_sha`, `leader_url`, `pr_url`,
 `state_url`, `build_url`, `note`, `historical_snapshot`, `synthetic` are supported;
 collector `selected-run`, `creator-outcome`, and `head-sha` fields are also used.
@@ -135,6 +134,12 @@ intent is persisted, so deterministic presentation errors do not strand write in
 backfilled. Summary/registry identity and Slack lifecycle are unchanged.
 
 ## Discussion projection and read-only inspection
+
+The metadata link uses the suffix `(Jira permissions required)`. Managed-section
+validation recognizes both this wording and the original `Jira permissions required.`
+suffix, while still requiring exact link labels, URLs and section structure. Other
+edits and duplicate sections continue to fail closed. Cosmetic projection emits the
+new wording without changing notification delivery or incident identity.
 
 The managed **Slack discussion** section is a cosmetic projection of the confirmed
 root stored in the validated Jira `gap.notification.v1` property, not a routing

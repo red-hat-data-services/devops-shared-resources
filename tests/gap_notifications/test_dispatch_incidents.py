@@ -487,7 +487,7 @@ def test_metadata_on_delivery_failure_preserves_original_core_state(setup, monke
         report = inspect_issue(jira, 'RHAI-1')
         assert report['discussion_url'] is None and report['visible_metadata_link'] == 'match'
         assert report['metadata_url'] == 'https://stage-redhat.atlassian.net/rest/api/3/issue/RHAI-1/properties/gap.notification.v1'
-        assert 'Jira permissions required.' in json.dumps(jira.issues['RHAI-1']['fields']['description'])
+        assert '(Jira permissions required)' in json.dumps(jira.issues['RHAI-1']['fields']['description'])
     assert 'SECRET' not in json.dumps(result)
 
 
