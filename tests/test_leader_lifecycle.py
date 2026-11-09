@@ -607,6 +607,8 @@ def test_eg_finalization_and_retry_use_one_frozen_record(git_leader, monkeypatch
     blocked = True
     def gh(args):
         """Stub GitHub metadata and merge requests while preserving publication ordering."""
+        if args[:2] == ["api", "repos/acme/gap/pulls/9"] and "--jq" in args:
+            return git(["rev-parse", "HEAD"], root)
         if args == ["api", "repos/acme/gap/pulls/9"]:
             return json.dumps(pull(sha=git(["rev-parse", "HEAD"], root)))
         if args[:2] == ["pr", "merge"] and blocked:
@@ -939,6 +941,29 @@ def test_first_archive_finalization_uses_evaluated_child_revision(git_leader, ou
     git(["commit", "-m", "Component ready for EG"], root)
     git(["push", "origin", "HEAD"], root)
     posts = []
+    leader_commit = git(["rev-parse", "HEAD"], root)
+    build_result = "failure" if outcome == "failure" else "success"
+    comments = [
+        {
+            "id": 1,
+            "created_at": "2026-11-05T12:00:00Z",
+            "user": {"login": "rhods-ci-bot"},
+            "body": (
+                f"<!-- early-gate-build-complete GAP_PR_COMMIT={leader_commit} -->\n"
+                + (":x: **Early Gate failed**" if build_result == "failure" else ":white_check_mark: **Early Gate passed**")
+            ),
+        }
+    ]
+    if outcome == "success":
+        comments.append({
+            "id": 2,
+            "created_at": "2026-11-05T12:01:00Z",
+            "user": {"login": "rhods-ci-bot"},
+            "body": (
+                f"<!-- early-gate-job-complete GAP_PR_COMMIT={leader_commit} -->\n"
+                ":white_check_mark: **Early Gate Tests Passed**"
+            ),
+        })
 
     def gh(args):
         """Emulate GitHub heads and statuses while real updater code enforces revision checks."""
@@ -946,9 +971,15 @@ def test_first_archive_finalization_uses_evaluated_child_revision(git_leader, ou
             return ""
         endpoint = args[1] if args[1] != "--method" else args[3]
         if endpoint.endswith("/pulls/9"):
+            if args[-1:] == [".head.sha"]:
+                return git(["rev-parse", "HEAD"], root)
             if "--jq" in args:
-                return json.dumps({"sha": git(["rev-parse", "HEAD"], root),
-                                   "owner": "acme", "repo": "gap", "state": "open"})
+                return json.dumps({
+                    "sha": git(["rev-parse", "HEAD"], root),
+                    "owner": "acme",
+                    "repo": "gap",
+                    "state": "open",
+                })
             return json.dumps(pull(sha=git(["rev-parse", "HEAD"], root)))
         if endpoint.endswith("/pulls/3"):
             return json.dumps({"sha": ("c" if child_moved else "b") * 40,
@@ -959,7 +990,7 @@ def test_first_archive_finalization_uses_evaluated_child_revision(git_leader, ou
         if "/commits/" in endpoint:
             return ""
         if "/comments" in endpoint:
-            return "[]"
+            return json.dumps(comments)
         return ""
 
     def factory(**kwargs):
@@ -994,6 +1025,7 @@ def test_active_monitor_still_refreshes_receipts_and_retriggers_eg(git_leader, m
     child = payload()["pull-requests"][0]["pr-url"]
     stage = {"status": "build-pending", "sha": "b" * 40}
     comments, posts = [], []
+    triggered_commits = set()
     monkeypatch.setenv("GAP_BUILD_STATUS_SOURCE", "konflux")
     monkeypatch.setattr(monitor, "fetch_component_repo_map", lambda _: {"component": frozenset({"model"})})
     monkeypatch.setattr(monitor, "_post_leader_failure_summary", lambda **kwargs: None)
@@ -1012,10 +1044,14 @@ def test_active_monitor_still_refreshes_receipts_and_retriggers_eg(git_leader, m
         """Record status and trigger writes without any real GitHub changes."""
         if args[:2] == ["pr", "comment"]:
             comments.append(args[args.index("--body") + 1])
+            triggered_commits.add(git(["rev-parse", "HEAD"], root))
             return ""
         if args[0] != "api":
             raise AssertionError(args)
         endpoint = args[1] if args[1] != "--method" else args[3]
+        if "/check-runs" in endpoint:
+            leader_commit = endpoint.split("/commits/", 1)[1].split("/", 1)[0]
+            return json.dumps(["run"] if leader_commit in triggered_commits else [])
         if endpoint.endswith("/pulls/3"):
             return json.dumps({"sha": stage["sha"], "owner": "acme", "repo": "component", "state": "open"})
         if "/statuses/" in endpoint:

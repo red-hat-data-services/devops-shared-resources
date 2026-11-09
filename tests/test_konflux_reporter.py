@@ -131,6 +131,7 @@ def test_build_receipt_survives_eg_result_and_history_snapshot(tmp_path, monkeyp
     if outcome == "success":
         comments.append(_bot_comment(TESTS_PASSED))
     monkeypatch.setattr(eg, "list_leader_pr_comments", lambda *a, **k: comments)
+    monkeypatch.setattr(eg, "fetch_leader_head_sha", lambda *a, **k: "d" * 40)
     result = eg.run_early_gate_results(
         repo_root=tmp_path, leader_pr_url="https://github.com/acme/gap/pull/9",
         state_file=str(path), labels=[], publish=False)
