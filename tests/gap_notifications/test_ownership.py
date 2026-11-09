@@ -27,11 +27,54 @@ def test_blocks_isolate_handle_and_bound_body():
     p = policy()
     body = "@everyone @here " + "x" * 6001
     blocks = p.blocks({"component": "api-v3-4", "status": "failure"}, body, root=True)
-    assert blocks[0]["text"] == {"type": "mrkdwn", "text": "@api", "verbatim": False}
-    assert "".join(b["text"]["text"] for b in blocks[1:]) == body
-    assert all(b["text"]["verbatim"] and len(b["text"]["text"]) <= 3000 for b in blocks[1:])
+    assert blocks[1]["text"] == {"type": "mrkdwn", "text": "*Owning team:* @api\n", "verbatim": False}
+    assert "".join(b["text"]["text"] for b in blocks[2:-1]) == body
+    assert all(b["text"]["verbatim"] and len(b["text"]["text"]) <= 3000 for b in blocks[2:-1])
+    assert blocks[-1]["type"] == "context"
     for status, root in [("failure", False), ("success", True), ("success", False)]:
         assert all(b["text"]["verbatim"] for b in p.blocks({"status": status}, body, root=root))
+
+
+def test_failure_summary_integrates_team_and_links_to_both_mapping_files():
+    body = ('🔴 *GAP · Build failed — staging test*\n'
+            '*Component:* `api-v3-4`\n'
+            '*Repository:* `example/repo`\nReported reason: @everyone @here')
+    blocks = policy().blocks({'component': 'api-v3-4', 'status': 'failure'}, body, root=True)
+    summary, team = blocks[0]['text'], blocks[1]['text']
+    assert summary == {'type': 'mrkdwn', 'text': body.split('\n*Repository:*')[0] + '\n', 'verbatim': True}
+    assert team == {'type': 'mrkdwn', 'text': '*Owning team:* @api\n', 'verbatim': False}
+    assert blocks[2]['text']['text'] == '*Repository:* `example/repo`\nReported reason: @everyone @here'
+    assert blocks[2]['text']['verbatim'] is True
+    assert all('fields' not in block for block in blocks)
+    footer = blocks[-1]
+    assert footer['type'] == 'context'
+    assert footer['elements'] == [{
+        'type': 'mrkdwn', 'verbatim': True,
+        'text': 'Ownership mappings: '
+                '<https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/rhoai-component-data.yaml|Slack teams> · '
+                '<https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/konflux-to-jira-component-map.yaml|Jira components>',
+    }]
+
+
+@pytest.mark.parametrize('body', ['@everyone', '', 'heading\n' + '*Component:* ' + 'x' * 3100])
+def test_summary_does_not_parse_untrusted_text_or_exceed_section_limits(body):
+    blocks = policy().blocks({'status': 'failure'}, body, root=True)
+    assert blocks[0]['text']['verbatim'] is True
+    assert all(0 < len(block['text']['text']) <= 3000 for block in blocks[:-1])
+    assert all(b['text']['verbatim'] for b in blocks[2:-1])
+    if '\n' in body:
+        assert ''.join(b['text']['text'] for b in blocks[2:-1]) == body.split('\n', 1)[1]
+
+
+def test_long_component_and_owner_remain_separate_when_copied():
+    component = 'odh-pipeline-runtime-pytorch-rocm-py312-v3-6'
+    body = ('🔴 GAP · Build failed — staging test\n'
+            f'*Component:* `{component}`\n'
+            '*Repository:* `red-hat-data-services/notebooks`\nBuild failed at: 2026-11-09 19:54:41 UTC')
+    blocks = policy().blocks({'component': component, 'status': 'failure'}, body, root=True)
+    copied = ''.join(block['text']['text'] for block in blocks[:-1])
+    assert f'*Component:* `{component}`\n*Owning team:* @devops\n*Repository:*' in copied
+    assert all('fields' not in block for block in blocks)
 
 
 @pytest.mark.parametrize('body', ['!!python/object/apply:os.system [false]', '[]', '_default: []', 'api: 123'])
@@ -79,7 +122,7 @@ components:
     assert p.extra_fields({'component': 'api-v3-4', 'failed_task': 'clone-repository'}) == {
         'components': [{'name': 'API'}, {'name': 'Serving'}]}
     assert p.extra_fields({'component': 'api-v2'}) == {'components': [{'name': 'V2'}]}
-    assert p.blocks({'component': 'api', 'status': 'failure'}, 'body', root=True)[0]['text']['text'] == '@devops'
+    assert p.blocks({'component': 'api', 'status': 'failure'}, 'body', root=True)[1]['text']['text'] == '*Owning team:* @devops\n'
     assert p.extra_fields({}) == {'components': [{'name': 'DevOps'}]}
 
 

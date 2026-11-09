@@ -93,8 +93,12 @@ def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
     assert invoke()["status"] == "settled"
     assert len(jira.issues) == len(slack.calls) == 1
     root = slack.calls[0]
-    assert root[1]['blocks'][0]['text'] == {'type': 'mrkdwn', 'text': '@devops', 'verbatim': False}
-    assert all(b['text']['verbatim'] for b in root[1]['blocks'][1:])
+    assert root[1]['blocks'][1]['text'] == {'type': 'mrkdwn', 'text': '*Owning team:* @devops\n', 'verbatim': False}
+    assert root[1]['blocks'][0]['text']['verbatim'] is True
+    assert all(b['text']['verbatim'] for b in root[1]['blocks'][2:-1])
+    assert all('fields' not in block for block in root[1]['blocks'])
+    assert root[1]['blocks'][-1]['type'] == 'context'
+    assert 'Ownership mappings:' in root[1]['blocks'][-1]['elements'][0]['text']
     assert 'link_names' not in root[1] and '@devops' not in root[0]
     assert invoke()["status"] == "settled"
     assert len(slack.calls) == 1

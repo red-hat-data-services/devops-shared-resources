@@ -32,9 +32,17 @@ components (including repository-scoped conflict/feasibility incidents) use
 Slack uses `components.<name>.slack_team_handle`, falling back to
 `components.default.slack_team_handle` for absent/unknown components or missing
 handles, including explicit `unknown` handles. `slack_team_channel` is ignored: explicit notification channel routing
-is unchanged. Only root failures include a dedicated mrkdwn section containing
-`@mapped-handle` with `verbatim: false`, allowing Slack to parse that team handle.
-All rendered body sections use `verbatim: true` and are at most 3000 characters.
+is unchanged. Root failures use a single-column layout: failure summary/component,
+then **Owning team: @mapped-handle** on its own full-width line, followed by
+repository and failure details. Explicit line endings keep these sections
+separate when copied. Only the ownership line uses `verbatim: false` to parse
+the handle; the summary and failure details keep `verbatim: true`.
+A compact context footer links directly to the Slack-team and Jira-component
+mapping YAML files on GitLab, so readers can find where ownership is maintained.
+Replies and recovery do not add this ownership/footer layout or re-ping teams.
+All section text respects Slack's 3000-character limit, with oversized summary
+text retained in the body. Two-column fields are avoided so long component
+names do not squeeze or run into the ownership label.
 Top-level text is unchanged fallback text; global `link_names` parsing is not enabled.
 Reserved broadcast handles (`here`, `channel`, `everyone`) and malformed handles
 are rejected before delivery. No usergroup lookup API or `usergroups:read` scope

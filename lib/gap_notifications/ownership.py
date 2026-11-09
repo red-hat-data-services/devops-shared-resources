@@ -6,6 +6,7 @@ from lib.gap_component_map import normalize_component_name
 
 BASE = "https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/raw/main/data/"
 LIMIT = 1024 * 1024
+MAPPING_LINK_BASE = "https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/"
 
 
 def fetch_mapping(name, *, ca_bundle=None):
@@ -82,13 +83,33 @@ class OwnershipPolicy:
         return {'components': [{'name': name} for name in names]}
 
     def blocks(self, observation, text, *, root=False):
-        """Only the trusted mapped handle gets automatic parsing."""
+        """Integrate ownership with the summary; only the mapped handle is parsed."""
         blocks = []
-        if root and observation.get("status") == "failure":
+        root_failure = root and observation.get("status") == "failure"
+        if root_failure:
             handle = self._lookup(self.teams, observation.get("component"), self.teams["default"])
+            summary, _, body = text.partition("\n")
+            if len(summary) > 2999:
+                summary, body = "*Failure*", text
+            elif body.startswith("*Component:*"):
+                component, _, remaining = body.partition("\n")
+                if len(summary) + len(component) + 2 <= 3000:
+                    summary, body = summary + "\n" + component, remaining
+            # Full-width sections avoid long names squeezing the ownership label.
+            # Explicit newlines also separate sections when their text is copied.
             blocks.append({"type": "section", "text": {
-                "type": "mrkdwn", "text": "@" + handle, "verbatim": False}})
+                "type": "mrkdwn", "text": (summary or "*Failure*") + "\n", "verbatim": True}})
+            blocks.append({"type": "section", "text": {
+                "type": "mrkdwn", "text": "*Owning team:* @" + handle + "\n", "verbatim": False}})
+            text = body
         blocks.extend({"type": "section", "text": {
             "type": "mrkdwn", "text": text[i:i + 3000], "verbatim": True}}
             for i in range(0, len(text), 3000))
+        if root_failure:
+            blocks.append({"type": "context", "elements": [{
+                "type": "mrkdwn", "verbatim": True,
+                "text": "Ownership mappings: "
+                        f"<{MAPPING_LINK_BASE}rhoai-component-data.yaml|Slack teams> · "
+                        f"<{MAPPING_LINK_BASE}konflux-to-jira-component-map.yaml|Jira components>",
+            }]})
         return blocks
