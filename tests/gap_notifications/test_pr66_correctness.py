@@ -113,9 +113,10 @@ def test_invalid_inventory_never_recovers(mutation):
     assert collect(payload)['status'] == 'unknown'
 
 
-# Multiple discovered Leaders retain ordinary monitoring but must disable notification writes.
-@pytest.mark.parametrize('count,mode,expected', [(2, 'write', 'disabled'), (1, 'write', 'write'), (2, 'preview', 'preview'), (2, 'disabled', 'disabled')])
-def test_multi_leader_write_preflight(tmp_path, monkeypatch, count, mode, expected):
+# Leader overlap must not disable notifications or alter the configured routing.
+@pytest.mark.parametrize('count', [1, 2, 3])
+@pytest.mark.parametrize('mode', ['write', 'preview', 'disabled'])
+def test_scheduled_leaders_preserve_notification_config(tmp_path, monkeypatch, count, mode):
     from types import SimpleNamespace
     from scripts import gap_pr_monitor as monitor
     from lib.gap_notifications.monitor_hook import NotificationConfig
@@ -126,11 +127,15 @@ def test_multi_leader_write_preflight(tmp_path, monkeypatch, count, mode, expect
     monkeypatch.setattr(monitor, 'resolve_state_file', lambda **k: tmp_path / 'state.json')
     configs = []
     def invoke(*a, **kw):
-        configs.append(kw['notification_config'].mode)
+        configs.append(kw['notification_config'])
         return monitor.MonitorResult(tmp_path / 'state.json', [], [], [], [], False)
     monkeypatch.setattr(monitor, 'run_monitor_publish_and_signal', invoke)
-    assert monitor.run_scheduled_monitors(tmp_path, leader_repo='a/b', notification_config=NotificationConfig(mode)) == 0
-    assert configs == [expected] * count
+    config = NotificationConfig(mode=mode, ledger=str(tmp_path / 'journal.json'),
+                                trial_id='overlapping-leaders', jira_environment='production',
+                                channel='C07RGA06207')
+    assert monitor.run_scheduled_monitors(tmp_path, leader_repo='a/b', notification_config=config) == 0
+    assert len(configs) == count
+    assert all(actual is config for actual in configs)
 
 
 # Notifications follow applicable signals; retained failures never emit a Leader conclusion.

@@ -1726,10 +1726,6 @@ def run_scheduled_monitors(
         )
         return 0
 
-    if len(leaders) > 1 and notification_config is not None and notification_config.mode == "write":
-        print("WARNING: multiple Leaders discovered; notification writes disabled for this pass.", file=sys.stderr)
-        notification_config = replace(notification_config, mode="disabled")
-
     print(f"Scheduled monitor: {len(leaders)} open Leader PR(s) in {leader_repo}")
     failures: list[str] = []
     root = repo_root.expanduser().resolve()

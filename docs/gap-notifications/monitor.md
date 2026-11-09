@@ -3,8 +3,11 @@
 The monitor CLI now has a **default-disabled** build notification hook. Normal
 monitor commands do not import the hook, access notification credentials, open a
 notification journal, or construct notification clients. No workflow enables it.
-This prototype assumes **one active Leader and one notification writer**. Leader
-selection/authority and supersession are deliberately unchanged and deferred.
+Multiple active Leaders retain the configured notification mode. Leaders with
+matching incident identities may update evidence in the same Jira issue and
+Slack thread. Leader identity is not part of the incident key, and newest-Leader
+authority is not enforced: distinct observations from overlapping Leaders may
+change the shared incident lifecycle, including recovery or recurrence.
 
 ## Execution boundary
 

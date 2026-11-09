@@ -11,9 +11,10 @@ An optional separate tracking handoff performs validated read-only Jira lookup
 for the same accepted observations, without initiating writes or Slack reads
 for display. Errors remain isolated from promotion gates and summary reporting.
 
-This hook neither chooses a Leader nor decides gates. A single active Leader
-and notification writer are caller assumptions, not guarantees; state
-publication and notification writes are not one transaction.
+This hook neither chooses a Leader nor decides gates. Multiple active Leaders
+may update the same incident's Jira issue and Slack thread; no newest-Leader
+authority is enforced. State publication and notification writes are not one
+transaction.
 """
 from __future__ import annotations
 
