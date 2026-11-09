@@ -702,6 +702,33 @@ def test_categories_labels_and_missing(category, setup):
     assert 'Unavailable' in render_markdown(obs)
 
 
+# Jira explains feasibility without confusing the promotion branch with the sync source,
+# labels the workflow link accurately, and keeps the explanation out of other categories.
+@pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
+@pytest.mark.parametrize('status', ['failure', 'success'])
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+def test_jira_feasibility_explanation(category, status, environment):
+    workflow_url = 'https://github.com/acme/repo/actions/runs/123'
+    obs = observation(category=category, status=status, source_branch='promotion-source',
+                      evidence={'workflow_url': workflow_url})
+    markdown = render_markdown(obs, jira_environment=environment)
+    adf = _description(obs, jira_environment=environment)
+    JiraNotifier._validate_adf(adf)
+    text = json.dumps(adf)
+    explanation = ('Dry-runs the normal sync from the current configured source branch to configured active release branches. '
+                   'It does not test the proposed stable PR contents or push changes.')
+    guidance = 'Inspect the feasibility job for merge conflicts or configuration/workflow errors.'
+    assert ('## Main-to-release feasibility' in markdown) == (category == 'feasibility')
+    assert (explanation in markdown) == (category == 'feasibility')
+    assert (explanation in text) == (category == 'feasibility')
+    assert (guidance in markdown) == (category == 'feasibility' and status == 'failure')
+    assert (guidance in text) == (category == 'feasibility' and status == 'failure')
+    label = 'Feasibility run' if category == 'feasibility' else 'Creator workflow'
+    assert f'[{label}]({workflow_url})' in markdown
+    assert f'"text": "{label}"' in text
+    assert workflow_url in text
+
+
 # Grouped targets must stay explicit, and injected Markdown or template text must remain
 # literal.
 def test_grouped_targets_and_literal_injection(monkeypatch, tmp_path):
@@ -738,7 +765,8 @@ def test_explicit_targets_only_and_bounded():
 
 
 # Missing required template fields must fail instead of silently rendering incomplete content.
-def test_strict_template_missing_fields(monkeypatch):
+@pytest.mark.parametrize('renderer', [render_markdown, lambda obs: slack_message(obs, jira_url=JIRA)])
+def test_strict_template_missing_fields(monkeypatch, renderer):
     class MissingTemplate:
         def joinpath(self, path):
             return self
@@ -746,7 +774,7 @@ def test_strict_template_missing_fields(monkeypatch):
             return '# GAP STAGING TEST\n\n{{ required_missing }}'
     monkeypatch.setattr(presentation, 'files', lambda package: MissingTemplate())
     with pytest.raises(UndefinedError):
-        render_markdown(observation())
+        renderer(observation())
 
 
 # Invalid presentation must leave no write intent; corrected evidence may proceed safely.
@@ -876,6 +904,51 @@ JIRA = "https://stage-redhat.atlassian.net/browse/RHAI-177"
 
 def render(**changes):
     return slack_message(observation(**changes), jira_url=JIRA)
+
+
+# The packaged Slack template preserves exact root/reply layout for every outcome and destination.
+@pytest.mark.parametrize("category", ["build", "conflict", "feasibility"])
+@pytest.mark.parametrize("status", ["failure", "success"])
+@pytest.mark.parametrize("reply", [False, True])
+@pytest.mark.parametrize("environment", ["stage", "production"])
+@pytest.mark.parametrize("synthetic", [False, True])
+def test_slack_template_layout(category, status, reply, environment, synthetic):
+    headings = {
+        "failure": {"build": "Build failed", "conflict": "Merge conflict", "feasibility": "Promotion blocked"},
+        "success": {"build": "Successful build observed", "conflict": "Conflict resolved", "feasibility": "Feasibility restored"},
+    }
+    heading = "Failure update" if reply and status == "failure" else headings[status][category]
+    destination = "staging test" if environment == "stage" else "production Jira"
+    expected = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading} — {destination}*"]
+    if category == "build":
+        expected.append("*Component:* `cpu`")
+    if not reply:
+        expected.append("*Repository:* `acme/repo`")
+    if category == "build":
+        expected.append(f"*Build {'failed' if status == 'failure' else 'completed'} at:* Unavailable")
+    expected.append("*Reported reason:* `A useful reason`")
+    if category == "feasibility" and not reply:
+        expected.extend(["", "*Main-to-release feasibility:* Dry-runs the normal sync from the current source branch "
+                         "(usually `main`) to configured active release branches. It does not test the proposed "
+                         "stable PR contents or push changes."])
+        if status == "failure":
+            expected.append("Inspect the feasibility job for merge conflicts or configuration/workflow errors.")
+    expected.extend(["", f"<{JIRA}|Jira RHAI-177>"])
+    if synthetic:
+        expected.extend(["", "Synthetic evidence"])
+    if status == "success":
+        expected.append("Staging result only; does not establish production recovery." if environment == "stage"
+                        else "Reported component outcome only; not a claim that the whole promotion is healthy.")
+    assert slack_message(observation(category=category, status=status,
+                         evidence={"reason": "A useful reason", "synthetic": synthetic}),
+                         jira_url=JIRA, reply=reply, jira_environment=environment) == "\n".join(expected)
+
+
+# Template expressions supplied as evidence remain literal, never a second rendering pass.
+def test_slack_template_evidence_is_not_evaluated():
+    text = render(component="{{ 7 * 7 }}", evidence={"reason": "{% if true %}literal{% endif %}"})
+    assert "`{{ 7 * 7 }}`" in text
+    assert "`{% if true %}literal{% endif %}`" in text
 
 
 # A root message must show useful context and provenance without dumping debug data or generic

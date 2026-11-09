@@ -1,0 +1,29 @@
+{{ '🟢' if status == 'success' else '🔴' }} *GAP · {{ heading }} — {{ 'staging test' if jira_environment == 'stage' else 'production Jira' }}*
+{% if category == 'build' %}
+*Component:* `{{ component }}`
+{% endif %}
+{% if not reply %}
+*Repository:* `{{ repository }}`
+{% endif %}
+{% if category == 'build' %}
+{{ build_time }}
+{% endif %}
+{% if reason %}
+*Reported reason:* `{{ reason }}`
+{% endif %}
+{% if category == 'feasibility' and not reply %}
+
+*Main-to-release feasibility:* Dry-runs the normal sync from the current source branch (usually `main`) to configured active release branches. It does not test the proposed stable PR contents or push changes.
+{% if status == 'failure' %}
+Inspect the feasibility job for merge conflicts or configuration/workflow errors.
+{% endif %}
+{% endif %}
+
+{{ links | join(' · ') }}
+{% if synthetic %}
+
+Synthetic evidence
+{% endif %}
+{% if status == 'success' %}
+{{ 'Staging result only; does not establish production recovery.' if jira_environment == 'stage' else 'Reported component outcome only; not a claim that the whole promotion is healthy.' }}
+{% endif %}

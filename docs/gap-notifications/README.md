@@ -75,8 +75,31 @@ stay outside this package. The issue template moves with identical content to
 
 ## Readable presentation
 
+Slack messages use the packaged `lib/gap_notifications/templates/slack.md.j2`
+Jinja2 template for Slack mrkdwn (not Jira Markdown). Like the Jira template, it
+uses StrictUndefined and loads independently of the current directory. Edit this
+file to change message layout and wording for roots, threaded updates and recovery
+notifications. The template receives only selected, escaped text, validated links
+and explicit outcome/routing flags; raw observations are not exposed and evidence
+is never evaluated as template source. Python retains evidence selection, URL
+validation, truncation and escaping. Template changes do not change delivery,
+threading or replay identity. Both templates are included by the existing
+`templates/*.md.j2` package-data rule.
+
+Feasibility root messages explain that the check dry-runs the normal sync from the
+current source branch (usually `main`) to configured active release branches,
+without testing the proposed stable PR contents or pushing changes. Failed roots
+point readers to the feasibility job for merge conflicts or configuration/workflow errors;
+a failed feasibility result alone does not prove a merge conflict. Threaded updates
+omit this explanation to avoid repeating root context.
+
 Jira descriptions use the packaged `lib/gap_notifications/templates/issue.md.j2`
-with Jinja2 StrictUndefined, independent of the current directory. The restricted
+with Jinja2 StrictUndefined, independent of the current directory. Feasibility
+issues include a main-to-release dry-run explanation, distinguish it from testing
+the proposed stable PR contents, and direct failures to the feasibility job rather
+than assuming a merge conflict. They refer to the configured source branch without
+guessing its name, which is not yet carried in the notification evidence. Their
+workflow evidence link is labeled **Feasibility run**, not **Creator workflow**. The restricted
 Markdown converter supports headings, one-line paragraphs, flat bullets, explicit
 HTTPS links and inline code; no HTML, emphasis, tables, nested lists or code fences.
 Unsupported markup fails clearly. Evidence is escaped literal data, never a template.

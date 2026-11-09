@@ -24,6 +24,11 @@ def test_packaged_template_and_real_formatting_work_outside_checkout(tmp_path, m
     assert '# GAP STAGING TEST' in markdown
     assert 'Repository: ' + notify_tools.literal('acme/repo') in markdown
     assert notify_tools.description(observation())['type'] == 'doc'
+    slack_template = files('lib.gap_notifications').joinpath('templates/slack.md.j2')
+    assert slack_template.is_file()
+    slack = notify_tools.slack_message(observation(), jira_url='https://stage-redhat.atlassian.net/browse/RHAI-1')
+    assert '*GAP · Build failed — staging test*' in slack
+    assert '*Repository:* `acme/repo`' in slack
 
 
 # Importing the package initializer must not eagerly initialize notification modules or clients.
