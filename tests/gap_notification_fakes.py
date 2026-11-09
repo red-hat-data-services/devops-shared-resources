@@ -36,7 +36,7 @@ class Jira:
         self.properties[key] = copy.deepcopy(value)
         return copy.deepcopy(value)
 
-    def create_bug(self, summary, description, labels, *, notification_state):
+    def create_bug(self, summary, description, labels, *, notification_state, extra_fields=None):
         self.calls.append("create")
         if self.fail_create:
             raise TimeoutError("SECRET")
@@ -44,6 +44,7 @@ class Jira:
         self.issues[key] = {"key": key, "fields": {"summary": summary, "project": {"key": "RHAI"},
             "issuetype": {"name": "Bug", "id": "10016"}, "description": description,
             "labels": labels, "status": {"statusCategory": {"key": "new"}}}}
+        self.issues[key]['fields'].update(copy.deepcopy(extra_fields or {}))
         self.properties[key] = copy.deepcopy(notification_state)
         if self.fail_readback:
             error = TimeoutError("SECRET")

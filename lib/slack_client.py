@@ -129,7 +129,7 @@ class SlackClient:
             raise ValueError("timeout must be positive")
 
     def post_message(self, channel: str, text: str, *, thread_ts: str | None = None,
-                     client_msg_id: str | None = None) -> dict[str, str]:
+                     client_msg_id: str | None = None, blocks=None) -> dict[str, str]:
         if not isinstance(channel, str) or not channel.strip():
             raise ValueError("channel must be a non-empty string")
         if not isinstance(text, str) or not text:
@@ -140,6 +140,7 @@ class SlackClient:
             sdk.chat_postMessage(
                 channel=channel, text=text, thread_ts=thread_ts,
                 client_msg_id=client_msg_id, unfurl_links=False, unfurl_media=False,
+                **({"blocks": blocks} if blocks is not None else {}),
             )
         except Exception:
             # SDK validates only HTTP 200 and truthy ok, and can reject malformed

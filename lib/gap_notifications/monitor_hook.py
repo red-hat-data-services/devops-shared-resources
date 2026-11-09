@@ -65,7 +65,8 @@ def _state_url(leader_url, published_sha, relative):
 def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None,
                          published_sha=None, state_path=None, repo_root=None,
                          dry_run=False, collector=None, dispatcher_factory=None,
-                         jira_factory=None, slack_factory=None, environ=None, tracking=None):
+                         jira_factory=None, slack_factory=None, environ=None, tracking=None,
+                         ownership_fetch=None, ownership_ca_bundle=None):
     """Non-blocking. No credential/client/ledger access unless explicitly write-enabled.
 
     Input is the published payload, restricted to this pass's accepted decisions.
@@ -108,6 +109,14 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         target = routing_target(config.jira_environment, config.channel)
         observations = collector(filtered, environment=target.scope, leader_url=leader_url, state_url=link)
         validate_observations(observations, **target.options)
+        from lib.gap_notifications.ownership import OwnershipPolicy
+        if ownership_ca_bundle is None:
+            if environ is None:
+                import os
+                ownership_ca_bundle = os.environ.get('GAP_OWNERSHIP_CA_BUNDLE')
+            else:
+                ownership_ca_bundle = environ.get('GAP_OWNERSHIP_CA_BUNDLE')
+        ownership = OwnershipPolicy.load(ownership_fetch, ca_bundle=ownership_ca_bundle) if observations else None
         counts = {s: sum(o["status"] == s for o in observations) for s in ("failure", "success", "unknown")}
         if config.mode == "preview" or not observations:
             result = {"status": "preview" if config.mode == "preview" else "no-observations", "counts": counts}
@@ -133,7 +142,7 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
             dispatcher = (dispatcher_factory or Dispatcher)(Ledger(config.ledger),
                 jira, slack_factory(slack_token, target.channel),
                 trial_id=config.trial_id, transition_id=config.transition_id,
-                transition_fields=config.transition_fields, **target.options)
+                transition_fields=config.transition_fields, ownership=ownership, **target.options)
             data = dispatcher.run(observations)
             if tracking is not None:
                 try:

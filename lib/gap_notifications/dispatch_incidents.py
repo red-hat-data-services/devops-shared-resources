@@ -424,7 +424,8 @@ def _create_journal(value):
 
 class Dispatcher:
     """Single writer only: Jira properties are not compare-and-swap locks."""
-    def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default", jira_environment="stage", channel=None):
+    def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default", jira_environment="stage", channel=None, ownership=None):
+        self.ownership = ownership
         self.target = routing_target(jira_environment, channel)
         if getattr(jira, "base_url", self.target.url) != self.target.url:
             raise ValueError("Jira adapter environment mismatch")
@@ -525,7 +526,8 @@ class Dispatcher:
         self._save()  # Local intent BEFORE Jira create; property is atomic with issue.
         try:
             result = self.jira.create_bug(_summary(obs, **self.target.options), body, labels,
-                notification_state=_bounded(state))
+                notification_state=_bounded(state),
+                **({"extra_fields": self.ownership.extra_fields(obs)} if self.ownership else {}))
             key = _key(result["key"])
             self.data["creates"][identity].update(state="confirmed", key=key)
             attempt.update(state="confirmed", key=key)
@@ -739,6 +741,8 @@ class Dispatcher:
             return  # No unrelated recovery root.
         text = slack_message(obs, jira_url=f"{self.target.url}/browse/{key}", reply=delivery["root"] is not None,
                              **self.target.options)
+        options = ({"blocks": self.ownership.blocks(obs, text, root=delivery["root"] is None)}
+                   if self.ownership else {})
         intent = {"id": str(uuid.uuid4()), "event_id": event, "outcome": obs["status"], "state": "inflight"}
         delivery["intent"] = intent
         _bounded(state)
@@ -746,7 +750,7 @@ class Dispatcher:
         task.update(operation="slack", delivery_id=intent["id"])
         self._save()
         try:
-            result = _receipt(self.slack.send(text, thread_ts=(delivery["root"] or {}).get("ts"), client_msg_id=intent["id"]), channel=self.target.channel)
+            result = _receipt(self.slack.send(text, thread_ts=(delivery["root"] or {}).get("ts"), client_msg_id=intent["id"], **options), channel=self.target.channel)
         except Exception as exc:
             # Definite rejection can be recorded; all ambiguous outcomes retain inflight.
             if isinstance(exc, SlackRateLimitError):

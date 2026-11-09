@@ -28,7 +28,9 @@ def hook(tmp_path):
     def slack_factory(token, channel):
         assert channel == "C0883L8FARE"
         return slack
-    defaults = dict(accepted_urls=[PR], leader_url=LEADER_URL, published_sha="b" * 40,
+    def ownership_fetch(name):
+        return "_default: DevOps\nmappings: {api: [API, Serving]}" if name.startswith("konflux") else "components:\n  default:\n    slack_team_handle: devops"
+    defaults = dict(ownership_fetch=ownership_fetch, accepted_urls=[PR], leader_url=LEADER_URL, published_sha="b" * 40,
                     state_path=root / "state.json", repo_root=root,
                     config=NotificationConfig("write", str(tmp_path / "journal.json"), "monitor-test", "41"),
                     jira_factory=jira_factory, slack_factory=slack_factory,
@@ -39,6 +41,51 @@ def hook(tmp_path):
     return invoke, jira, slack, defaults, calls
 
 
+@pytest.mark.parametrize('explicit,expected', [(None, '/fake/env-ca.pem'), ('/fake/explicit.pem', '/fake/explicit.pem')])
+def test_ca_setting_forwarded_without_preview_credentials(hook, monkeypatch, explicit, expected):
+    from lib.gap_notifications.ownership import OwnershipPolicy
+    invoke, _, _, opts, _ = hook
+    original = OwnershipPolicy.load
+    seen = []
+    def load(fetch=None, *, ca_bundle=None):
+        seen.append(ca_bundle)
+        return original(fetch)
+    monkeypatch.setattr(OwnershipPolicy, 'load', load)
+    class Environment:
+        def get(self, key):
+            assert key == 'GAP_OWNERSHIP_CA_BUNDLE'
+            return '/fake/env-ca.pem'
+    assert invoke(config=replace(opts['config'], mode='preview'), environ=Environment(),
+                  ownership_ca_bundle=explicit)['status'] == 'preview'
+    assert seen == [expected]
+
+
+def test_mapping_failure_isolated_and_no_services(hook):
+    invoke, jira, slack, _, calls = hook
+    def fail(name):
+        raise OSError('offline')
+    assert invoke(ownership_fetch=fail)['status'] == 'error'
+    assert not calls and not jira.calls and not slack.calls
+
+
+@pytest.mark.parametrize('mode,dry_run', [('disabled', False), ('write', True)])
+def test_disabled_dry_run_no_mapping_fetch(hook, mode, dry_run):
+    invoke, _, _, opts, _ = hook
+    def fail(name):
+        pytest.fail('mapping fetch on inactive path')
+    invoke(config=replace(opts['config'], mode=mode), dry_run=dry_run, ownership_fetch=fail)
+
+
+def test_creation_fields_and_existing_ownership_unchanged(hook):
+    invoke, jira, slack, _, _ = hook
+    assert invoke()['status'] == 'settled'
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'API'}, {'name': 'Serving'}]
+    jira.issues['RHAI-1']['fields']['components'] = [{'name': 'Manual'}]
+    invoke()
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'Manual'}]
+    assert len(slack.calls) == 1
+
+
 # The monitor must deduplicate failure, ignore unknown outcomes and close only on explicit
 # recovery.
 def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
@@ -46,6 +93,9 @@ def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
     assert invoke()["status"] == "settled"
     assert len(jira.issues) == len(slack.calls) == 1
     root = slack.calls[0]
+    assert root[1]['blocks'][0]['text'] == {'type': 'mrkdwn', 'text': '@devops', 'verbatim': False}
+    assert all(b['text']['verbatim'] for b in root[1]['blocks'][1:])
+    assert 'link_names' not in root[1] and '@devops' not in root[0]
     assert invoke()["status"] == "settled"
     assert len(slack.calls) == 1
     for payload in [state(expected_components=["api"], runs=[], pr_status="success"),
@@ -55,6 +105,7 @@ def test_real_collector_failure_dedup_unknown_explicit_recovery(hook):
     result = invoke(state(expected_components=["api"], runs=[run("api", "success", uid="recovery")]))
     assert result["status"] == "settled"
     assert jira.closed("RHAI-1") and len(slack.calls) == 2
+    assert all(b['text']['verbatim'] for b in slack.calls[1][1]['blocks'])
     assert slack.calls[1][1]["thread_ts"] == jira.properties["RHAI-1"]["delivery"]["root"]["ts"]
     invoke(state(expected_components=["api"], runs=[run("api", "success", uid="recovery")]))
     invoke()  # historical failure replay cannot create a successor
@@ -83,6 +134,8 @@ def test_preview_no_clients_credentials_or_journal(hook):
 
 class Bomb:
     def get(self, *a):
+        if a == ('GAP_OWNERSHIP_CA_BUNDLE',):
+            return None
         raise AssertionError("must not access credentials")
 
 

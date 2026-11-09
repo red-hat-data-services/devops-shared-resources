@@ -676,13 +676,14 @@ class SlackNotifier:
     def _client(self) -> SlackClient:
         return SlackClient(self.token, session=self.session, timeout=self.timeout)
 
-    def send(self, text: str, *, thread_ts: str | None = None, client_msg_id: str | None = None) -> dict[str, str]:
+    def send(self, text: str, *, thread_ts: str | None = None, client_msg_id: str | None = None, blocks=None) -> dict[str, str]:
         self._validate_inputs()
         return self._client().post_message(
             self.channel,
             text,
             thread_ts=thread_ts,
             client_msg_id=client_msg_id,
+            **({"blocks": blocks} if blocks is not None else {}),
         )
 
 
