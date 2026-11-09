@@ -859,14 +859,12 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
     context = {key: literal(observation.get(key)) for key in (
         "repository", "category", "source_branch", "destination_branch", "component", "pipeline", "observation_id")}
     context.update(notification_heading=target.banner,
-                   notification_status=observation.get("status"),
                    destination_notice=("Staging notification only. This does not establish production failure or recovery."
                                        if target.name == "stage" else
                                        "Production Jira destination. Outcomes reflect only the explicitly supplied evidence."),
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
-                   synthetic=literal(e.get("synthetic")), historical=literal(e.get("historical_snapshot")),
                    revision=literal(e.get("head_sha") or e.get("head-sha")), targets=[], links=[],
                    discussion_url=https_url(discussion_url) if discussion_url else None,
                    metadata_url=https_url(metadata_url) if metadata_url else None)

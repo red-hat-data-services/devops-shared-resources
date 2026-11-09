@@ -2,8 +2,6 @@
 
 {{ destination_notice }}
 
-Historical snapshot: {{ historical }}; synthetic evidence: {{ synthetic }}. Missing flags are unavailable, not an assertion of live evidence.
-
 {{ note }}
 
 ## Failure
@@ -18,10 +16,8 @@ Historical snapshot: {{ historical }}; synthetic evidence: {{ synthetic }}. Miss
 ## Main-to-release feasibility
 
 Dry-runs the normal sync from the current configured source branch to configured active release branches. It does not test the proposed stable PR contents or push changes.
-{% if notification_status == 'failure' %}
 
 Inspect the feasibility job for merge conflicts or configuration/workflow errors.
-{% endif %}
 {% endif %}
 
 ## Explicitly affected targets

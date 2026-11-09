@@ -721,12 +721,30 @@ def test_jira_feasibility_explanation(category, status, environment):
     assert ('## Main-to-release feasibility' in markdown) == (category == 'feasibility')
     assert (explanation in markdown) == (category == 'feasibility')
     assert (explanation in text) == (category == 'feasibility')
-    assert (guidance in markdown) == (category == 'feasibility' and status == 'failure')
-    assert (guidance in text) == (category == 'feasibility' and status == 'failure')
+    assert (guidance in markdown) == (category == 'feasibility')
+    assert (guidance in text) == (category == 'feasibility')
     label = 'Feasibility run' if category == 'feasibility' else 'Creator workflow'
     assert f'[{label}]({workflow_url})' in markdown
     assert f'"text": "{label}"' in text
     assert workflow_url in text
+
+
+# Jira omits provenance boilerplate regardless of the evidence flags, without losing its
+# destination banner or evidence links.
+@pytest.mark.parametrize('environment', ['stage', 'production'])
+@pytest.mark.parametrize('flags', [{}, {'synthetic': False, 'historical_snapshot': False},
+                                   {'synthetic': True, 'historical_snapshot': True}])
+def test_jira_omits_provenance_boilerplate(environment, flags):
+    obs = observation(evidence=dict(flags, pr_url='https://github.com/acme/repo/pull/1'))
+    markdown = render_markdown(obs, jira_environment=environment)
+    adf = _description(obs, jira_environment=environment)
+    JiraNotifier._validate_adf(adf)
+    for text in (markdown, json.dumps(adf)):
+        assert 'Historical snapshot:' not in text
+        assert 'synthetic evidence:' not in text
+        assert 'Missing flags' not in text
+        assert 'https://github.com/acme/repo/pull/1' in text
+    assert markdown.startswith('# GAP STAGING TEST' if environment == 'stage' else '# GAP PRODUCTION')
 
 
 # Grouped targets must stay explicit, and injected Markdown or template text must remain
@@ -1163,14 +1181,14 @@ def test_mutated_production_facade_revalidates_target_and_issue_type():
     assert not session.calls
 
 
-# Production content must retain synthetic labeling and avoid claiming global recovery.
+# Slack production content retains synthetic labeling and avoids claiming global recovery.
 def test_production_presentation_is_labeled_without_claiming_global_recovery():
     from lib.gap_notifications.notify_tools import jira_target, slack_message
     target = jira_target('production')
     obs = observation(environment=target.scope, evidence={'synthetic': True, 'historical_snapshot': True})
     markdown = render_markdown(obs, **target.options)
     assert markdown.startswith('# GAP PRODUCTION') and 'Staging notification only' not in markdown
-    assert 'synthetic evidence: True' in markdown
+    assert 'Historical snapshot:' not in markdown and 'synthetic evidence:' not in markdown
     text = slack_message(dict(obs, status='success'), jira_url=target.url + '/browse/RHAI-1', **target.options)
     assert 'production Jira' in text and 'staging test' not in text
     assert 'Synthetic evidence' in text and 'Recorded snapshot' not in text

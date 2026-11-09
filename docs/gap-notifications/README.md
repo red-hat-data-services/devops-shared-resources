@@ -5,7 +5,8 @@ Leader selection, monitor mutation from the standalone CLI, reopening of closed
 issues, or claim of exactly-once delivery. Staging issues retain the
 `[GAP STAGING TEST]` marker. Explicit production selection uses `[GAP PRODUCTION]`;
 this identifies the Jira destination, not proof of live production build health.
-Jira descriptions retain historical/synthetic provenance in both environments.
+Jira descriptions omit the historical/synthetic provenance boilerplate in both environments;
+the evidence fields remain available to callers without being displayed as raw flags.
 Slack keeps destination and synthetic-test labels without snapshot/check boilerplate.
 
 Slack build alerts show the selected PipelineRun's completion time in UTC, not the
