@@ -139,9 +139,7 @@ WAITING_FOR_EARLY_GATE_DESCRIPTION = (
     "GAP: waiting for Early Gate (auto-merge held)"
 )
 EARLY_GATE_COMMENT_BODY = "/early-gate"
-EARLY_GATE_COMMENT_RE = re.compile(
-    r"^/early-gate(-build)?(?:\s+GAP_PR_COMMIT=[0-9a-f]{40})?\s*$"
-)
+EARLY_GATE_COMMENT_RE = re.compile(r"^/early-gate(-build)?\s*$")
 # overall-status values that allow Leader green (final).
 FINAL_OVERALL_STATUSES = frozenset(
     {OVERALL_STATUS_SUCCESS, OVERALL_STATUS_FAILURE}
@@ -618,9 +616,34 @@ def early_gate_comment_already_present(
     leader_commit: str | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
-    """True when the Leader already has an Early Gate trigger comment."""
+    """True when the current Leader commit already has an Early Gate run."""
     run = gh_runner or _run_gh
     ref = parse_pr_url(leader_pr_url)
+    if leader_commit:
+        endpoint = (
+            f"repos/{ref.owner}/{ref.repo}/commits/{leader_commit}/check-runs"
+            "?per_page=100"
+        )
+        raw = run(
+            [
+                "api",
+                endpoint,
+                "--jq",
+                '[.check_runs[]? | select(.app.slug == "konflux-internal-p02" '
+                'and (.name | split(" / ")[-1] == "early-gate-ci-build")) | .id]',
+            ]
+        )
+        try:
+            matches = json.loads(raw or "[]")
+        except json.JSONDecodeError as exc:
+            raise GapPrMonitorError(
+                f"Invalid Early Gate check-run response for {leader_commit}: {exc}"
+            ) from exc
+        if not isinstance(matches, list):
+            raise GapPrMonitorError(
+                f"Unexpected Early Gate check-run response for {leader_commit}."
+            )
+        return bool(matches)
     endpoint = f"repos/{ref.owner}/{ref.repo}/issues/{ref.number}/comments"
     try:
         raw = run(["api", endpoint, "--paginate"])
@@ -642,10 +665,7 @@ def early_gate_comment_already_present(
         match = EARLY_GATE_COMMENT_RE.match(body)
         if not match:
             continue
-        if leader_commit is None:
-            return True
-        if re.search(rf"\bGAP_PR_COMMIT={re.escape(leader_commit)}\b", body):
-            return True
+        return True
     return False
 
 
@@ -663,11 +683,7 @@ def post_early_gate_trigger_comment(
     Idempotent: skips if a matching comment already exists.
     """
     run = gh_runner or _run_gh
-    body = (
-        f"{EARLY_GATE_COMMENT_BODY} GAP_PR_COMMIT={leader_commit}"
-        if leader_commit
-        else EARLY_GATE_COMMENT_BODY
-    )
+    body = EARLY_GATE_COMMENT_BODY
     if not allow_repeat and early_gate_comment_already_present(
         leader_pr_url, leader_commit=leader_commit, gh_runner=run
     ):
@@ -1507,9 +1523,6 @@ def run_monitor_publish_and_signal(
     previous_payload = load_state(Path(state_path))
     ensure_promotion_gates(previous_payload)
     migrate_legacy_overall_status(previous_payload)
-    previous_component_build_status = get_gate_status(
-        previous_payload, GATE_COMPONENT_BUILDS
-    )
     result = run_monitor(
         state_path,
         check_name=check_name,
@@ -1562,10 +1575,6 @@ def run_monitor_publish_and_signal(
                 leader_url,
                 dry_run=dry_run,
                 leader_commit=published.sha,
-                allow_repeat=(
-                    result.child_head_changed
-                    or previous_component_build_status != GATE_STATUS_SUCCESS
-                ),
                 gh_runner=gh_runner,
             )
         except (GhCommandError, ValueError, RuntimeError) as exc:

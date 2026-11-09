@@ -3083,7 +3083,8 @@ def test_post_early_gate_trigger_comment_is_idempotent_per_leader_commit() -> No
     def gh(args):
         calls.append(list(args))
         if args[0] == "api":
-            return json.dumps([{"body": f"/early-gate GAP_PR_COMMIT={leader_commit}"}])
+            assert "check-runs" in args[1]
+            return json.dumps(["check-run-id"])
         raise AssertionError(f"same Leader commit must not post again: {args}")
 
     assert post_early_gate_trigger_comment(
@@ -3100,7 +3101,8 @@ def test_post_early_gate_trigger_comment_posts_for_new_leader_commit() -> None:
     def gh(args):
         calls.append(list(args))
         if args[0] == "api":
-            return json.dumps([{"body": f"/early-gate GAP_PR_COMMIT={'a' * 40}"}])
+            assert "check-runs" in args[1]
+            return "[]"
         if args[:2] == ["pr", "comment"]:
             return ""
         raise AssertionError(f"unexpected gh call: {args}")
@@ -3109,9 +3111,7 @@ def test_post_early_gate_trigger_comment_posts_for_new_leader_commit() -> None:
         leader, leader_commit=leader_commit, gh_runner=gh
     ) is True
     comment = next(c for c in calls if c[:2] == ["pr", "comment"])
-    assert comment[comment.index("--body") + 1] == (
-        f"/early-gate GAP_PR_COMMIT={leader_commit}"
-    )
+    assert comment[comment.index("--body") + 1] == EARLY_GATE_COMMENT_BODY
 
 
 def test_record_child_head_shas_detects_change() -> None:
@@ -3194,7 +3194,7 @@ def test_coordinator_all_success_comments_early_gate_no_leader_green(
     assert result.overall_status == "early-gate-triggered"
     assert result.early_gate_comment_posted is True
     assert result.leader_status_posted is False
-    assert comments == [f"{EARLY_GATE_COMMENT_BODY} GAP_PR_COMMIT={'a' * 40}"]
+    assert comments == [EARLY_GATE_COMMENT_BODY]
     # No Leader green updater constructed on the early-gate path.
     assert "u" not in holder
 
@@ -3237,7 +3237,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps([{"body": f"/early-gate GAP_PR_COMMIT={'a' * 40}"}])
+            return json.dumps(["existing-check-run"])
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
@@ -3303,7 +3303,7 @@ def test_coordinator_includes_published_leader_commit_in_trigger(
     )
 
     assert result.early_gate_comment_posted is True
-    assert comments == [f"/early-gate GAP_PR_COMMIT={expected}"]
+    assert comments == [EARLY_GATE_COMMENT_BODY]
 
 
 def test_coordinator_retriggers_after_child_head_changes(
@@ -3341,7 +3341,7 @@ def test_coordinator_retriggers_after_child_head_changes(
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps([{"body": "/early-gate"}])
+            return "[]"
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
