@@ -63,7 +63,6 @@ from lib.gap_promotion_gates import (
     strip_legacy_overall_status,
     waiting_for_early_gate,
 )
-from lib.early_gate_generation import early_gate_generation, has_child_sha_tracking
 from lib.gap_check_selection import (
     FeasibilityRun,
     TriggerParseError,
@@ -141,7 +140,7 @@ WAITING_FOR_EARLY_GATE_DESCRIPTION = (
 )
 EARLY_GATE_COMMENT_BODY = "/early-gate"
 EARLY_GATE_COMMENT_RE = re.compile(
-    r"^/early-gate(-build)?(?:\s+GAP_GENERATION=[0-9a-f]{64})?\s*$"
+    r"^/early-gate(-build)?(?:\s+GAP_PR_COMMIT=[0-9a-f]{40})?\s*$"
 )
 # overall-status values that allow Leader green (final).
 FINAL_OVERALL_STATUSES = frozenset(
@@ -616,7 +615,7 @@ def provisional_payload_with_updates(
 def early_gate_comment_already_present(
     leader_pr_url: str,
     *,
-    generation: str | None = None,
+    leader_commit: str | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
     """True when the Leader already has an Early Gate trigger comment."""
@@ -643,9 +642,9 @@ def early_gate_comment_already_present(
         match = EARLY_GATE_COMMENT_RE.match(body)
         if not match:
             continue
-        if generation is None:
+        if leader_commit is None:
             return True
-        if re.search(rf"\bGAP_GENERATION={re.escape(generation)}\b", body):
+        if re.search(rf"\bGAP_PR_COMMIT={re.escape(leader_commit)}\b", body):
             return True
     return False
 
@@ -655,7 +654,7 @@ def post_early_gate_trigger_comment(
     *,
     dry_run: bool = False,
     allow_repeat: bool = False,
-    generation: str | None = None,
+    leader_commit: str | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
     """Comment ``/early-gate`` on the Leader once (RHAI-10942).
@@ -665,12 +664,12 @@ def post_early_gate_trigger_comment(
     """
     run = gh_runner or _run_gh
     body = (
-        f"{EARLY_GATE_COMMENT_BODY} GAP_GENERATION={generation}"
-        if generation
+        f"{EARLY_GATE_COMMENT_BODY} GAP_PR_COMMIT={leader_commit}"
+        if leader_commit
         else EARLY_GATE_COMMENT_BODY
     )
     if not allow_repeat and early_gate_comment_already_present(
-        leader_pr_url, generation=generation, gh_runner=run
+        leader_pr_url, leader_commit=leader_commit, gh_runner=run
     ):
         return False
     if dry_run:
@@ -1559,24 +1558,16 @@ def run_monitor_publish_and_signal(
 
     if early_gate and leader_url:
         try:
-            generation = early_gate_generation(state_payload)
-            if generation is None and has_child_sha_tracking(state_payload):
-                print(
-                    "WARNING: child head-SHA state is incomplete; skipped "
-                    "Early Gate trigger until every child SHA is known.",
-                    file=sys.stderr,
-                )
-            else:
-                early_gate_comment_posted = post_early_gate_trigger_comment(
-                    leader_url,
-                    dry_run=dry_run,
-                    generation=generation,
-                    allow_repeat=(
-                        result.child_head_changed
-                        or previous_component_build_status != GATE_STATUS_SUCCESS
-                    ),
-                    gh_runner=gh_runner,
-                )
+            early_gate_comment_posted = post_early_gate_trigger_comment(
+                leader_url,
+                dry_run=dry_run,
+                leader_commit=published.sha,
+                allow_repeat=(
+                    result.child_head_changed
+                    or previous_component_build_status != GATE_STATUS_SUCCESS
+                ),
+                gh_runner=gh_runner,
+            )
         except (GhCommandError, ValueError, RuntimeError) as exc:
             raise GapPrMonitorError(
                 f"Failed to post Early Gate trigger comment on {leader_url}: {exc}"

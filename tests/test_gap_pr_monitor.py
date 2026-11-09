@@ -7,7 +7,6 @@ from typing import Any
 import pytest
 
 from lib.gap_pr_gates import RepositoryGateDecision
-from lib.early_gate_generation import early_gate_generation
 from lib.pr_status_updater import (
     GhCommandError,
     PullHeadInfo,
@@ -3076,42 +3075,42 @@ def test_post_early_gate_trigger_comment_allows_retrigger() -> None:
     assert comments == [EARLY_GATE_COMMENT_BODY]
 
 
-def test_post_early_gate_trigger_comment_is_idempotent_per_generation() -> None:
+def test_post_early_gate_trigger_comment_is_idempotent_per_leader_commit() -> None:
     leader = "https://github.com/org/gap/pull/9"
-    generation = "a" * 64
+    leader_commit = "a" * 40
     calls: list[list[str]] = []
 
     def gh(args):
         calls.append(list(args))
         if args[0] == "api":
-            return json.dumps([{"body": f"/early-gate GAP_GENERATION={generation}"}])
-        raise AssertionError(f"same generation must not post again: {args}")
+            return json.dumps([{"body": f"/early-gate GAP_PR_COMMIT={leader_commit}"}])
+        raise AssertionError(f"same Leader commit must not post again: {args}")
 
     assert post_early_gate_trigger_comment(
-        leader, generation=generation, gh_runner=gh
+        leader, leader_commit=leader_commit, gh_runner=gh
     ) is False
     assert len(calls) == 1
 
 
-def test_post_early_gate_trigger_comment_posts_new_generation() -> None:
+def test_post_early_gate_trigger_comment_posts_for_new_leader_commit() -> None:
     leader = "https://github.com/org/gap/pull/9"
-    generation = "b" * 64
+    leader_commit = "b" * 40
     calls: list[list[str]] = []
 
     def gh(args):
         calls.append(list(args))
         if args[0] == "api":
-            return json.dumps([{"body": f"/early-gate GAP_GENERATION={'a' * 64}"}])
+            return json.dumps([{"body": f"/early-gate GAP_PR_COMMIT={'a' * 40}"}])
         if args[:2] == ["pr", "comment"]:
             return ""
         raise AssertionError(f"unexpected gh call: {args}")
 
     assert post_early_gate_trigger_comment(
-        leader, generation=generation, gh_runner=gh
+        leader, leader_commit=leader_commit, gh_runner=gh
     ) is True
     comment = next(c for c in calls if c[:2] == ["pr", "comment"])
     assert comment[comment.index("--body") + 1] == (
-        f"/early-gate GAP_GENERATION={generation}"
+        f"/early-gate GAP_PR_COMMIT={leader_commit}"
     )
 
 
@@ -3170,7 +3169,7 @@ def test_coordinator_all_success_comments_early_gate_no_leader_green(
 
     monkeypatch.setattr(
         "scripts.gap_pr_monitor.publish_state",
-        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+        lambda *a, **k: PublishResult(sha="a" * 40, committed=True),
     )
     _fake_child_monitor(monkeypatch, statuses={child: "success"}, overall="early-gate-triggered")
 
@@ -3195,7 +3194,7 @@ def test_coordinator_all_success_comments_early_gate_no_leader_green(
     assert result.overall_status == "early-gate-triggered"
     assert result.early_gate_comment_posted is True
     assert result.leader_status_posted is False
-    assert comments == [EARLY_GATE_COMMENT_BODY]
+    assert comments == [f"{EARLY_GATE_COMMENT_BODY} GAP_PR_COMMIT={'a' * 40}"]
     # No Leader green updater constructed on the early-gate path.
     assert "u" not in holder
 
@@ -3227,7 +3226,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
 
     monkeypatch.setattr(
         "scripts.gap_pr_monitor.publish_state",
-        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+        lambda *a, **k: PublishResult(sha="a" * 40, committed=True),
     )
     _fake_child_monitor(
         monkeypatch,
@@ -3238,7 +3237,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     def gh(args):
         nonlocal comment_posts
         if args[0] == "api":
-            return json.dumps([{"body": "/early-gate"}])
+            return json.dumps([{"body": f"/early-gate GAP_PR_COMMIT={'a' * 40}"}])
         if args[:2] == ["pr", "comment"]:
             comment_posts += 1
             return ""
@@ -3258,7 +3257,7 @@ def test_coordinator_early_gate_skips_duplicate_comment(
     assert comment_posts == 0
 
 
-def test_coordinator_includes_current_child_generation_in_trigger(
+def test_coordinator_includes_published_leader_commit_in_trigger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "state.json"
@@ -3276,11 +3275,11 @@ def test_coordinator_includes_current_child_generation_in_trigger(
         "overall-status": "early-gate-triggered",
     }
     save_state(path, payload)
-    expected = early_gate_generation(payload)
+    expected = "c" * 40
     comments: list[str] = []
     monkeypatch.setattr(
         "scripts.gap_pr_monitor.publish_state",
-        lambda *a, **k: PublishResult(sha="published-sha-abc", committed=True),
+        lambda *a, **k: PublishResult(sha=expected, committed=True),
     )
     _fake_child_monitor(
         monkeypatch, statuses={child: "success"}, overall="early-gate-triggered"
@@ -3304,7 +3303,7 @@ def test_coordinator_includes_current_child_generation_in_trigger(
     )
 
     assert result.early_gate_comment_posted is True
-    assert comments == [f"/early-gate GAP_GENERATION={expected}"]
+    assert comments == [f"/early-gate GAP_PR_COMMIT={expected}"]
 
 
 def test_coordinator_retriggers_after_child_head_changes(

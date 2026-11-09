@@ -36,7 +36,6 @@ if str(REPO_ROOT) not in sys.path:
 
 from lib.leader_lifecycle import retired_outcome
 from lib.leader_history import history_state_outcome, is_history_state
-from lib.early_gate_generation import early_gate_generation, has_child_sha_tracking
 
 from lib.gap_promotion_gates import (
     GATE_COMPONENT_BUILDS,
@@ -101,7 +100,7 @@ EARLY_GATE_JOB_COMPLETE_MARKER = "early-gate-job-complete"
 # Default Early Gate reporting identity (override via GAP_EG_TRUSTED_AUTHORS).
 DEFAULT_TRUSTED_EG_AUTHORS = frozenset({"rhods-ci-bot"})
 ENV_TRUSTED_AUTHORS = "GAP_EG_TRUSTED_AUTHORS"
-EARLY_GATE_GENERATION_RE = re.compile(r"\bGAP_GENERATION=([0-9a-f]{64})\b")
+EARLY_GATE_COMMIT_RE = re.compile(r"\bGAP_PR_COMMIT=([0-9a-f]{40})\b")
 
 # Visible headlines / Status row — build comments (early-gate-build-complete).
 _BUILD_PASSED_PATTERNS = (
@@ -283,7 +282,7 @@ def select_latest_early_gate_outcome(
     *,
     trusted_authors: frozenset[str] | None = None,
     gate: str = GATE_EARLY_GATE_BUILD,
-    generation: str | None = None,
+    leader_commit: str | None = None,
 ) -> EarlyGateCommentOutcome | None:
     """Pick the latest trusted comment for one EG gate (build or test)."""
     allowed = (
@@ -305,9 +304,9 @@ def select_latest_early_gate_outcome(
         if not is_trusted_early_gate_author(login, trusted=allowed):
             continue
         body = str(comment.get("body") or "")
-        if generation is not None:
-            match = EARLY_GATE_GENERATION_RE.search(body)
-            if match is None or match.group(1) != generation:
+        if leader_commit is not None:
+            match = EARLY_GATE_COMMIT_RE.search(body)
+            if match is None or match.group(1) != leader_commit:
                 continue
         outcome = parse(body)
         if outcome is None:
@@ -339,22 +338,22 @@ def resolve_eg_gate_status(
     comments: Sequence[dict[str, Any]],
     labels: Sequence[str],
     trusted_authors: frozenset[str] | None = None,
-    generation: str | None = None,
+    leader_commit: str | None = None,
 ) -> tuple[str | None, str]:
     """Resolve one EG gate from comments (preferred) or Leader labels."""
     selected = select_latest_early_gate_outcome(
         comments,
         trusted_authors=trusted_authors,
         gate=gate,
-        generation=generation,
+        leader_commit=leader_commit,
     )
     if selected is not None:
         return (
             selected.overall_status,
             f"comment id={selected.comment_id} author={selected.author}",
         )
-    if generation is not None:
-        return None, "no trusted terminal comment for current child generation"
+    if leader_commit is not None:
+        return None, "no trusted terminal comment for current GAP PR commit"
     if gate == GATE_EARLY_GATE_BUILD:
         from_labels = gate_status_from_labels(
             labels,
@@ -478,6 +477,20 @@ def fetch_leader_head_ref(
     return head
 
 
+def fetch_leader_head_sha(
+    leader_pr_url: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> str:
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    sha = run(["api", f"repos/{ref.slug}/pulls/{ref.number}", "--jq", ".head.sha"])
+    sha = (sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", sha):
+        raise GapPrMonitorError(f"Could not resolve current Leader commit for {leader_pr_url}.")
+    return sha
+
+
 def decide_overall_from_comments(
     *,
     current_overall: str | None = None,
@@ -486,6 +499,7 @@ def decide_overall_from_comments(
     labels: Sequence[str] | None = None,
     payload: dict[str, Any] | None = None,
     eg_already_concluded: bool | None = None,
+    leader_commit: str | None = None,
 ) -> tuple[str | None, str, dict[str, str | None]]:
     """Update EG gates from comments/labels; return derived overall when both done.
 
@@ -504,9 +518,6 @@ def decide_overall_from_comments(
     migrate_legacy_overall_status(working)
 
     builds = get_gate_status(working, GATE_COMPONENT_BUILDS)
-    generation = early_gate_generation(working)
-    if generation is None and has_child_sha_tracking(working):
-        generation = ""
     current_snap = {
         GATE_EARLY_GATE_BUILD: get_gate_status(working, GATE_EARLY_GATE_BUILD),
         GATE_EARLY_GATE_TEST: get_gate_status(working, GATE_EARLY_GATE_TEST),
@@ -547,14 +558,14 @@ def decide_overall_from_comments(
         comments=comments,
         labels=label_list,
         trusted_authors=trusted_authors,
-        generation=generation,
+        leader_commit=leader_commit,
     )
     test_status, test_src = resolve_eg_gate_status(
         gate=GATE_EARLY_GATE_TEST,
         comments=comments,
         labels=label_list,
         trusted_authors=trusted_authors,
-        generation=generation,
+        leader_commit=leader_commit,
     )
     if build_status is not None:
         set_gate_status(working, GATE_EARLY_GATE_BUILD, build_status)
@@ -783,6 +794,14 @@ def run_early_gate_results(
     migrate_legacy_overall_status(payload)
     previous = derive_legacy_overall_status(payload)
     eg_already = early_gate_concluded(payload)
+    leader_commit = fetch_leader_head_sha(leader_url, gh_runner=gh_runner)
+    if publish and not dry_run and (root / ".git").exists():
+        run_git = git_runner or (lambda args, cwd=root: gpm._run_git(args, cwd=cwd))
+        checked_out = run_git(["rev-parse", "HEAD"], cwd=root).strip()
+        if checked_out != leader_commit:
+            raise GapPrMonitorError(
+                "Leader head moved while loading Early Gate results; rerun for the current commit."
+            )
 
     # Always reconcile full comment + label history (wake-up may be stale).
     comments = list_leader_pr_comments(leader_url, gh_runner=gh_runner)
@@ -796,6 +815,7 @@ def run_early_gate_results(
         labels=leader_labels,
         payload=payload,
         eg_already_concluded=eg_already,
+        leader_commit=leader_commit,
     )
     strip_legacy_overall_status(payload)
     derived = derive_legacy_overall_status(payload)
@@ -878,6 +898,7 @@ def run_early_gate_results(
         commit_message=(
             f"Update GAP promotion-gates from merge-orchestrator ({new_overall})"
         ),
+        rebase_on_conflict=False,
         git_runner=git_runner,
         archive=new_overall == OVERALL_STATUS_SUCCESS,
     )
