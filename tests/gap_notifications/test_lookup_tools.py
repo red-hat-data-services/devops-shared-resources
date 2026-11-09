@@ -200,7 +200,7 @@ def test_render_condenses_only_not_found_entries():
         {'component': 'arm', 'jira_key': 'RHAI-3', 'status': 'confirmed', 'closed': False,
          'slack_url': 'https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001'},
     ]
-    projection = {'status': 'checked', 'rows': {PR: empty + links}}
+    projection = {'status': 'checked', 'channel': 'C0883L8FARE', 'rows': {PR: empty + links}}
     cell = tracking_cell(projection, PR)
     assert cell.count('No confirmed registry match') == 1
     assert cell.endswith('No confirmed registry match (16 other components)')
@@ -289,7 +289,7 @@ def test_inspect_missing_malformed_safe(setup, state):
 
 # Production tracking and inspection must use production links and reject staging adapters.
 def test_environment_scoped_tracking_and_inspection(tmp_path):
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     target = jira_target('production')
     jira, slack = Jira(), Slack()
     jira.base_url = target.url

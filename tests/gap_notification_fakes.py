@@ -76,7 +76,7 @@ class Slack:
         self.calls, self.fail = [], False
 
     def send(self, text, **kwargs):
-        from lib.gap_notifications.dispatch_incidents import CHANNEL
+        CHANNEL = "C0883L8FARE"
         self.calls.append((text, kwargs))
         if self.fail:
             raise TimeoutError("SECRET")

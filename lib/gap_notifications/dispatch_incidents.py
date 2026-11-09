@@ -21,7 +21,7 @@ Cosmetic ADF mechanics live in notify_tools; delivery never imports lookup_tools
 from __future__ import annotations
 
 from lib.gap_notifications.notify_tools import (JiraNotifier, category_labels, description,
-    project_body, slack_message, jira_target, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
+    project_body, slack_message, routing_target, configured_channel, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
 import copy
 import json
 from typing import Any
@@ -142,8 +142,7 @@ def incident_key(observation: dict) -> str:
 
 
 STAGE = "https://stage-redhat.atlassian.net"
-CHANNEL = "C0883L8FARE"
-ENVIRONMENT = "stage-redhat.atlassian.net/RHAI/C0883L8FARE"
+LEGACY_ENVIRONMENT = "stage-redhat.atlassian.net/RHAI/C0883L8FARE"
 PROPERTY_LIMIT = 24 * 1024
 
 
@@ -155,8 +154,8 @@ def _stamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def validate_observations(observations, *, jira_environment="stage"):
-    target = jira_target(jira_environment)
+def validate_observations(observations, *, jira_environment="stage", channel=None):
+    target = routing_target(jira_environment, channel)
     if not isinstance(observations, list) or len(observations) > 1000:
         raise ValueError("expected at most 1000 normalized observations")
     for obs in observations:
@@ -168,14 +167,14 @@ def validate_observations(observations, *, jira_environment="stage"):
     return observations
 
 
-def bind_trial(ledger, trial_id, *, jira_environment="stage"):
+def bind_trial(ledger, trial_id, *, jira_environment="stage", channel=None):
     if not isinstance(trial_id, str) or not re.fullmatch(r"[a-zA-Z0-9_-]{1,64}", trial_id):
         raise ValueError("invalid trial ID")
     if ledger and (ledger.get("schema") != 2 or ledger.get("trial_id") != trial_id):
         raise ValueError("registry v2 requires a new schema2 ledger with matching trial")
-    target = jira_target(jira_environment)
+    target = routing_target(jira_environment, channel)
     # Journals without a binding predate production support and are staging-only.
-    if ledger and ledger.get("scope", ENVIRONMENT) != target.scope:
+    if ledger and ledger.get("scope", LEGACY_ENVIRONMENT) != target.scope:
         raise ValueError("journal Jira environment mismatch")
     for task in ledger.get("outbox", []):
         validate_observations([task["observation"]], **target.options)
@@ -193,8 +192,8 @@ def incident_label(key, trial_id="default"):
     return "gap-registry-" + _hash(trial_id + ":" + key)[:40]
 
 
-def ingest(ledger, observations, *, trial_id="default", jira_environment="stage"):
-    target = jira_target(jira_environment)
+def ingest(ledger, observations, *, trial_id="default", jira_environment="stage", channel=None):
+    target = routing_target(jira_environment, channel)
     validate_observations(observations, **target.options)
     data = bind_trial(ledger, trial_id, **target.options)
     for obs in observations:
@@ -262,11 +261,11 @@ def _closed(issue):
     return issue.get("fields", {}).get("status", {}).get("statusCategory", {}).get("key") == "done"
 
 
-def _summary(observation, *, jira_environment="stage"):
-    return f"[{jira_target(jira_environment).banner}] {observation['category']} failure: {observation['repository']}"[:250]
+def _summary(observation, *, jira_environment="stage", channel=None):
+    return f"[{routing_target(jira_environment, channel).banner}] {observation['category']} failure: {observation['repository']}"[:250]
 
 
-def _verify_issue(issue, episode, *, jira_environment="stage"):
+def _verify_issue(issue, episode, *, jira_environment="stage", channel=None):
     fields = issue.get("fields", {})
     _key(issue.get("key"))
     if (fields.get("project", {}).get("key") != "RHAI"
@@ -285,15 +284,15 @@ def _key(value):
     return value
 
 
-def _description(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
+def _description(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage", channel=None):
     return description(observation, discussion_url=discussion_url, metadata_url=metadata_url,
-                       **jira_target(jira_environment).options)
+                       **routing_target(jira_environment, channel).options)
 
 
-def _presentation(observation, existing_labels, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
+def _presentation(observation, existing_labels, *, discussion_url=None, metadata_url=None, jira_environment="stage", channel=None):
     """Finish deterministic rendering/adapter validation before durable write intent."""
     body = _description(observation, discussion_url=discussion_url, metadata_url=metadata_url,
-                        **jira_target(jira_environment).options)
+                        **routing_target(jira_environment, channel).options)
     labels = sorted(set(existing_labels) | set(category_labels(observation["category"])))
     JiraNotifier._validate_adf(body)
     JiraNotifier._validate_labels(labels)
@@ -313,7 +312,7 @@ def _bounded(state):
 ABSENT_RECEIPT = object()
 
 
-def validate_resolution(resolution):
+def validate_resolution(resolution, *, channel=None):
     """Validate explicit reconciliation shape before ingest, locking or clients."""
     if not isinstance(resolution, dict) or not isinstance(resolution.get("task_id"), str) or not resolution["task_id"].strip():
         raise ValueError("receipt task ID required")
@@ -322,7 +321,7 @@ def validate_resolution(resolution):
         raise ValueError("explicit receipt audit reason required")
     _key(value.get("key"))
     if value.get("system") == "slack":
-        _receipt(value)
+        _receipt(value, channel=channel)
     elif value.get("system") == "jira":
         if "done" in value and not isinstance(value["done"], bool):
             raise ValueError("invalid done attestation")
@@ -330,19 +329,20 @@ def validate_resolution(resolution):
         raise ValueError("receipt system must be jira or slack")
 
 
-def _receipt(value):
-    if not isinstance(value, dict) or value.get("channel") != CHANNEL or not re.fullmatch(r"[0-9]+\.[0-9]+", str(value.get("ts", ""))):
+def _receipt(value, *, channel=None):
+    channel = configured_channel(channel)
+    if not isinstance(value, dict) or value.get("channel") != channel or not re.fullmatch(r"[0-9]+\.[0-9]+", str(value.get("ts", ""))):
         raise ValueError("invalid Slack receipt")
-    return {"channel": CHANNEL, "ts": value["ts"]}
+    return {"channel": channel, "ts": value["ts"]}
 
 
-def _validate_state(value, key, trial, label, *, jira_environment="stage"):
+def _validate_state(value, key, trial, label, *, jira_environment="stage", channel=None):
     if not isinstance(value, dict):
         raise ValueError("registry property missing")
     _bounded(value)
     if not {"schema", "scope", "trial_id", "incident_key", "episode_id", "seen_event_ids", "last_event", "last_outcome", "jira_intent", "delivery"}.issubset(value):
         raise ValueError("incomplete registry property")
-    target = jira_target(jira_environment)
+    target = routing_target(jira_environment, channel)
     if (value.get("schema") != 1 or value.get("scope") != target.scope
             or json.loads(key).get("environment") != target.scope
             or value.get("trial_id") != trial or value.get("incident_key") != key
@@ -362,7 +362,7 @@ def _validate_state(value, key, trial, label, *, jira_environment="stage"):
     if delivery["last_event"] is not None and delivery["last_event"] not in seen:
         raise ValueError("unknown delivered event")
     if delivery.get("root") is not None:
-        _receipt(delivery["root"])
+        _receipt(delivery["root"], channel=channel)
     for intent in (value.get("jira_intent"), delivery.get("intent")):
         if intent is not None:
             if not isinstance(intent, dict) or intent.get("outcome") not in {"failure", "success"} or not re.fullmatch(r"[0-9a-f]{64}", str(intent.get("event_id", ""))):
@@ -424,8 +424,8 @@ def _create_journal(value):
 
 class Dispatcher:
     """Single writer only: Jira properties are not compare-and-swap locks."""
-    def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default", jira_environment="stage"):
-        self.target = jira_target(jira_environment)
+    def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default", jira_environment="stage", channel=None):
+        self.target = routing_target(jira_environment, channel)
         if getattr(jira, "base_url", self.target.url) != self.target.url:
             raise ValueError("Jira adapter environment mismatch")
         bind_trial({}, trial_id, **self.target.options)
@@ -576,7 +576,7 @@ class Dispatcher:
             intent = state["delivery"].get("intent")
             if not intent or intent["event_id"] != _event(task["observation"]):
                 raise ValueError("no matching Slack uncertainty to resolve")
-            receipt = _receipt(value)
+            receipt = _receipt(value, channel=self.target.channel)
             if not state["delivery"]["root"]:
                 state["delivery"]["root"] = receipt
             state["delivery"].update(last_event=intent["event_id"], intent=None)
@@ -596,10 +596,12 @@ class Dispatcher:
 
     def run(self, observations, *, receipt=ABSENT_RECEIPT):
         if receipt is not ABSENT_RECEIPT:
-            validate_resolution(receipt)
+            validate_resolution(receipt, channel=self.target.channel)
         if getattr(self.jira, "base_url", self.target.url) != self.target.url:
             raise ValueError("Jira adapter environment mismatch")
         validate_observations(observations, **self.target.options)
+        if getattr(self.slack, "channel", self.target.channel) != self.target.channel:
+            raise ValueError("Slack adapter channel mismatch")
         self.attempted_creates = set()
         with self.ledger.locked():
             self.data = ingest(self.ledger.read(), observations, trial_id=self.trial_id, **self.target.options)
@@ -681,7 +683,7 @@ class Dispatcher:
             if obs["status"] == "failure":
                 root = state["delivery"]["root"]  # Jira registry only, never evidence.
                 validated_property(issue, state, trial=self.trial_id, identity=task["incident_key"], **self.target.options)
-                body, labels = _presentation(obs, [], discussion_url=discussion_url(root) if root else None,
+                body, labels = _presentation(obs, [], discussion_url=discussion_url(root, channel=self.target.channel) if root else None,
                                              metadata_url=metadata_url(key, **self.target.options), **self.target.options)
             if obs["status"] == "success" and not _closed(issue) and not self.transition_id:
                 raise RegistryHold("explicit done transition required")
@@ -717,7 +719,7 @@ class Dispatcher:
                                        trial=self.trial_id, identity=task["incident_key"], **self.target.options)
             root = state["delivery"]["root"]
             current = issue["fields"].get("description")
-            projected = project_body(current, discussion_url(root) if root else None,
+            projected = project_body(current, discussion_url(root, channel=self.target.channel) if root else None,
                                      metadata=metadata_url(key, **self.target.options), **self.target.options)
             if JiraNotifier._adf_signature(current) != JiraNotifier._adf_signature(projected):
                 self.jira.update_issue(key, description=projected)
@@ -744,7 +746,7 @@ class Dispatcher:
         task.update(operation="slack", delivery_id=intent["id"])
         self._save()
         try:
-            result = _receipt(self.slack.send(text, thread_ts=(delivery["root"] or {}).get("ts"), client_msg_id=intent["id"]))
+            result = _receipt(self.slack.send(text, thread_ts=(delivery["root"] or {}).get("ts"), client_msg_id=intent["id"]), channel=self.target.channel)
         except Exception as exc:
             # Definite rejection can be recorded; all ambiguous outcomes retain inflight.
             if isinstance(exc, SlackRateLimitError):
@@ -764,17 +766,17 @@ class Dispatcher:
         self._put(key, state)
 
 
-def discussion_url(root):
-    receipt = _receipt(root)
+def discussion_url(root, *, channel=None):
+    receipt = _receipt(root, channel=channel)
     return f"{SLACK_ORIGIN}/archives/{receipt['channel']}/p{receipt['ts'].replace('.', '')}"
 
 
-def validated_property(issue, state, *, trial=None, identity=None, jira_environment="stage"):
+def validated_property(issue, state, *, trial=None, identity=None, jira_environment="stage", channel=None):
     """Validate full stored scope/identity before using routing data; never description."""
     if not isinstance(state, dict):
         raise ValueError("missing property")
     stored_trial = state.get("trial_id")
-    bind_trial({}, stored_trial)
+    bind_trial({}, stored_trial, jira_environment=jira_environment, channel=channel)
     if trial is not None and trial != stored_trial:
         raise ValueError("trial mismatch")
     stored_identity = state.get("incident_key")
@@ -783,7 +785,7 @@ def validated_property(issue, state, *, trial=None, identity=None, jira_environm
     if incident_key(obs) != stored_identity or (identity is not None and identity != stored_identity):
         raise ValueError("incident mismatch")
     label = incident_label(stored_identity, stored_trial)
-    target = jira_target(jira_environment)
+    target = routing_target(jira_environment, channel)
     checked = _validate_state(state, stored_identity, stored_trial, label, **target.options)
     # Summary retains caller repository spelling; identity canonicalizes it.
     # Validate that spelling against the stored identity, never against body links.
@@ -802,5 +804,5 @@ def validated_property(issue, state, *, trial=None, identity=None, jira_environm
     return checked
 
 
-def metadata_url(key, *, jira_environment="stage"):
-    return f"{jira_target(jira_environment).url}/rest/api/3/issue/{_key(key)}/properties/gap.notification.v1"
+def metadata_url(key, *, jira_environment="stage", channel=None):
+    return f"{routing_target(jira_environment, channel).url}/rest/api/3/issue/{_key(key)}/properties/gap.notification.v1"

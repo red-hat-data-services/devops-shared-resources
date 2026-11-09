@@ -3,7 +3,7 @@
 JiraNotifier enforces explicitly selected origin/project/Bug scope, atomic initial properties,
 restricted content and stronger readbacks; completed issues are not reopened or
 content-edited. SlackNotifier preserves explicit-channel sends and mutable
-configuration; its callers own the fixed staging-channel policy. Generic Jira,
+configuration; its callers supply the configured notification destination. Generic Jira,
 Slack and ADF operations remain outside this package.
 
 Content helpers escape/bound supplied evidence, render the packaged issue
@@ -46,8 +46,11 @@ class JiraTarget:
     """Allowlisted destination; evidence never selects credentials or routing."""
     name: str
     url: str
-    scope: str
     banner: str
+
+    @property
+    def scope(self):
+        return self.url.removeprefix("https://") + "/RHAI/" + configured_channel()
 
     @property
     def options(self):
@@ -55,13 +58,43 @@ class JiraTarget:
         return {} if self.name == "stage" else {"jira_environment": self.name}
 
 
+def configured_channel(channel=None):
+    """Require an explicit configured Slack ID, never infer it from evidence."""
+    if channel is None:
+        import os
+        channel = os.environ.get("GAP_SLACK_CHANNEL")
+    if not isinstance(channel, str) or not re.fullmatch(r"[CG][A-Z0-9]+", channel):
+        raise ValueError("GAP_SLACK_CHANNEL must be a nonblank Slack channel ID")
+    return channel
+
+
+@dataclass(frozen=True)
+class RoutingTarget:
+    jira: JiraTarget
+    channel: str
+
+    def __getattr__(self, name):
+        return getattr(self.jira, name)
+
+    @property
+    def scope(self):
+        return self.jira.url.removeprefix("https://") + "/RHAI/" + self.channel
+
+    @property
+    def options(self):
+        return {**self.jira.options, "channel": self.channel}
+
+
+def routing_target(name="stage", channel=None):
+    return RoutingTarget(jira_target(name), configured_channel(channel))
+
+
 def jira_target(name="stage"):
     """Resolve an explicit selector without reading environment variables or secrets."""
     if not isinstance(name, str) or name not in {"stage", "production"}:
         raise ValueError("Jira environment must be stage or production")
     host = "stage-redhat.atlassian.net" if name == "stage" else "redhat.atlassian.net"
-    return JiraTarget(name, "https://" + host, host + "/RHAI/C0883L8FARE",
-                      "GAP STAGING TEST" if name == "stage" else "GAP PRODUCTION")
+    return JiraTarget(name, "https://" + host, "GAP STAGING TEST" if name == "stage" else "GAP PRODUCTION")
 
 
 STAGING_JIRA_ORIGIN = "https://stage-redhat.atlassian.net"
@@ -742,7 +775,7 @@ def _slack_merge_links(observation):
     return links
 
 
-def slack_message(observation, *, jira_url, reply=False, jira_environment="stage"):
+def slack_message(observation, *, jira_url, reply=False, jira_environment="stage", channel=None):
     """Render an explicitly scoped notification without clients, lookups or delivery-state changes.
 
     Only selected evidence is displayed; this is not a general secret scrubber.
@@ -821,7 +854,7 @@ def category_labels(category):
             "feasibility": ["gap-sync-failure", "gap-feasibility-failure"]}[category]
 
 
-def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
+def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage", channel=None):
     target = jira_target(jira_environment)
     e = observation["evidence"]
     run = e.get("selected-run") or {}
@@ -859,7 +892,7 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
     return rendered
 
 
-def description(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage"):
+def description(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage", channel=None):
     return markdown_to_adf(render_markdown(observation, discussion_url=discussion_url, metadata_url=metadata_url,
                                          **jira_target(jira_environment).options))
 
@@ -879,7 +912,7 @@ def section(url, *, metadata=False):
     return [heading, {"type": "paragraph", "content": content}]
 
 
-def _managed_indices(body, *, metadata=False, jira_environment="stage"):
+def _managed_indices(body, *, metadata=False, jira_environment="stage", channel=None):
     if not isinstance(body, dict) or body.get("type") != "doc" or not isinstance(body.get("content"), list):
         raise ValueError("description unavailable")
     nodes = body["content"]
@@ -895,7 +928,7 @@ def _managed_indices(body, *, metadata=False, jira_environment="stage"):
         try:
             url = paragraph["content"][0]["marks"][0]["attrs"]["href"]
             pattern = (re.escape(jira_target(jira_environment).url) + r"/rest/api/3/issue/RHAI-[1-9][0-9]*/properties/gap\.notification\.v1"
-                       if metadata else re.escape(SLACK_ORIGIN) + r"/archives/C0883L8FARE/p[0-9]+")
+                       if metadata else re.escape(SLACK_ORIGIN) + r"/archives/" + re.escape(configured_channel(channel)) + r"/p[0-9]+")
             if not re.fullmatch(pattern, url) or paragraph != section(url, metadata=metadata)[1]:
                 raise ValueError("edited discussion section")
         except (KeyError, IndexError, TypeError):
@@ -903,13 +936,13 @@ def _managed_indices(body, *, metadata=False, jira_environment="stage"):
     return indices
 
 
-def project_body(body, url, *, metadata=None, jira_environment="stage"):
+def project_body(body, url, *, metadata=None, jira_environment="stage", channel=None):
     updated = copy.deepcopy(body)
     # Plan both sections before returning any mutation; edits/duplicates fail closed.
     for value, is_metadata in ((url, False), (metadata, True)):
         if value is None:
             continue
-        indices = _managed_indices(updated, metadata=is_metadata, **jira_target(jira_environment).options)
+        indices = _managed_indices(updated, metadata=is_metadata, **routing_target(jira_environment, channel).options)
         nodes = section(value, metadata=is_metadata)
         if indices:
             updated["content"][indices[0]:indices[0] + 2] = nodes
@@ -919,9 +952,9 @@ def project_body(body, url, *, metadata=None, jira_environment="stage"):
     return updated
 
 
-def visible_link_status(body, url, *, metadata=False, jira_environment="stage"):
+def visible_link_status(body, url, *, metadata=False, jira_environment="stage", channel=None):
     try:
-        indices = _managed_indices(body, metadata=metadata, **jira_target(jira_environment).options)
+        indices = _managed_indices(body, metadata=metadata, **routing_target(jira_environment, channel).options)
         if not indices:
             return "missing"
         return "match" if body["content"][indices[0] + 1] == section(url, metadata=metadata)[1] else "mismatch"

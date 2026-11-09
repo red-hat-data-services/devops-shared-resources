@@ -24,15 +24,15 @@ The redundant promotion branch line is omitted; failure-reason behavior is uncha
 
 | URL | Internal target | Required observation `environment` |
 | --- | --- | --- |
-| `https://stage-redhat.atlassian.net` (default only when unset) | `stage` | `stage-redhat.atlassian.net/RHAI/C0883L8FARE` |
-| `https://redhat.atlassian.net` | `production` | `redhat.atlassian.net/RHAI/C0883L8FARE` |
+| `https://stage-redhat.atlassian.net` (default only when unset) | `stage` | `stage-redhat.atlassian.net/RHAI/<GAP_SLACK_CHANNEL>` |
+| `https://redhat.atlassian.net` | `production` | `redhat.atlassian.net/RHAI/<GAP_SLACK_CHANNEL>` |
 
 Only these exact origins, optionally followed by one slash, are accepted.
 Explicit empty values, whitespace, case variants, HTTP, credentials, ports,
 paths, query/fragment delimiters and lookalike hosts fail closed. Remove legacy
 `GAP_JIRA_ENVIRONMENT`: its presence (even empty or matching) is rejected with
 sanitized migration guidance, never ignored or used as a fallback. Project `RHAI`, issue type `Bug`,
-and Slack channel `C0883L8FARE` remain fixed. Only staging also accepts its legacy
+remain fixed; Slack destination is selected by required `GAP_SLACK_CHANNEL`. Only staging also accepts its legacy
 numeric issue-type ID `10016`. The deprecated `--jira-url` option remains a matching assertion
 with the same URL rules, not an independent routing override. Internal Python
 name-based target/config APIs and environment-bound identities remain unchanged.
@@ -417,3 +417,31 @@ Jira-registry/manual-closure-successor policy. Those results are not v2 verifica
 proof production failures recovered. Historical failure, synthetic recovery/recurrence,
 and real staging writes are explicitly separate concepts. No production workflow wiring,
 newest-Leader reconciliation, bulk creates or distributed coordination is included.
+
+
+## Configured destination and workflow boundary
+
+`GAP_SLACK_CHANNEL` is authoritative and must be a nonblank Slack channel ID.
+There is no fixed-channel allowlist or routing fallback. CLI `--channel` is
+an optional matching assertion, never an override. Requested channel, adapter,
+acknowledgement, stored root and manually attested receipt must agree.
+Slack links retain the exact verified workspace origin.
+
+Channel remains part of incident identity. Selecting the historical channel
+preserves existing identities and dedup. Changing channels selects a separate
+namespace, may create new Jira incidents, and does not migrate or automatically
+close old-channel incidents. Old-channel journals/properties are not reused.
+Example channel IDs in this document are examples only, not defaults.
+
+`scripts/gap_monitor_workflow.py` owns workflow notification configuration,
+environment-specific recovery defaults and receipt-only skip policy. Its
+stdlib-only `receipt` command runs after the trusted shared checkout and before
+dependency setup. Its `run` command resolves policy and invokes the unchanged
+monitor entry point. YAML retains infrastructure and write/non-dry-run credential
+boundaries only. Invalid/disabled/skip outcomes emit bounded diagnostics.
+Production recovery remains held without a verified transition.
+
+Roll out shared support before the new promoter caller. Both moving writer refs
+remain unchanged. Publishing shared changes may affect live runs; publishing the
+new promoter caller removes the previous channel block and can enable delivery.
+Publication and activation require separate authorization.

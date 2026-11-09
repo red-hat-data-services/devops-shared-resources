@@ -4,7 +4,7 @@
 Without --write, validate supplied observation JSON and ingest it against a
 trial-bound journal snapshot in memory, printing a preview without authenticated
 clients or journal writes. With --write, use explicitly supplied environment
-credentials for the selected Jira environment/fixed Slack channel and existing
+credentials for the selected Jira environment/configured Slack channel and existing
 dispatcher; an empty observation list can drain pending work. Receipt resolution
 is an explicit write-mode operator action, not automatic proof of delivery.
 
@@ -27,8 +27,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from lib.gap_notifications.dispatch_incidents import CHANNEL, Dispatcher, Ledger, bind_trial, ingest, validate_observations
-from lib.gap_notifications.notify_tools import jira_target_from_url, STAGING_JIRA_ORIGIN
+from lib.gap_notifications.dispatch_incidents import Dispatcher, Ledger, bind_trial, ingest, validate_observations
+from lib.gap_notifications.notify_tools import configured_channel, routing_target, jira_target_from_url, STAGING_JIRA_ORIGIN
 
 
 def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdout=None):
@@ -41,7 +41,7 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
     parser.add_argument("--jira-url", help="Deprecated matching assertion of GAP_JIRA_URL, never a routing override")
     parser.add_argument("--project", default="RHAI")
     parser.add_argument("--issue-type", default="Bug", choices=["Bug", "10016"])
-    parser.add_argument("--channel", default=CHANNEL)
+    parser.add_argument("--channel", help="Matching assertion of GAP_SLACK_CHANNEL, never a routing override")
     parser.add_argument("--transition-id", help="Explicit verified transition to done for the selected Jira environment")
     parser.add_argument("--transition-fields", default="{}", help="JSON fields required for closure")
     parser.add_argument("--resolve-receipt", help="JSON file containing task_id and operator-attested receipt/reason")
@@ -54,9 +54,11 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
                               "guidance": "Remove GAP_JIRA_ENVIRONMENT; use GAP_JIRA_URL."}), file=out)
             return 1
         destination = jira_target_from_url(env.get("GAP_JIRA_URL", STAGING_JIRA_ORIGIN))
+        channel = configured_channel(env.get("GAP_SLACK_CHANNEL", ""))
+        route = routing_target(destination.name, channel)
         asserted = jira_target_from_url(args.jira_url) if args.jira_url is not None else destination
-        if asserted != destination or args.project != "RHAI" or args.channel != CHANNEL:
-            raise ValueError("destination must match the selected Jira environment and fixed project/channel")
+        if asserted != destination or args.project != "RHAI" or (args.channel is not None and args.channel != channel):
+            raise ValueError("destination must match the selected Jira environment and fixed project and configured channel")
         if destination.name == "production" and args.issue_type != "Bug":
             raise ValueError("production requires the Bug type name, not a staging type ID")
         if args.inspect:
@@ -71,13 +73,13 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
             if not all(isinstance(v, str) and v.strip() for v in (email, token)):
                 raise ValueError("explicit Jira environment credentials required")
             jira = (jira_factory or JiraNotifier)(destination.url, "RHAI", args.issue_type, email, token, **destination.options)
-            print(json.dumps(inspect_issue(jira, args.inspect, trial=args.trial_id, **destination.options), indent=2), file=out)
+            print(json.dumps(inspect_issue(jira, args.inspect, trial=args.trial_id, **route.options), indent=2), file=out)
             return 0
         from lib.gap_notifications.dispatch_incidents import ABSENT_RECEIPT, validate_resolution
         receipt = ABSENT_RECEIPT
         if args.resolve_receipt is not None:
             receipt = json.loads(Path(args.resolve_receipt).read_text())
-            validate_resolution(receipt)
+            validate_resolution(receipt, channel=channel)
         args.trial_id = args.trial_id or "default"
         if not args.observations or not args.ledger:
             raise ValueError("observations and ledger required outside inspect mode")
@@ -92,13 +94,13 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
         if source.stat().st_size > 4 * 1024 * 1024:
             raise ValueError("observation file exceeds 4 MiB")
         observations = json.loads(source.read_text())
-        validate_observations(observations, **destination.options)
+        validate_observations(observations, **route.options)
         ledger = Ledger(target)
-        bind_trial(ledger.read(), args.trial_id, **destination.options)
+        bind_trial(ledger.read(), args.trial_id, **route.options)
         if not args.write:
             if args.resolve_receipt:
                 raise ValueError("receipt resolution requires --write")
-            result = ingest(ledger.read(), observations, trial_id=args.trial_id, **destination.options)
+            result = ingest(ledger.read(), observations, trial_id=args.trial_id, **route.options)
             summary = {"dry_run": True, "registry_version": 2,
                        "incidents": len({t["incident_key"] for t in result.get("outbox", [])}),
                        "outbox": result.get("outbox", [])}
@@ -117,9 +119,9 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
                 from lib.gap_notifications.notify_tools import SlackNotifier
                 slack_factory = SlackNotifier
             jira = jira_factory(destination.url, "RHAI", args.issue_type, email, token, **destination.options)
-            slack = slack_factory(slack_token, CHANNEL)
+            slack = slack_factory(slack_token, channel)
             result = Dispatcher(ledger, jira, slack, transition_id=args.transition_id,
-                                transition_fields=fields, trial_id=args.trial_id, **destination.options).run(observations, receipt=receipt)
+                                transition_fields=fields, trial_id=args.trial_id, **route.options).run(observations, receipt=receipt)
             summary = {"dry_run": False, "registry_version": 2,
                        "incidents": len({t["incident_key"] for t in result.get("outbox", [])}),
                        "deliveries": [{"id": t["id"], "system": t["system"], "state": t["state"],

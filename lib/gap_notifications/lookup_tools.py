@@ -19,7 +19,7 @@ import re
 import json
 
 
-def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_environment="stage"):
+def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_environment="stage", channel=None):
     """Search/GET only; hints require the same fresh identity/property validation.
 
     Absence is not proof that no ticket exists (search may lag). Nothing here
@@ -28,8 +28,8 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
     from lib.gap_notifications.dispatch_incidents import discussion_url, validated_property
     from lib.gap_notifications.dispatch_incidents import incident_key
     from lib.gap_notifications.dispatch_incidents import bind_trial, incident_label, validate_observations
-    from lib.gap_notifications.notify_tools import jira_target
-    target = jira_target(jira_environment)
+    from lib.gap_notifications.notify_tools import routing_target
+    target = routing_target(jira_environment, channel)
     bind_trial({}, trial_id, **target.options)
     validate_observations(observations, **target.options)
     if getattr(jira, "base_url", target.url) != target.url:
@@ -75,7 +75,7 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
                     projected = {"jira_key": issue["key"], "closed": closed,
                                  "status": "closed" if closed else ("confirmed" if root else "slack_pending")}
                     if root:
-                        projected["slack_url"] = discussion_url(root)
+                        projected["slack_url"] = discussion_url(root, channel=target.channel)
                     if state["jira_intent"] or state["delivery"]["intent"]:
                         projected["status"] = "held"
                 cache[identity] = projected
@@ -84,7 +84,7 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
         entry.update(cache[identity])
         if entry not in rows.setdefault(pr, []):
             rows[pr].append(entry)
-    return {"status": "checked", "rows": rows, "jira_origin": target.url}
+    return {"status": "checked", "rows": rows, "jira_origin": target.url, "channel": target.channel}
 
 
 def _text(value):
@@ -130,7 +130,9 @@ def tracking_cell(tracking, pr_url):
                     value += " (Closed)"
                 url = entry.get("slack_url")
                 if url:
-                    if not re.fullmatch(r"https://redhat-internal\.slack\.com/archives/C0883L8FARE/p[0-9]+", url):
+                    if not re.fullmatch(r"[CG][A-Z0-9]+", tracking["channel"]):
+                        raise ValueError("invalid configured channel")
+                    if not re.fullmatch(r"https://redhat-internal\.slack\.com/archives/" + re.escape(tracking["channel"]) + r"/p[0-9]+", url):
                         raise ValueError("invalid discussion")
                     value += f" · [Slack thread]({url})"
                 else:
@@ -147,11 +149,11 @@ def tracking_cell(tracking, pr_url):
     return "<br>".join(parts)
 
 
-def inspect_issue(jira, key, *, trial=None, jira_environment="stage"):
+def inspect_issue(jira, key, *, trial=None, jira_environment="stage", channel=None):
     """GET only. Output allowlisted fields; malformed properties never leak raw values."""
     from lib.gap_notifications.dispatch_incidents import validated_property, discussion_url, metadata_url
-    from lib.gap_notifications.notify_tools import visible_link_status, jira_target
-    target = jira_target(jira_environment)
+    from lib.gap_notifications.notify_tools import visible_link_status, routing_target
+    target = routing_target(jira_environment, channel)
     if getattr(jira, "base_url", target.url) != target.url:
         raise ValueError("Jira adapter environment mismatch")
     issue = jira.get_issue(key)
@@ -171,7 +173,7 @@ def inspect_issue(jira, key, *, trial=None, jira_environment="stage"):
             return result
         delivery = checked["delivery"]
         root = delivery["root"]
-        url = discussion_url(root) if root else None
+        url = discussion_url(root, channel=target.channel) if root else None
         def intent(value):
             if value is None:
                 return None

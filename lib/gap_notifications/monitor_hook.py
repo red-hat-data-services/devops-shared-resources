@@ -34,10 +34,11 @@ class NotificationConfig:
     transition_id: str | None = None
     transition_fields: dict = field(default_factory=dict)
     jira_environment: str = "stage"
+    channel: str | None = None
 
     def validate(self):
-        from lib.gap_notifications.notify_tools import jira_target
-        jira_target(self.jira_environment)
+        from lib.gap_notifications.notify_tools import routing_target
+        routing_target(self.jira_environment, self.channel)
         if self.mode not in {"disabled", "preview", "write"}:
             raise ValueError("invalid notification mode")
         if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", self.trial_id):
@@ -102,9 +103,9 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         if collector is None:
             from lib.gap_notifications.analyze_merge_state import collect_observations
             collector = collect_observations
-        from lib.gap_notifications.dispatch_incidents import CHANNEL, Ledger, Dispatcher, validate_observations, bind_trial
-        from lib.gap_notifications.notify_tools import jira_target
-        target = jira_target(config.jira_environment)
+        from lib.gap_notifications.dispatch_incidents import Ledger, Dispatcher, validate_observations, bind_trial
+        from lib.gap_notifications.notify_tools import routing_target
+        target = routing_target(config.jira_environment, config.channel)
         observations = collector(filtered, environment=target.scope, leader_url=leader_url, state_url=link)
         validate_observations(observations, **target.options)
         counts = {s: sum(o["status"] == s for o in observations) for s in ("failure", "success", "unknown")}
@@ -128,9 +129,9 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
             if slack_factory is None:
                 from lib.gap_notifications.notify_tools import SlackNotifier
                 slack_factory = SlackNotifier
-            jira = jira_factory(target.url, "RHAI", "Bug", email, token, **target.options)
+            jira = jira_factory(target.url, "RHAI", "Bug", email, token, **target.jira.options)
             dispatcher = (dispatcher_factory or Dispatcher)(Ledger(config.ledger),
-                jira, slack_factory(slack_token, CHANNEL),
+                jira, slack_factory(slack_token, target.channel),
                 trial_id=config.trial_id, transition_id=config.transition_id,
                 transition_fields=config.transition_fields, **target.options)
             data = dispatcher.run(observations)

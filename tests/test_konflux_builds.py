@@ -206,7 +206,7 @@ def test_latest_attempt_does_not_reuse_old_completion():
 def test_completion_and_commit_flow_from_reader_to_slack():
     from gap_notification_fakes import state
     from lib.gap_notifications.analyze_leader_state import collect_build_observations
-    from lib.gap_notifications.dispatch_incidents import ENVIRONMENT
+    from lib.gap_notifications.dispatch_incidents import LEGACY_ENVIRONMENT as ENVIRONMENT
     from lib.gap_notifications.notify_tools import slack_message
     selected = observe([run(status='False', reason='Failed')]).to_dict()
     payload = state(repo=REPO, pr_url='https://github.com/acme/foo/pull/123', head_sha=SHA,

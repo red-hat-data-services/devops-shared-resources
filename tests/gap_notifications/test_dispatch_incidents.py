@@ -10,9 +10,9 @@ from lib.gap_notifications.lookup_tools import inspect_issue
 from lib.gap_notifications.notify_tools import visible_link_status, SlackAmbiguousError, SlackPermanentError, SlackRateLimitError
 from gap_notification_fakes import Jira, Slack, observation
 from gap_notification_fakes import make_runner
-from lib.gap_notifications.dispatch_incidents import CHANNEL, Dispatcher, Ledger, ingest, incident_label
+from lib.gap_notifications.dispatch_incidents import Dispatcher, Ledger, ingest, incident_label
 from lib.gap_notifications.dispatch_incidents import incident_key
-from lib.gap_notifications.dispatch_incidents import CHANNEL, Dispatcher, Ledger, incident_label
+from lib.gap_notifications.dispatch_incidents import Dispatcher, Ledger, incident_label
 from lib.gap_notifications.notify_tools import SlackRateLimitError
 
 
@@ -880,7 +880,7 @@ def test_query_failure_with_existing_registry_holds(tmp_path):
 # Explicit production selection must isolate identity while retaining replay and recovery rules.
 @pytest.mark.parametrize('environment', ['stage', 'production'])
 def test_environment_scoped_lifecycle(tmp_path, environment):
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     target = jira_target(environment)
     jira, slack = Jira(), Slack()
     jira.base_url = target.url
@@ -911,7 +911,7 @@ def test_environment_scoped_lifecycle(tmp_path, environment):
 
 # Stage and production must never share incident labels, even with the same trial and event.
 def test_environment_is_part_of_incident_identity():
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     keys = [incident_key(observation(environment=jira_target(env).scope)) for env in ('stage', 'production')]
     assert keys[0] != keys[1]
     assert incident_label(keys[0], 'trial') != incident_label(keys[1], 'trial')
@@ -920,7 +920,7 @@ def test_environment_is_part_of_incident_identity():
 # A selected target must reject foreign observations before any service lookup or write.
 @pytest.mark.parametrize('selected,observed', [('stage', 'production'), ('production', 'stage')])
 def test_cross_environment_observation_rejected_before_services(tmp_path, selected, observed):
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     class NoServices:
         def __getattr__(self, name):
             if name == 'base_url': return jira_target(selected).url
@@ -935,7 +935,7 @@ def test_cross_environment_observation_rejected_before_services(tmp_path, select
 @pytest.mark.parametrize('tamper', ['none', 'scope-only', 'create-only'])
 def test_cross_environment_journal_rejected(tmp_path, tamper):
     from lib.gap_notifications.dispatch_incidents import bind_trial
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     data = ingest({}, [observation()], trial_id='trial')
     if tamper != 'none': data['scope'] = jira_target('production').scope
     if tamper == 'create-only':
@@ -964,7 +964,7 @@ def test_legacy_stage_journal_remains_compatible(tmp_path):
 
 # A forged property scope cannot hide a foreign environment inside its stored incident identity.
 def test_cross_environment_property_is_rejected(tmp_path):
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     runner, jira, _ = make_runner(tmp_path)
     runner().run([observation()])
     state = copy.deepcopy(jira.properties['RHAI-1'])
@@ -984,3 +984,5 @@ def test_adapter_origin_must_match_explicit_environment(tmp_path):
     with pytest.raises(ValueError, match='environment'):
         runner.run([])
     assert not jira.calls and not slack.calls
+
+CHANNEL = "C0883L8FARE"

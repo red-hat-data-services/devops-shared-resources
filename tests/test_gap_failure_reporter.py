@@ -296,7 +296,7 @@ def test_render_summary_markdown_table() -> None:
 def test_tracking_column_standalone_and_creator_only_refresh(monkeypatch, tmp_path):
     row = fr.ChildFailureRow("repo", "https://github.com/acme/repo/pull/1", 1,
                              "build-failure", "open", False, "failed")
-    tracking = {"status": "checked", "rows": {row.pr_url: [
+    tracking = {"status": "checked", "channel": "C0883L8FARE", "rows": {row.pr_url: [
         {"component": "cpu", "status": "slack_pending", "jira_key": "RHAI-1"},
         {"component": "gpu", "status": "confirmed", "jira_key": "RHAI-2",
          "slack_url": "https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001"}]}}

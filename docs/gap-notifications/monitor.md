@@ -91,8 +91,7 @@ production. Only the two exact HTTPS origins, optionally with one trailing slash
 are accepted. Explicit empty, whitespace/case variants, credentials, ports, paths,
 queries/fragments and unknown hosts are invalid. Remove legacy
 `GAP_JIRA_ENVIRONMENT`: any explicit presence is rejected with sanitized migration
-guidance. Internal name-based target/config APIs remain unchanged. Project `RHAI`, issue type `Bug`, and Slack channel `C0883L8FARE` remain
-fixed. Production does not inherit staging's numeric issue-type or transition IDs.
+guidance. Internal name-based target/config APIs remain unchanged. Project `RHAI`, issue type `Bug`, remain fixed; Slack destination is selected by required `GAP_SLACK_CHANNEL`. Production does not inherit staging's numeric issue-type or transition IDs.
 
 Only explicit write mode reads `JIRA_USER_EMAIL`/`JIRA_API_EMAIL`, `JIRA_API_TOKEN`,
 and `SLACK_TOKEN`/`SLACK_BOT_TOKEN`. Operators must supply credentials authorized
@@ -227,3 +226,31 @@ installation or live service access is required:
 uv run --no-project --python /path/to/existing/.venv/bin/python -m pytest -q \
   tests/test_gap_pr_monitor.py tests/test_gap_notification_*.py tests/test_gap_notify.py
 ```
+
+
+## Configured destination and workflow boundary
+
+`GAP_SLACK_CHANNEL` is authoritative and must be a nonblank Slack channel ID.
+There is no fixed-channel allowlist or routing fallback. CLI `--channel` is
+an optional matching assertion, never an override. Requested channel, adapter,
+acknowledgement, stored root and manually attested receipt must agree.
+Slack links retain the exact verified workspace origin.
+
+Channel remains part of incident identity. Selecting the historical channel
+preserves existing identities and dedup. Changing channels selects a separate
+namespace, may create new Jira incidents, and does not migrate or automatically
+close old-channel incidents. Old-channel journals/properties are not reused.
+Example channel IDs in this document are examples only, not defaults.
+
+`scripts/gap_monitor_workflow.py` owns workflow notification configuration,
+environment-specific recovery defaults and receipt-only skip policy. Its
+stdlib-only `receipt` command runs after the trusted shared checkout and before
+dependency setup. Its `run` command resolves policy and invokes the unchanged
+monitor entry point. YAML retains infrastructure and write/non-dry-run credential
+boundaries only. Invalid/disabled/skip outcomes emit bounded diagnostics.
+Production recovery remains held without a verified transition.
+
+Roll out shared support before the new promoter caller. Both moving writer refs
+remain unchanged. Publishing shared changes may affect live runs; publishing the
+new promoter caller removes the previous channel block and can enable delivery.
+Publication and activation require separate authorization.

@@ -2617,6 +2617,7 @@ def main(argv: list[str] | None = None) -> int:
                 mode=args.notification_mode, ledger=args.notification_ledger,
                 trial_id=args.notification_trial_id,
                 jira_environment=target.name,
+                channel=os.environ.get("GAP_SLACK_CHANNEL", ""),
                 transition_id=args.notification_transition_id,
                 transition_fields=json.loads(args.notification_transition_fields),
             )

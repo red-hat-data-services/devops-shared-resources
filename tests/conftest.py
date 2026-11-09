@@ -67,3 +67,9 @@ def git_repo_factory(tmp_path: Path):
         return repo_path
 
     return _create_repo
+
+
+# Legacy notification regression fixtures explicitly select their original destination.
+@pytest.fixture(autouse=True)
+def notification_test_channel(monkeypatch):
+    monkeypatch.setenv("GAP_SLACK_CHANNEL", "C0883L8FARE")

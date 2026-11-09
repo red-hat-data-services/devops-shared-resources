@@ -308,14 +308,14 @@ def test_parser_default_disabled():
 
 # Production config must drive collection, factories, registry scope and tracking together.
 def test_production_hook_passes_explicit_target_without_changing_delivery_rules(hook):
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     invoke, jira, slack, opts, calls = hook
     target = jira_target('production')
     jira.base_url = target.url
     def factory(*args, **kwargs):
         calls.append((args, kwargs))
         assert args[:3] == (target.url, 'RHAI', 'Bug')
-        assert kwargs == target.options
+        assert kwargs == target.jira.options
         return jira
     config = replace(opts['config'], jira_environment='production', transition_id=None)
     tracking = {}
@@ -337,7 +337,7 @@ def test_production_hook_passes_explicit_target_without_changing_delivery_rules(
 def test_production_preview_has_no_clients_credentials_or_journal_access(hook):
     from pathlib import Path
     from lib.gap_notifications.analyze_leader_state import collect_build_observations
-    from lib.gap_notifications.notify_tools import jira_target
+    from lib.gap_notifications.notify_tools import routing_target as jira_target
     invoke, _, _, opts, calls = hook
     seen = []
     def collector(payload, **kwargs):
