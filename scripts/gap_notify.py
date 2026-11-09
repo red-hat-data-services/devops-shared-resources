@@ -73,6 +73,11 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
             jira = (jira_factory or JiraNotifier)(destination.url, "RHAI", args.issue_type, email, token, **destination.options)
             print(json.dumps(inspect_issue(jira, args.inspect, trial=args.trial_id, **destination.options), indent=2), file=out)
             return 0
+        from lib.gap_notifications.dispatch_incidents import ABSENT_RECEIPT, validate_resolution
+        receipt = ABSENT_RECEIPT
+        if args.resolve_receipt is not None:
+            receipt = json.loads(Path(args.resolve_receipt).read_text())
+            validate_resolution(receipt)
         args.trial_id = args.trial_id or "default"
         if not args.observations or not args.ledger:
             raise ValueError("observations and ledger required outside inspect mode")
@@ -113,7 +118,6 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
                 slack_factory = SlackNotifier
             jira = jira_factory(destination.url, "RHAI", args.issue_type, email, token, **destination.options)
             slack = slack_factory(slack_token, CHANNEL)
-            receipt = json.loads(Path(args.resolve_receipt).read_text()) if args.resolve_receipt else None
             result = Dispatcher(ledger, jira, slack, transition_id=args.transition_id,
                                 transition_fields=fields, trial_id=args.trial_id, **destination.options).run(observations, receipt=receipt)
             summary = {"dry_run": False, "registry_version": 2,

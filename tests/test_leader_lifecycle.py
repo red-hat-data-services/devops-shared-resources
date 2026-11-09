@@ -711,6 +711,14 @@ def test_final_failure_summary_is_not_lost_after_archiving(git_leader, monkeypat
     data["pull-requests"][0]["merge-observations"] = {
         "schema": 1, "conflict": {"status": "failure"}, "feasibility": {"status": "unknown"},
     }
+    data["pull-requests"][0]["build-observations"] = {
+        "source": "konflux", "repository": "acme/demo", "pr": 42, "head-sha": SHA,
+        "runs": [], "expected-components": ["api"],
+        "required-pipelines": {"schema": 1, "source": "revision-pinned-tekton",
+            "repository": "acme/demo", "pr": 42, "head-sha": SHA,
+            "pipelines": [{"component": "api", "pipeline_name": "build"},
+                          {"component": "api", "pipeline_name": "test"}]},
+    }
     data["promotion-gates"][0]["status"] = "failure"
     def evaluate(state, **kwargs):
         """Provide a failed component evaluation for the final-summary path."""
@@ -733,6 +741,8 @@ def test_final_failure_summary_is_not_lost_after_archiving(git_leader, monkeypat
         from lib.state_file import StatePullRequest
         child = saved["pull-requests"][0]
         assert StatePullRequest.from_mapping(child, index=0).to_dict()["merge-observations"] == child["merge-observations"]
+        assert child["build-observations"] == data["pull-requests"][0]["build-observations"]
+        assert StatePullRequest.from_mapping(child, index=0).to_dict()["build-observations"] == child["build-observations"]
         assert kwargs["accepted_urls"] == (data["pull-requests"][0]["pr-url"],)
         assert kwargs["published_sha"] == git(["rev-parse", "HEAD"], root)
         notifications.append(archive)

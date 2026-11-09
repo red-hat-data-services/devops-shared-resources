@@ -310,6 +310,26 @@ def _bounded(state):
     return state
 
 
+ABSENT_RECEIPT = object()
+
+
+def validate_resolution(resolution):
+    """Validate explicit reconciliation shape before ingest, locking or clients."""
+    if not isinstance(resolution, dict) or not isinstance(resolution.get("task_id"), str) or not resolution["task_id"].strip():
+        raise ValueError("receipt task ID required")
+    value = resolution.get("receipt")
+    if not isinstance(value, dict) or not isinstance(value.get("reason"), str) or not value["reason"].strip():
+        raise ValueError("explicit receipt audit reason required")
+    _key(value.get("key"))
+    if value.get("system") == "slack":
+        _receipt(value)
+    elif value.get("system") == "jira":
+        if "done" in value and not isinstance(value["done"], bool):
+            raise ValueError("invalid done attestation")
+    else:
+        raise ValueError("receipt system must be jira or slack")
+
+
 def _receipt(value):
     if not isinstance(value, dict) or value.get("channel") != CHANNEL or not re.fullmatch(r"[0-9]+\.[0-9]+", str(value.get("ts", ""))):
         raise ValueError("invalid Slack receipt")
@@ -362,6 +382,46 @@ class RegistryHold(RuntimeError):
     pass
 
 
+class LedgerPersistenceError(RuntimeError):
+    """Stop dispatch when durable local state cannot be acknowledged."""
+
+
+def _create_journal(value):
+    if value is None:
+        return None
+    if not isinstance(value, dict) or value.get("state") not in {"confirmed", "inflight", "reconciliation_required"}:
+        raise RegistryHold("invalid create journal")
+    try:
+        uuid.UUID(value["episode_id"])
+        attempts = value.get("attempts", [])
+        if not isinstance(attempts, list):
+            raise ValueError()
+        for attempt in attempts:
+            uuid.UUID(attempt["attempt_id"])
+            uuid.UUID(attempt["episode_id"])
+            if not isinstance(attempt.get("task_id"), str) or not attempt["task_id"]:
+                raise ValueError()
+            if attempt.get("state") not in {"confirmed", "inflight", "reconciliation_required"}:
+                raise ValueError()
+            if "started_at" in attempt and (type(attempt["started_at"]) not in (int, float) or not math.isfinite(attempt["started_at"]) or attempt["started_at"] < 0):
+                raise ValueError()
+            if attempt.get("key"):
+                _key(attempt["key"])
+        if len({a["attempt_id"] for a in attempts}) != len(attempts):
+            raise ValueError()
+        count = value.get("consecutive_attempts", 0)
+        if type(count) is not int or count < 0 or count > len(attempts):
+            raise ValueError()
+        deadline = value.get("next_retry_at", 0)
+        if type(deadline) not in (int, float) or not math.isfinite(deadline) or deadline < 0:
+            raise ValueError()
+        for episode in value.get("active_episodes", [value["episode_id"]]):
+            uuid.UUID(episode)
+    except (ValueError, TypeError, KeyError, AttributeError):
+        raise RegistryHold("invalid create journal") from None
+    return value
+
+
 class Dispatcher:
     """Single writer only: Jira properties are not compare-and-swap locks."""
     def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default", jira_environment="stage"):
@@ -374,7 +434,10 @@ class Dispatcher:
         self.transition_id, self.transition_fields = transition_id, transition_fields
 
     def _save(self):
-        self.ledger.save(self.data)
+        try:
+            self.ledger.save(self.data)
+        except Exception:
+            raise LedgerPersistenceError("local persistence unavailable; dispatch stopped") from None
 
     def _put(self, key, state):
         _bounded(state)
@@ -389,15 +452,23 @@ class Dispatcher:
         issues = self.jira.find_by_label(label)  # Adapter guarantees complete pagination.
         if not isinstance(issues, list):
             raise RegistryHold("incomplete registry")
-        known = self.data.get("creates", {}).get(identity, {}).get("key")
-        if known and not any(i.get("key") == known for i in issues):
-            issues.append(self.jira.get_issue(known))  # Known key beats eventual JQL visibility.
+        journal = _create_journal(self.data.get("creates", {}).get(identity))
+        known_keys = {a["key"] for a in (journal or {}).get("attempts", []) if a.get("key")}
+        if (journal or {}).get("key"):
+            known_keys.add(journal["key"])
+        for known in sorted(known_keys):
+            _key(known)
+            if not any(i.get("key") == known for i in issues):
+                issues.append(self.jira.get_issue(known))  # Known key beats eventual JQL visibility.
         records = []
         for issue in issues:
             _verify_issue(issue, {"label": label, "latest": obs}, **self.target.options)
             state = _validate_state(self.jira.get_notification_state(issue["key"]), identity, self.trial_id, label, **self.target.options)
             if "gap-episode-" + uuid.UUID(state["episode_id"]).hex not in issue["fields"]["labels"]:
                 raise RegistryHold("episode property/label mismatch")
+            expected_episodes = {a["episode_id"] for a in (journal or {}).get("attempts", []) if a.get("key") == issue["key"]}
+            if expected_episodes and state["episode_id"] not in expected_episodes:
+                raise RegistryHold("known create key episode mismatch")
             records.append((issue, state))
         if (len({i["key"] for i, p in records}) != len(records)
                 or len({p["episode_id"] for i, p in records}) != len(records)):
@@ -417,9 +488,12 @@ class Dispatcher:
 
     def _create(self, task, previous):
         identity, obs = task["incident_key"], task["observation"]
-        journal = self.data.get("creates", {}).get(identity)
-        if journal and journal["state"] != "confirmed":
-            raise RegistryHold("ambiguous create; absence from search never authorizes retry")
+        journal = _create_journal(self.data.get("creates", {}).get(identity))
+        if identity in self.attempted_creates:
+            raise RegistryHold("one create attempt per incident per invocation")
+        if journal and journal["state"] != "confirmed" and time.time() < journal.get("next_retry_at", 0):
+            # Keep reconciliation eligible on every invocation; only POST is delayed.
+            raise RegistryHold("create retry cooldown")
         state = self._new_state(task, previous)
         if previous:
             state["predecessor"] = {"key": previous["issue_key"], "episode_id": previous["episode_id"]}
@@ -428,7 +502,25 @@ class Dispatcher:
         state.update(last_event=event, last_outcome="failure")
         label = incident_label(identity, self.trial_id)
         body, labels = _presentation(obs, [label, "gap-episode-" + uuid.UUID(state["episode_id"]).hex], **self.target.options)
-        self.data.setdefault("creates", {})[identity] = {"state": "inflight", "episode_id": state["episode_id"]}
+        attempts = copy.deepcopy((journal or {}).get("attempts", []))
+        if journal and not attempts:
+            attempts.append({"attempt_id": journal["episode_id"], "episode_id": journal["episode_id"],
+                             "task_id": task["id"], "state": journal["state"],
+                             **({"key": journal["key"]} if journal.get("key") else {}), "legacy": True})
+        pending = journal and journal["state"] != "confirmed"
+        active = list(journal.get("active_episodes", [journal["episode_id"]])) if pending else []
+        count = (journal.get("consecutive_attempts", len(attempts)) if pending else 0) + 1
+        now = time.time()
+        deadline = now + min(60 * 2 ** min(count - 1, 4), 900)
+        attempt = {"attempt_id": str(uuid.uuid4()), "episode_id": state["episode_id"],
+                   "task_id": task["id"], "event_id": event, "started_at": now,
+                   "next_retry_at": deadline, "state": "inflight"}
+        attempts.append(attempt)
+        self.data.setdefault("creates", {})[identity] = {
+            "state": "inflight", "episode_id": state["episode_id"], "attempts": attempts,
+            "active_episodes": active + [state["episode_id"]], "consecutive_attempts": count,
+            "next_retry_at": deadline}
+        self.attempted_creates.add(identity)
         task["operation"] = "create"
         self._save()  # Local intent BEFORE Jira create; property is atomic with issue.
         try:
@@ -436,12 +528,24 @@ class Dispatcher:
                 notification_state=_bounded(state))
             key = _key(result["key"])
             self.data["creates"][identity].update(state="confirmed", key=key)
+            attempt.update(state="confirmed", key=key)
             self._save()
+        except LedgerPersistenceError:
+            raise
         except Exception as exc:
             known = getattr(exc, "key", None)
-            self.data["creates"][identity]["state"] = "reconciliation_required"
+            current = self.data["creates"][identity]
+            current["state"] = "reconciliation_required"
+            attempt.update(state="reconciliation_required", error_type=type(exc).__name__)
             if known:
-                self.data["creates"][identity]["key"] = _key(known)
+                current["key"] = attempt["key"] = _key(known)
+            delay = getattr(exc, "retry_after", None)
+            if type(delay) in (int, float) and math.isfinite(delay) and delay >= 0:
+                current["next_retry_at"] = max(current["next_retry_at"], time.time() + delay)
+            attempt["next_retry_at"] = current["next_retry_at"]
+            status = getattr(exc, "status_code", None)
+            if type(status) is int and 100 <= status <= 599:
+                attempt["status_code"] = status
             self._save()
             raise
         issue = self.jira.get_issue(key)
@@ -490,14 +594,17 @@ class Dispatcher:
         self.data.setdefault("audit", []).append({"at": _stamp(), "key": key, "receipt": copy.deepcopy(value)})
         self._save()
 
-    def run(self, observations, *, receipt=None):
+    def run(self, observations, *, receipt=ABSENT_RECEIPT):
+        if receipt is not ABSENT_RECEIPT:
+            validate_resolution(receipt)
         if getattr(self.jira, "base_url", self.target.url) != self.target.url:
             raise ValueError("Jira adapter environment mismatch")
         validate_observations(observations, **self.target.options)
+        self.attempted_creates = set()
         with self.ledger.locked():
             self.data = ingest(self.ledger.read(), observations, trial_id=self.trial_id, **self.target.options)
             self._save()
-            if receipt:
+            if receipt is not ABSENT_RECEIPT:
                 self._resolve(receipt)
             for task in self.data.get("outbox", []):
                 if task["state"] in {"confirmed", "superseded"} or task.get("retry_at", 0) > time.time():
@@ -507,6 +614,8 @@ class Dispatcher:
                     task["state"] = "confirmed"
                     for field in ("hold", "error_type", "retry_at"):
                         task.pop(field, None)
+                except LedgerPersistenceError:
+                    raise
                 except Exception as exc:
                     task["state"] = "reconciliation_required" if isinstance(exc, RegistryHold) else "pending"
                     task["hold"] = "registry_or_delivery_unavailable"
@@ -523,13 +632,17 @@ class Dispatcher:
         orphan_success = _hash(identity + ":" + event)
         if obs["status"] == "success" and orphan_success in self.data.get("no_issue_successes", {}):
             return
-        journal = self.data.get("creates", {}).get(identity)
+        journal = _create_journal(self.data.get("creates", {}).get(identity))
         if journal and journal["state"] != "confirmed":
-            matches = [(i, p) for i, p in records if p["episode_id"] == journal["episode_id"]]
-            if len(matches) != 1:
-                raise RegistryHold("create reconciliation required")
-            journal.update(state="confirmed", key=matches[0][0]["key"])
-            self._save()
+            active = journal.get("active_episodes", [journal["episode_id"]])
+            matches = [(i, p) for i, p in records if p["episode_id"] in active]
+            if len(matches) > 1:
+                raise RegistryHold("multiple attributable create episodes")
+            if matches:
+                journal.update(state="confirmed", key=matches[0][0]["key"])
+                self._save()
+            # A successful complete no-match permits later bounded CREATE retries.
+            # This deliberately accepts duplicates if prior creation is not yet visible.
         # Only positively rejected rate-limited sends may retry automatically.
         for item, prop in records:
             if prop.get("jira_intent"):
@@ -560,6 +673,8 @@ class Dispatcher:
             # Explicit success also resolves a manually-closed unresolved episode
             # through property metadata only; never transition a done issue.
             issue, state = previous
+            if state["last_outcome"] == "success" and event not in state["seen_event_ids"]:
+                return  # New positive evidence cannot repeat an episode's recovery.
         key = issue["key"]
         task["jira_key"] = key
         if event not in state["seen_event_ids"]:

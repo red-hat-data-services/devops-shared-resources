@@ -136,6 +136,35 @@ def _select_component_run(runs: list[dict[str, Any]], component: str) -> dict[st
     return matches[0]
 
 
+def _required_runs(receipt, runs, component, child):
+    """Validate authoritative inventory before aggregating current required evidence."""
+    inventory = receipt.get("required-pipelines")
+    if not isinstance(inventory, dict) or inventory.get("schema") != 1 or inventory.get("source") != "revision-pinned-tekton":
+        return [], "Invalid required pipeline inventory"
+    if any(inventory.get(k) != receipt.get(k) for k in ("repository", "pr", "head-sha")):
+        return [], "Required pipeline inventory binding mismatch"
+    if child.get("head-sha") and child["head-sha"] != receipt.get("head-sha"):
+        return [], "Child head does not match receipt"
+    pairs = inventory.get("pipelines")
+    if not isinstance(pairs, list) or not pairs:
+        return [], "Missing required pipeline inventory"
+    keys = []
+    for pair in pairs:
+        if not isinstance(pair, dict) or any(not isinstance(pair.get(k), str) or not pair[k].strip() for k in ("component", "pipeline_name")):
+            return [], "Invalid required pipeline identity"
+        keys.append((pair["component"], pair["pipeline_name"]))
+    if len(keys) != len(set(keys)) or set(c for c, p in keys) != set(receipt.get("expected-components") or []):
+        return [], "Conflicting required pipeline inventory"
+    selected = []
+    for c, pipeline in sorted(keys):
+        if c != component:
+            continue
+        matches = [r for r in runs if r.get("component") == c and r.get("pipeline_name") == pipeline]
+        # Ambiguity in one pair cannot erase a proven failure in another pair.
+        selected.append((pipeline, matches[0] if len(matches) == 1 else None))
+    return selected, None
+
+
 def _child_repo(child: dict[str, Any]) -> str:
     repo = str(child.get("repo") or "").strip()
     if not repo:
@@ -243,8 +272,27 @@ def _normalize_pull_request(child: dict[str, Any], *, environment: str, leader_u
     runs = [_mapping(run, path="build-observations.runs") for run in runs_raw]
     observations: list[dict[str, Any]] = []
     for component in expected_components:
-        selected_run = _select_component_run(runs, component)
-        status, reason = _status_for_observation(build_observations, selected_run, pr_number=pr_number)
+        aggregate = None
+        if "required-pipelines" in build_observations:
+            aggregate, inventory_error = _required_runs(build_observations, runs, component, child)
+            outcomes = [_status_for_observation(build_observations, r, pr_number=pr_number) for p, r in aggregate]
+            if inventory_error or not outcomes:
+                status, reason = "unknown", inventory_error or "Missing required pipelines"
+            elif any(s == "failure" for s, _ in outcomes):
+                status, reason = "failure", "Required pipeline failure"
+            elif all(s == "success" for s, _ in outcomes):
+                status, reason = "success", "All required pipelines succeeded"
+            else:
+                status, reason = "unknown", "Incomplete required pipeline success coverage"
+            selected_run = next((r for (p, r), (s, _) in zip(aggregate, outcomes) if s == status and r), None)
+            if len(aggregate) == 1 and not inventory_error:
+                selected_run = aggregate[0][1]
+                status, reason = outcomes[0]
+        else:
+            selected_run = _select_component_run(runs, component)
+            status, reason = _status_for_observation(build_observations, selected_run, pr_number=pr_number)
+        if child.get("head-sha") and child["head-sha"] != build_observations.get("head-sha"):
+            status, reason = "unknown", "Child head does not match receipt"
         if selected_run is not None and selected_run.get("component") and str(selected_run["component"]).strip() != component:
             status, reason = "unknown", "Selected receipt does not match the expected component"
         build_url = str((selected_run or {}).get("url") or "").strip() or None
@@ -277,6 +325,13 @@ def _normalize_pull_request(child: dict[str, Any], *, environment: str, leader_u
             identity["query-kind"] = "query-skipped"
         else:
             identity["query-kind"] = "receipt"
+        if aggregate is not None:
+            evidence["required-pipelines"] = copy.deepcopy(build_observations.get("required-pipelines"))
+            evidence["selected-runs"] = [copy.deepcopy(r) for p, r in aggregate if r is not None]
+            if len(aggregate) != 1:
+                identity.pop("selected-run")
+                identity["required-runs"] = [{"pipeline_name": p, "uid": (r or {}).get("uid"),
+                                              "status": (r or {}).get("status")} for p, r in aggregate]
         observation = {
             "environment": environment,
             "repository": repo,

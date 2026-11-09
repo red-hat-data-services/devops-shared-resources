@@ -12,6 +12,11 @@ def evaluate_konflux_gate(*, repo, number, sha, expected, client=None, query_err
                 "observed-at": datetime.now(timezone.utc).isoformat(),
                 "expected-components": sorted({item.key for item in expected}),
                 "runs": []}
+    evidence["required-pipelines"] = {
+        "schema": 1, "source": "revision-pinned-tekton", "repository": repo,
+        "pr": number, "head-sha": sha,
+        "pipelines": [{"component": item.key, "pipeline_name": item.name_suffix} for item in expected],
+    }
     findings = []
     try:
         if query_error:

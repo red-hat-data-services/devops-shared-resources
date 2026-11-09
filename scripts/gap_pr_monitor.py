@@ -1511,21 +1511,6 @@ def run_monitor_publish_and_signal(
 
     result = replace(result, state_path=published.state_path or result.state_path)
 
-    notification_result = None
-    notification_tracking = {"status": "not_checked"}
-    if notification_config is not None and notification_config.mode != "disabled":
-        try:
-            from lib.gap_notifications.monitor_hook import notify_after_publish
-            notification_result = notify_after_publish(
-                load_state(result.state_path), accepted_urls=result.notification_urls,
-                config=notification_config, leader_url=leader_pr_url,
-                published_sha=published.sha, state_path=result.state_path,
-                repo_root=repo_root, dry_run=dry_run, tracking=notification_tracking,
-            )
-        except Exception as exc:
-            notification_tracking = {"status": "unavailable"}
-            notification_result = {"status": "error", "error_type": type(exc).__name__}
-            print("WARNING: GAP notification hook failed: " + type(exc).__name__, file=sys.stderr)
 
 
     leader_url = (leader_pr_url or "").strip() or None
@@ -1599,6 +1584,22 @@ def run_monitor_publish_and_signal(
             "skipped Leader self-status.",
             file=sys.stderr,
         )
+
+    notification_result = None
+    notification_tracking = {"status": "not_checked"}
+    if notification_config is not None and notification_config.mode != "disabled":
+        try:
+            from lib.gap_notifications.monitor_hook import notify_after_publish
+            notification_result = notify_after_publish(
+                load_state(result.state_path), accepted_urls=result.notification_urls,
+                config=notification_config, leader_url=leader_pr_url,
+                published_sha=published.sha, state_path=result.state_path,
+                repo_root=repo_root, dry_run=dry_run, tracking=notification_tracking,
+            )
+        except Exception as exc:
+            notification_tracking = {"status": "unavailable"}
+            notification_result = {"status": "error", "error_type": type(exc).__name__}
+            print("WARNING: GAP notification hook failed: " + type(exc).__name__, file=sys.stderr)
 
     # After state is published, refresh the single Leader failure/pending/closed
     # summary comment so the table matches this run's state.json.
@@ -1708,6 +1709,10 @@ def run_scheduled_monitors(
             "nothing to do."
         )
         return 0
+
+    if len(leaders) > 1 and notification_config is not None and notification_config.mode == "write":
+        print("WARNING: multiple Leaders discovered; notification writes disabled for this pass.", file=sys.stderr)
+        notification_config = replace(notification_config, mode="disabled")
 
     print(f"Scheduled monitor: {len(leaders)} open Leader PR(s) in {leader_repo}")
     failures: list[str] = []
