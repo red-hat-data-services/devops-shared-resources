@@ -148,6 +148,34 @@ def test_inspect_rejects_mutating_or_production_args(extra):
     assert main(['--inspect', 'RHAI-1'] + extra, environ={}, jira_factory=forbidden, stdout=io.StringIO()) == 1
 
 
+# Any explicit legacy selector must fail before I/O with sanitized migration guidance.
+@pytest.mark.parametrize('legacy', ['', 'stage', 'production', 'unknown'])
+@pytest.mark.parametrize('url', [None, 'https://redhat.atlassian.net'])
+def test_legacy_selector_rejected_with_migration_guidance_before_io(legacy, url):
+    env = {'GAP_JIRA_ENVIRONMENT': legacy}
+    if url is not None:
+        env['GAP_JIRA_URL'] = url
+    out = io.StringIO()
+    def forbidden(*a, **kw):
+        raise AssertionError('client created')
+    assert main(['--inspect', 'RHAI-1'], environ=env, jira_factory=forbidden, stdout=out) == 1
+    result = json.loads(out.getvalue())
+    assert result['type'] == 'ValueError' and 'Remove GAP_JIRA_ENVIRONMENT' in result['guidance']
+
+
+# The deprecated URL flag may assert the selected origin but never route independently.
+@pytest.mark.parametrize('name', ['stage', 'production'])
+@pytest.mark.parametrize('suffix', ['', '/'])
+def test_deprecated_url_flag_is_matching_assertion_only(tmp_path, name, suffix):
+    from lib.gap_notifications.notify_tools import jira_target
+    target = jira_target(name)
+    out = io.StringIO()
+    assert main(args(tmp_path, [observation(environment=target.scope)]) +
+                ['--jira-url', target.url + suffix],
+                environ={'GAP_JIRA_URL': target.url}, stdout=out) == 0
+    assert json.loads(out.getvalue())['dry_run'] is True
+
+
 # The selector alone must not enable writes, construct clients or create a journal.
 @pytest.mark.parametrize('environment', ['stage', 'production'])
 def test_environment_selection_keeps_cli_preview_read_only(tmp_path, environment):
@@ -158,7 +186,7 @@ def test_environment_selection_keeps_cli_preview_read_only(tmp_path, environment
         raise AssertionError('client construction')
     out = io.StringIO()
     obs = observation(environment=jira_target(environment).scope)
-    result = main(args(tmp_path, [obs]), environ={'GAP_JIRA_ENVIRONMENT': environment},
+    result = main(args(tmp_path, [obs]), environ={'GAP_JIRA_URL': jira_target(environment).url},
                   jira_factory=forbidden, slack_factory=forbidden, stdout=out)
     assert result == 0 and json.loads(out.getvalue())['dry_run'] is True
     assert not constructed and not (tmp_path / 'ledger.json').exists()
@@ -169,9 +197,9 @@ def test_environment_selection_keeps_cli_preview_read_only(tmp_path, environment
 def test_invalid_environment_configuration_fails_before_clients(tmp_path, problem):
     from lib.gap_notifications.notify_tools import jira_target
     obs = observation(environment=jira_target('production').scope)
-    env = {'GAP_JIRA_ENVIRONMENT': 'production', 'JIRA_USER_EMAIL': 'dummy@example.test',
+    env = {'GAP_JIRA_URL': jira_target('production').url, 'JIRA_USER_EMAIL': 'dummy@example.test',
            'JIRA_API_TOKEN': 'dummy', 'SLACK_TOKEN': 'dummy'}
-    if problem in {'typo', 'empty'}: env['GAP_JIRA_ENVIRONMENT'] = 'typo' if problem == 'typo' else ''
+    if problem in {'typo', 'empty'}: env['GAP_JIRA_URL'] = 'typo' if problem == 'typo' else ''
     if problem == 'foreign-observation': obs = observation()
     values = args(tmp_path, [obs]) + ['--write']
     if problem == 'old-journal':
@@ -193,7 +221,7 @@ def test_production_cli_write_then_read_only_inspect(tmp_path):
     target = jira_target('production')
     jira, slack = Jira(), Slack()
     jira.base_url = target.url
-    env = {'GAP_JIRA_ENVIRONMENT': 'production', 'JIRA_USER_EMAIL': 'dummy@example.test',
+    env = {'GAP_JIRA_URL': target.url, 'JIRA_USER_EMAIL': 'dummy@example.test',
            'JIRA_API_TOKEN': 'dummy', 'SLACK_TOKEN': 'dummy'}
     def factory(*a, **kw):
         assert a[:3] == (target.url, 'RHAI', 'Bug') and kw == target.options

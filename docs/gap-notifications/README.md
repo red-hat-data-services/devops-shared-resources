@@ -20,17 +20,22 @@ The link uses the full SHA. Formatting and completion metadata do not change eve
 identities, edit old messages, or cause existing delivery receipts to resend.
 The redundant promotion branch line is omitted; failure-reason behavior is unchanged.
 
-`GAP_JIRA_ENVIRONMENT` selects one allowlisted Jira destination:
+`GAP_JIRA_URL` is the single operator-facing destination selector:
 
-| Value | Jira origin | Required observation `environment` |
+| URL | Internal target | Required observation `environment` |
 | --- | --- | --- |
-| `stage` (default when unset) | `https://stage-redhat.atlassian.net` | `stage-redhat.atlassian.net/RHAI/C0883L8FARE` |
-| `production` | `https://redhat.atlassian.net` | `redhat.atlassian.net/RHAI/C0883L8FARE` |
+| `https://stage-redhat.atlassian.net` (default only when unset) | `stage` | `stage-redhat.atlassian.net/RHAI/C0883L8FARE` |
+| `https://redhat.atlassian.net` | `production` | `redhat.atlassian.net/RHAI/C0883L8FARE` |
 
-Unknown, empty, or misspelled values fail closed. Project `RHAI`, issue type `Bug`,
+Only these exact origins, optionally followed by one slash, are accepted.
+Explicit empty values, whitespace, case variants, HTTP, credentials, ports,
+paths, query/fragment delimiters and lookalike hosts fail closed. Remove legacy
+`GAP_JIRA_ENVIRONMENT`: its presence (even empty or matching) is rejected with
+sanitized migration guidance, never ignored or used as a fallback. Project `RHAI`, issue type `Bug`,
 and Slack channel `C0883L8FARE` remain fixed. Only staging also accepts its legacy
-numeric issue-type ID `10016`. The existing `--jira-url` option is an assertion
-that must match the selector, not a way to override it.
+numeric issue-type ID `10016`. The deprecated `--jira-url` option remains a matching assertion
+with the same URL rules, not an independent routing override. Internal Python
+name-based target/config APIs and environment-bound identities remain unchanged.
 
 Selection alone never enables writes: standalone CLI writes require `--write`,
 and monitor notifications remain disabled by default. Supply credentials authorized
@@ -151,7 +156,7 @@ uv run --no-project --python /Users/ckodama/code/devops-shared-resources/.venv/b
 Inspection requires only explicitly supplied Jira environment authentication
 (`JIRA_USER_EMAIL` or `JIRA_API_EMAIL`, plus `JIRA_API_TOKEN`). It does not discover
 credentials, read observations/ledger, acquire lockfiles, construct Slack clients,
-acknowledge receipts, repair, or mutate anything. It honors `GAP_JIRA_ENVIRONMENT`
+acknowledge receipts, repair, or mutate anything. It honors `GAP_JIRA_URL`
 with the same default and validation as write/preview mode. Inspect
 is exclusive with write/observation/ledger/receipt/transition options. JSON reports
 actual Jira status category, validated property scope/trial/incident identity,

@@ -2462,7 +2462,7 @@ def build_parser() -> argparse.ArgumentParser:
             f"(default: {ENV_LEADER_LABEL} or {DEFAULT_LEADER_LABEL!r})."
         ),
     )
-    notifications = parser.add_argument_group("opt-in notifications (disabled; GAP_JIRA_ENVIRONMENT defaults to stage)")
+    notifications = parser.add_argument_group("opt-in notifications (disabled; unset GAP_JIRA_URL defaults to staging)")
     notifications.add_argument("--notification-mode", choices=("disabled", "preview", "write"), default="disabled")
     notifications.add_argument("--notification-ledger", help="Isolated schema2 journal OUTSIDE monitored checkout")
     notifications.add_argument("--notification-trial-id", default="default")
@@ -2478,8 +2478,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.notification_mode != "disabled":
         try:
             from lib.gap_notifications.monitor_hook import NotificationConfig
-            from lib.gap_notifications.notify_tools import jira_target
-            target = jira_target(os.environ.get("GAP_JIRA_ENVIRONMENT", "stage"))
+            from lib.gap_notifications.notify_tools import jira_target_from_url, STAGING_JIRA_ORIGIN
+            if "GAP_JIRA_ENVIRONMENT" in os.environ:
+                print("WARNING: Remove GAP_JIRA_ENVIRONMENT; use GAP_JIRA_URL. Notifications disabled.", file=sys.stderr)
+                raise ValueError("legacy Jira selector")
+            target = jira_target_from_url(os.environ.get("GAP_JIRA_URL", STAGING_JIRA_ORIGIN))
             notification_config = NotificationConfig(
                 mode=args.notification_mode, ledger=args.notification_ledger,
                 trial_id=args.notification_trial_id,

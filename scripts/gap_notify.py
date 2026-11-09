@@ -28,7 +28,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from lib.gap_notifications.dispatch_incidents import CHANNEL, Dispatcher, Ledger, bind_trial, ingest, validate_observations
-from lib.gap_notifications.notify_tools import jira_target
+from lib.gap_notifications.notify_tools import jira_target_from_url, STAGING_JIRA_ORIGIN
 
 
 def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdout=None):
@@ -38,7 +38,7 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
     parser.add_argument("--ledger", help="Schema2 local uncertainty journal/cache; Jira is incident authority")
     parser.add_argument("--trial-id", help="Stable safe test namespace; immutable per ledger")
     parser.add_argument("--write", action="store_true", help="Allow selected-environment writes and ledger persistence")
-    parser.add_argument("--jira-url", help="Optional assertion of the selected Jira URL, not a routing override")
+    parser.add_argument("--jira-url", help="Deprecated matching assertion of GAP_JIRA_URL, never a routing override")
     parser.add_argument("--project", default="RHAI")
     parser.add_argument("--issue-type", default="Bug", choices=["Bug", "10016"])
     parser.add_argument("--channel", default=CHANNEL)
@@ -49,8 +49,13 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
     out = stdout or sys.stdout
     try:
         env = environ if environ is not None else os.environ
-        destination = jira_target(env.get("GAP_JIRA_ENVIRONMENT", "stage"))
-        if args.jira_url not in {None, destination.url} or args.project != "RHAI" or args.channel != CHANNEL:
+        if "GAP_JIRA_ENVIRONMENT" in env:
+            print(json.dumps({"error": "notification_prototype_failed", "type": "ValueError",
+                              "guidance": "Remove GAP_JIRA_ENVIRONMENT; use GAP_JIRA_URL."}), file=out)
+            return 1
+        destination = jira_target_from_url(env.get("GAP_JIRA_URL", STAGING_JIRA_ORIGIN))
+        asserted = jira_target_from_url(args.jira_url) if args.jira_url is not None else destination
+        if asserted != destination or args.project != "RHAI" or args.channel != CHANNEL:
             raise ValueError("destination must match the selected Jira environment and fixed project/channel")
         if destination.name == "production" and args.issue_type != "Bug":
             raise ValueError("production requires the Bug type name, not a staging type ID")

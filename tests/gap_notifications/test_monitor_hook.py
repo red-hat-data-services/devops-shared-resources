@@ -359,11 +359,27 @@ def test_invalid_hook_environment_fails_before_dependencies(hook):
 
 
 # The workflow-facing environment variable must reach config, but must not enable notifications.
-@pytest.mark.parametrize('selector,mode,expected', [(None, 'preview', 'stage'), ('stage', 'preview', 'stage'),
-    ('production', 'preview', 'production'), ('production', 'disabled', None), ('typo', 'preview', None)])
-def test_monitor_cli_reads_jira_environment_only_for_enabled_notifications(tmp_path, monkeypatch, selector, mode, expected):
-    if selector is None: monkeypatch.delenv('GAP_JIRA_ENVIRONMENT', raising=False)
-    else: monkeypatch.setenv('GAP_JIRA_ENVIRONMENT', selector)
+@pytest.mark.parametrize('selector,mode,expected', [(None, 'preview', 'stage'),
+    ('https://stage-redhat.atlassian.net', 'preview', 'stage'),
+    ('https://redhat.atlassian.net/', 'preview', 'production'),
+    ('https://redhat.atlassian.net', 'disabled', None), ('typo', 'preview', None),
+    ('', 'preview', None), ('legacy', 'preview', None), ('legacy', 'disabled', None)])
+def test_monitor_cli_reads_jira_url_only_for_enabled_notifications(tmp_path, monkeypatch, selector, mode, expected):
+    monkeypatch.delenv('GAP_JIRA_ENVIRONMENT', raising=False)
+    if selector == 'legacy':
+        monkeypatch.setenv('GAP_JIRA_ENVIRONMENT', 'production')
+        selector = 'https://redhat.atlassian.net'
+    if selector is None: monkeypatch.delenv('GAP_JIRA_URL', raising=False)
+    else: monkeypatch.setenv('GAP_JIRA_URL', selector)
+    if mode == 'disabled':
+        class NoSelectorReads(dict):
+            def get(self, key, *default):
+                assert key not in {'GAP_JIRA_URL', 'GAP_JIRA_ENVIRONMENT'}
+                return super().get(key, *default)
+            def __contains__(self, key):
+                assert key not in {'GAP_JIRA_URL', 'GAP_JIRA_ENVIRONMENT'}
+                return super().__contains__(key)
+        monkeypatch.setattr(monitor.os, 'environ', NoSelectorReads(monitor.os.environ))
     path = tmp_path / 'state.json'
     captured = []
     monkeypatch.setattr(monitor, 'resolve_inputs_for_cli', lambda **kw: (str(path), None, [], None))

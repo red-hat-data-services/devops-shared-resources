@@ -1027,7 +1027,30 @@ def test_format_failure_does_not_leave_a_slack_inflight_intent(tmp_path, monkeyp
     assert not slack.calls
 
 
-# Unknown selectors must fail explicitly rather than silently fall back to staging or production.
+# Allowlisted URL spellings must resolve to the unchanged environment-bound target.
+@pytest.mark.parametrize('name', ['stage', 'production'])
+@pytest.mark.parametrize('suffix', ['', '/'])
+def test_operator_jira_url_preserves_internal_target(name, suffix):
+    from lib.gap_notifications.notify_tools import jira_target, jira_target_from_url
+    assert jira_target_from_url(jira_target(name).url + suffix) == jira_target(name)
+    assert jira_target_from_url() == jira_target('stage')
+
+
+# Nonallowlisted URLs must fail closed rather than normalize into a destination.
+@pytest.mark.parametrize('value', ['', None, {}, True, 'stage', 'production',
+    ' https://redhat.atlassian.net', 'https://redhat.atlassian.net ',
+    'https://REDHAT.atlassian.net', 'http://redhat.atlassian.net',
+    'https://redhat.atlassian.net//', 'https://redhat.atlassian.net/path',
+    'https://redhat.atlassian.net?', 'https://redhat.atlassian.net#',
+    'https://redhat.atlassian.net:443', 'https://user@redhat.atlassian.net',
+    'https://redhat.atlassian.net.evil.test', 'https://redhat.atlassian.net/?x=1'])
+def test_operator_jira_url_rejects_nonallowlisted_values(value):
+    from lib.gap_notifications.notify_tools import jira_target_from_url
+    with pytest.raises(ValueError, match='GAP_JIRA_URL'):
+        jira_target_from_url(value)
+
+
+# Unknown internal selectors must fail explicitly rather than silently fall back to staging or production.
 @pytest.mark.parametrize('value', ['', 'prod', 'Stage', ' production ', None, {}, True])
 def test_jira_environment_selector_rejects_invalid_values(value):
     from lib.gap_notifications.notify_tools import jira_target

@@ -85,10 +85,13 @@ It is a notification preview only: the **ordinary monitor may still publish
 GitHub state/statuses**. Monitor `--dry-run` suppresses this hook altogether;
 use the mocked tests below for a fully offline integration preview.
 
-Jira selection is explicit through `GAP_JIRA_ENVIRONMENT`: `stage` (the default)
-uses `https://stage-redhat.atlassian.net`; `production` uses
-`https://redhat.atlassian.net`. Other values, including an explicitly empty value,
-are invalid. Project `RHAI`, issue type `Bug`, and Slack channel `C0883L8FARE` remain
+Jira selection is explicit through `GAP_JIRA_URL`: unset defaults to
+`https://stage-redhat.atlassian.net`; `https://redhat.atlassian.net` selects
+production. Only the two exact HTTPS origins, optionally with one trailing slash,
+are accepted. Explicit empty, whitespace/case variants, credentials, ports, paths,
+queries/fragments and unknown hosts are invalid. Remove legacy
+`GAP_JIRA_ENVIRONMENT`: any explicit presence is rejected with sanitized migration
+guidance. Internal name-based target/config APIs remain unchanged. Project `RHAI`, issue type `Bug`, and Slack channel `C0883L8FARE` remain
 fixed. Production does not inherit staging's numeric issue-type or transition IDs.
 
 Only explicit write mode reads `JIRA_USER_EMAIL`/`JIRA_API_EMAIL`, `JIRA_API_TOKEN`,
@@ -103,7 +106,7 @@ A workflow running a shared-code revision that supports this selector can pass:
 
 ```yaml
 env:
-  GAP_JIRA_ENVIRONMENT: ${{ vars.GAP_JIRA_ENVIRONMENT || 'stage' }}
+  GAP_JIRA_URL: ${{ vars.GAP_JIRA_URL || 'https://stage-redhat.atlassian.net' }}
 ```
 
 The repository variable is not a secret. The workflow expression defaults a missing
@@ -112,7 +115,10 @@ empty process variable. The monitor entry point resolves the selector only when
 notifications are enabled, then passes immutable configuration to the hook. Invalid
 enabled configuration suppresses notifications with a sanitized warning without
 changing the ordinary monitor's gate behavior. The standalone notification CLI
-returns a failing exit status for invalid selection.
+returns a failing exit status for invalid selection. The deprecated standalone
+`--jira-url` flag only asserts a matching allowlisted URL; it cannot select or
+override a destination. Disabled monitor notifications do not inspect either
+selector variable; preview never reads credentials or opens a journal.
 
 For direct Python calls, use `NotificationConfig(..., jira_environment="production")`.
 The hook does not implicitly reread process configuration or credential variables in
@@ -120,7 +126,9 @@ preview/disabled mode. Production preview collects production-scoped observation
 without credentials, clients or journal access. Existing staging callers retain
 their defaults and injected-factory call shape.
 
-Use an isolated production journal and a stable namespace for that environment.
+Use an isolated production journal and a stable namespace for that environment;
+never carry the staging workflow's namespace or transition41/resolution10000
+into production. No production recovery IDs are established by this refactor.
 Unbound older journals are staging-only, and retained outbox/create identities are
 validated before draining work. Cross-environment observations, properties, adapter
 origins and journals fail closed. Production recovery still requires an explicitly

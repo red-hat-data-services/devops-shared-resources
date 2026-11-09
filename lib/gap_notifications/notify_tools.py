@@ -65,6 +65,19 @@ def jira_target(name="stage"):
 
 
 STAGING_JIRA_ORIGIN = "https://stage-redhat.atlassian.net"
+
+
+def jira_target_from_url(url=STAGING_JIRA_ORIGIN):
+    """Map only allowlisted operator origins to the existing internal identity."""
+    if not isinstance(url, str):
+        raise ValueError("GAP_JIRA_URL must be an allowlisted HTTPS origin")
+    for name in ("stage", "production"):
+        target = jira_target(name)
+        if url in (target.url, target.url + "/"):
+            return target
+    raise ValueError("GAP_JIRA_URL must be an allowlisted HTTPS origin")
+
+
 STAGING_JIRA_PROJECT = "RHAI"
 STAGING_JIRA_ISSUE_TYPE_BUG = "Bug"
 STAGING_JIRA_ISSUE_TYPE_ID = "10016"
