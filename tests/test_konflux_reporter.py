@@ -135,8 +135,11 @@ def test_build_receipt_survives_eg_result_and_history_snapshot(tmp_path, monkeyp
         repo_root=tmp_path, leader_pr_url="https://github.com/acme/gap/pull/9",
         state_file=str(path), labels=[], publish=False)
     assert result.overall_status == outcome
-    for saved in (path, write_history_snapshot(tmp_path, path)):
-        child = json.loads(saved.read_text())["pull-requests"][0]
+    before = json.loads(path.read_text())
+    archive = write_history_snapshot(tmp_path, path)
+    assert not path.exists()
+    for saved in (before, json.loads(archive.read_text())):
+        child = saved["pull-requests"][0]
         assert child["build-observations"] == receipt
         assert child["builds"] == images
         assert child["pr-status"] == "success"

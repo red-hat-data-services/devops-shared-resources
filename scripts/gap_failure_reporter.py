@@ -38,6 +38,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.leader_lifecycle import retired_outcome
+from lib.leader_history import history_state_outcome
 
 from lib.gap_check_selection import DEFAULT_BUILD_APP_SLUG, default_build_producer
 from lib.konflux_builds import build_status_source, DEFAULT_UI
@@ -507,7 +508,8 @@ def build_child_row(
             if evidence.get("query-error"):
                 evidence_reason = "Konflux lookup unavailable: " + _clip(str(evidence["query-error"]))
             elif status_key in {"build-pending", "new"}:
-                pending = [str(r.get("component", "?")) + ": " + str(r.get("status", "unknown"))
+                pending = [str(r.get("component", "?")) + ": " + (str(r["retry"].get("status", "unknown")) + ": " + str(r["retry"].get("reason", ""))
+                            if r.get("retry") else str(r.get("status", "unknown")))
                            for r in evidence.get("runs", []) if isinstance(r, dict) and r.get("status") != "success"]
                 evidence_reason = "Konflux: " + "; ".join(pending) if pending else "Awaiting monitor refresh"
             if status_key == "build-failure":
@@ -515,7 +517,7 @@ def build_child_row(
                 expected_host = urlsplit(os.environ.get("KONFLUX_UI_URL", DEFAULT_UI)).netloc
                 verified = []
                 for record in evidence.get("runs", []):
-                    if not isinstance(record, dict) or record.get("status") not in {"failure", "timed_out"}:
+                    if not isinstance(record, dict) or record.get("status") not in {"failure", "timed_out", "cancelled"}:
                         continue
                     if record.get("head_sha") != head_sha:
                         continue
@@ -527,6 +529,15 @@ def build_child_row(
                         verified.append(BuildCheckLink(name=str(record.get("name") or record.get("component")),
                                                        conclusion=record["status"], url=link))
                 build_links = tuple(verified)
+                retry_details = [
+                    str(record.get("component", "?")) + ": " + str(record["retry"].get("status", "unknown"))
+                    + ": " + str(record["retry"].get("reason", ""))
+                    for record in evidence.get("runs", [])
+                    if isinstance(record, dict) and isinstance(record.get("retry"), dict)
+                    and record.get("status") != "success"
+                ]
+                if retry_details:
+                    evidence_reason = "; ".join(filter(None, [evidence_reason, *retry_details]))
     elif status_key in {"merge-failure", "build-pending", "new"}:
         build_links: tuple[BuildCheckLink, ...] = ()
     else:
@@ -871,7 +882,9 @@ def report_for_leader(
     git_runner: Callable[..., str] | None = None,
     reuse_monitor_evidence: bool = False,
     tracking: dict | None = None,
+    allow_archived: bool = False,
 ) -> ReporterResult:
+    """Update the maintained summary, preserving finalized records unless explicitly requested."""
     run = gh_runner or _run_gh
     if head_ref:
         checkout_leader_branch(repo_root, head_ref, git_runner=git_runner)
@@ -884,7 +897,7 @@ def report_for_leader(
         allow_gap_dir_fallback=True,
     )
     payload = load_state(path)
-    if retired_outcome(payload):
+    if retired_outcome(payload) or (history_state_outcome(path) and not allow_archived):
         return ReporterResult(
             leader_pr_url, (), None, False, False, dry_run,
             "Retired Leader: preserving the recorded failure summary.",

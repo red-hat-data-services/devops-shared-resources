@@ -24,6 +24,7 @@ from lib.state_file import (
 
 from lib.creator_outcomes import ERROR_OUTCOMES, PR, merge_outcomes
 from lib.leader_lifecycle import retired_outcome
+from lib.leader_history import is_history_state
 
 GAP_LABEL = "gated-artifacts-promoter"
 LEADER_BRANCH_PREFIX = "gap-leader"
@@ -353,8 +354,10 @@ class LeaderPRManager:
                 )
             else:
                 self.run_git(["checkout", "-B", branch], cwd=workdir, mutate=True)
-                state_rel = state_path_for_trigger(trigger_id)
+                state_rel = find_existing_state_path(workdir, trigger_id) or state_path_for_trigger(trigger_id)
 
+            if is_history_state(workdir / state_rel):
+                raise RuntimeError("Cannot update an archived Leader; use a new trigger ID")
             if resume_branch and (workdir / state_rel).exists():
                 previous_state = load_state_file(workdir / state_rel)
                 if retired_outcome(previous_state):

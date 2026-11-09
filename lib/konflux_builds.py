@@ -87,7 +87,9 @@ class BuildObservation:
     namespace: str = ""
     created_at: str = ""
     url: str = ""
+    pipeline_name: str = ""
     completed_at: str = ""
+    message: str = ""
 
     def to_dict(self):
         """Serialize the selected build observation for state persistence."""
@@ -204,7 +206,11 @@ def select_latest(runs, *, repo, number, sha, components, namespace, ui_url=DEFA
     ordered = sorted(selected.values(), key=lambda x: x[0], reverse=True)
     if len(ordered) > 1 and ordered[0][0] == ordered[1][0]:
         raise KonfluxQueryError("Latest PipelineRun attempt is ambiguous")
-    run = ordered[0][1]
+    return _observation(ordered[0][1], sha, namespace, ui_url)
+
+
+def _observation(run, sha, namespace, ui_url):
+    """Translate a run after its caller has verified the full build identity."""
     metadata, labels, _ = _facts(run)
     status = run.get("status") or {}
     if not isinstance(status, dict) or not isinstance(status.get("conditions", []), list):
@@ -237,7 +243,7 @@ def select_latest(runs, *, repo, number, sha, components, namespace, ui_url=DEFA
     if result in {"success", "failure", "timed_out", "cancelled"}:
         try:
             completed = _timestamp(status.get("completionTime"))
-            if completed >= ordered[0][0]:
+            if completed >= _timestamp(metadata.get("creationTimestamp")):
                 completed_at = completed.isoformat()
         except (KonfluxQueryError, OverflowError):
             pass
@@ -245,7 +251,10 @@ def select_latest(runs, *, repo, number, sha, components, namespace, ui_url=DEFA
     return BuildObservation(labels[COMPONENT], result, reason, sha, metadata["name"],
                             metadata["uid"], namespace, metadata["creationTimestamp"],
                             f"{ui}/ns/{quote(namespace)}/pipelinerun/{quote(metadata['name'])}",
-                            completed_at=completed_at)
+                            pipeline_name=str((metadata.get("annotations") or {}).get(PAC + "original-prname")
+                                or labels.get(PAC + "original-prname") or ""),
+                            completed_at=completed_at,
+                            message=str(conditions[0].get("message") or "")[:4000] if conditions else "")
 
 
 class _NoRedirect(HTTPRedirectHandler):
@@ -317,7 +326,13 @@ class KonfluxClient:
         # Query only this PR revision; archive payloads for long-lived notebook
         # PRs span many components/commits and can otherwise exhaust the budget.
         selector = PAC + "pull-request=" + str(number) + "," + PAC + "sha=" + sha
-        path = f"/apis/tekton.dev/v1/namespaces/{quote(self.namespace)}/pipelineruns"
+        self._cache[key] = self._list_resources(selector)
+        self._errors.pop(key, None)
+        return self._cache[key]
+
+    def _list_resources(self, selector, resource="pipelineruns"):
+        """Read a complete bounded live/archive listing; never trust a partial page."""
+        path = f"/apis/tekton.dev/v1/namespaces/{quote(self.namespace)}/{resource}"
         live, continuation, seen, version = [], "", set(), None
         for _ in range(40):
             query = {"labelSelector": selector, "limit": 100}
@@ -379,9 +394,7 @@ class KonfluxClient:
             if not uid:
                 raise KonfluxQueryError("PipelineRun record has no UID")
             by_uid[uid] = run
-        self._cache[key] = list(by_uid.values())
-        self._errors.pop(key, None)
-        return self._cache[key]
+        return list(by_uid.values())
 
     def prefetch_prs(self, queries, *, max_workers=4):
         """Read each unique PR/head once with bounded parallelism.

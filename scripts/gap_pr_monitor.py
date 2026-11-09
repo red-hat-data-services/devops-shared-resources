@@ -79,6 +79,7 @@ from lib.gap_check_selection import (
 from lib.leader_lifecycle import retire_leader, retired_outcome, validate_replacement
 from lib.konflux_builds import build_status_source
 from lib.konflux_gate import evaluate_konflux_gate
+from lib.gap_build_retries import BuildRetryManager, retries_enabled
 from lib.gap_component_map import fetch_component_repo_map, repository_components
 from lib.gap_pr_gates import (
     PR_STATUS_BUILD_FAILURE,
@@ -98,7 +99,10 @@ from lib.pr_status_updater import (
     StatusUpdateResult,
     parse_pr_url,
 )
-from lib.leader_history import prepare_leader_history_merge, write_history_snapshot
+from lib.leader_history import (
+    HISTORY_FOLDERS, canonical_state_path, history_state_outcome, is_history_state, state_outcome,
+    prepare_leader_history_merge, resolve_existing_state_path, write_history_snapshot,
+)
 from lib.state_file import (
     OVERALL_STATUS_EARLY_GATE_TRIGGERED,
     OVERALL_STATUS_FAILURE,
@@ -210,6 +214,7 @@ class PublishResult:
     sha: str
     committed: bool
     dry_run: bool = False
+    state_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -224,9 +229,9 @@ class OpenLeaderPr:
 
 
 def state_path_for_trigger(trigger_id: str, *, root: Path | None = None) -> Path:
-    """Return state.json for a trigger id under GAP Leaders/.
+    """Return active or archived state.json for a trigger id.
 
-    Looks for ``GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json``.
+    Prefer ``GAP Leaders/<YYYY-MM-DD>_<trigger_id>/state.json``.
     If several dated folders exist for the same trigger id, the latest
     folder name (lexicographic date prefix) wins.
     """
@@ -237,31 +242,14 @@ def state_path_for_trigger(trigger_id: str, *, root: Path | None = None) -> Path
             "(e.g. gap-4e997b5f8c224668b51d2fc8b4677495)."
         )
     base = root if root is not None else Path(".")
-    leaders = base / GAP_LEADERS_DIR
-    if not leaders.is_dir():
-        raise GapPrMonitorError(
-            f"State directory not found: {leaders} "
-            f"(expected {GAP_LEADERS_DIR}/<YYYY-MM-DD>_{tid}/state.json)."
-        )
-
-    matches: list[Path] = []
-    for child in sorted(leaders.iterdir()):
-        if not child.is_dir():
-            continue
-        m = DATED_TRIGGER_DIR_RE.match(child.name)
-        if not m or m.group("trigger_id") != tid:
-            continue
-        candidate = child / "state.json"
-        if candidate.is_file():
-            matches.append(candidate)
-
-    if not matches:
-        raise GapPrMonitorError(
-            f"State file not found for {tid!r} under {leaders} "
-            f"(expected {GAP_LEADERS_DIR}/<YYYY-MM-DD>_{tid}/state.json)."
-        )
-    # Date-prefixed names sort chronologically; take the newest.
-    return matches[-1].resolve()
+    from lib.state_file import find_existing_state_path
+    try:
+        found = find_existing_state_path(base, tid)
+    except ValueError as exc:
+        raise GapPrMonitorError(str(exc)) from exc
+    if found is None:
+        raise GapPrMonitorError(f"State file not found for {tid!r} under {base / GAP_LEADERS_DIR}.")
+    return (base / found).resolve()
 
 
 def extract_trigger_id_from_labels(labels: Sequence[str] | None) -> str | None:
@@ -362,7 +350,7 @@ def resolve_state_file(
     base = root if root is not None else Path(".")
 
     if state_file and str(state_file).strip():
-        return Path(state_file).expanduser().resolve()
+        return resolve_existing_state_path(base, Path(state_file))
 
     if trigger_id and str(trigger_id).strip():
         return state_path_for_trigger(str(trigger_id).strip(), root=base)
@@ -1079,6 +1067,38 @@ def checkout_leader_branch(
     run(["checkout", "-B", ref, f"{remote}/{ref}"], cwd=repo_root)
 
 
+def resolve_finalized_state(
+    repo_root: Path, state_path: Path, *, git_runner: Callable[..., str] | None = None,
+) -> Path:
+    """Recognize a tracked legacy conclusion before a scan can reset its gates.
+
+    Only identical, terminal active/history records are migration candidates.
+    A genuinely active retry may have stale history; conflicting terminal
+    records instead require investigation without changing either copy.
+    """
+    path = resolve_existing_state_path(repo_root, state_path)
+    if is_history_state(path) or os.environ.get("GAP_MOVE_FINAL_STATE", "").lower() != "true":
+        return path
+    payload = load_state(path)
+    if retired_outcome(payload):
+        return path  # Retirement may have just added metadata to the active record.
+    folder = HISTORY_FOLDERS.get(state_outcome(payload))
+    if folder is None:
+        return path
+    canonical = canonical_state_path(repo_root, path)
+    snapshot = repo_root.resolve() / "GAP History" / folder / canonical.parent.name / "state.json"
+    if not snapshot.is_file():
+        return path
+    run = git_runner or (lambda args, cwd: _run_git(args, cwd=cwd))
+    relative = state_path_for_output(snapshot, repo_root=repo_root)
+    if not run(["ls-files", "--", relative], cwd=repo_root).strip():
+        raise GapPrMonitorError("Refusing to use an untracked history snapshot")
+    history_state_outcome(snapshot)
+    if load_state(snapshot) != payload:
+        raise GapPrMonitorError("Active and archived Leader records disagree; refusing to change either")
+    return snapshot
+
+
 def publish_state(
     repo_root: Path,
     state_path: Path,
@@ -1088,6 +1108,7 @@ def publish_state(
     dry_run: bool = False,
     commit_message: str = "Update GAP state from PR monitor (RHOAIENG-97052)",
     rebase_on_conflict: bool = True,
+    archive: bool = False,
     git_runner: Callable[..., str] | None = None,
 ) -> PublishResult:
     """Commit and push state.json, returning the published commit SHA.
@@ -1095,35 +1116,68 @@ def publish_state(
     When the state file is unchanged, no empty commit is created; the current
     ``HEAD`` SHA is returned so Leader signaling can still target it.
     """
+    repo_root = repo_root.expanduser().resolve()
     run = git_runner or (lambda args, cwd=repo_root: _run_git(args, cwd=cwd))
+    state_path = (resolve_existing_state_path(repo_root, state_path) if archive
+                  else resolve_finalized_state(repo_root, state_path, git_runner=run))
     rel = state_path_for_output(state_path, repo_root=repo_root)
+    archive = archive or bool(retired_outcome(load_state(state_path))) or is_history_state(state_path)
     if dry_run:
         sha = run(["rev-parse", "HEAD"], cwd=repo_root) or "dry-run-sha"
         print(f"[dry-run] would commit and push {rel} on {head_ref} (sha={sha})")
-        return PublishResult(sha=sha, committed=True, dry_run=True)
+        return PublishResult(sha=sha, committed=True, dry_run=True, state_path=state_path)
 
     run(["config", "user.name", "github-actions[bot]"], cwd=repo_root)
     run(
         ["config", "user.email", "github-actions[bot]@users.noreply.github.com"],
         cwd=repo_root,
     )
-    snapshot = write_history_snapshot(repo_root, state_path)
-    paths = [rel]
-    if snapshot is not None:
-        paths.append(state_path_for_output(snapshot, repo_root=repo_root))
-        if retired_outcome(load_state(state_path)):
-            # Keep one final dashboard record. Earlier outcomes remain in Git
-            # history when an unsuccessful run later succeeds before retirement.
-            history = repo_root / "GAP History"
-            folder, *relative = snapshot.relative_to(history).parts
-            other = "unsuccessful" if folder == "successful" else "successful"
-            obsolete = history / other / Path(*relative)
-            if obsolete.exists():
-                old_rel = state_path_for_output(obsolete, repo_root=repo_root)
-                if not run(["ls-files", "--", old_rel], cwd=repo_root).strip():
+    # Activate together in the monitor and merge-orchestrator workflows. Older
+    # pinned consumers cannot resolve a state file after it moves to history.
+    exclusive = os.environ.get("GAP_MOVE_FINAL_STATE", "").lower() == "true" or is_history_state(state_path)
+    if not exclusive:
+        snapshot = write_history_snapshot(repo_root, state_path, move=False)
+        published_path = state_path
+        paths = [rel]
+        if snapshot is not None:
+            paths.append(state_path_for_output(snapshot, repo_root=repo_root))
+            if retired_outcome(load_state(state_path)):
+                folder, *relative = snapshot.relative_to(repo_root / "GAP History").parts
+                other = "unsuccessful" if folder == "successful" else "successful"
+                obsolete = repo_root / "GAP History" / other / Path(*relative)
+                if obsolete.exists():
+                    old_rel = state_path_for_output(obsolete, repo_root=repo_root)
+                    if not run(["ls-files", "--", old_rel], cwd=repo_root).strip():
+                        raise GapPrMonitorError("Refusing to remove an untracked history snapshot")
+                    obsolete.unlink()
+                    paths.append(old_rel)
+    else:
+        canonical = canonical_state_path(repo_root, state_path)
+        if is_history_state(state_path) and canonical.exists():
+            canonical_rel = state_path_for_output(canonical, repo_root=repo_root)
+            if not run(["ls-files", "--", canonical_rel], cwd=repo_root).strip():
+                raise GapPrMonitorError("Refusing to remove an untracked active state")
+        candidates = [repo_root / "GAP History" / folder / canonical.parent.name / "state.json"
+                      for folder in ("successful", "unsuccessful")]
+        # Check before touching any files. Legacy snapshots may exist while a run
+        # is still active; finalization keeps exactly one, ordinary updates none.
+        for candidate in candidates:
+            if candidate.exists() and candidate != state_path:
+                candidate_rel = state_path_for_output(candidate, repo_root=repo_root)
+                if not run(["ls-files", "--", candidate_rel], cwd=repo_root).strip():
                     raise GapPrMonitorError("Refusing to remove an untracked history snapshot")
-                obsolete.unlink()
-                paths.append(old_rel)
+        snapshot = write_history_snapshot(repo_root, state_path) if archive else None
+        if archive and snapshot is None:
+            raise GapPrMonitorError("Cannot archive a non-terminal Leader")
+        published_path = snapshot or state_path
+        paths = [state_path_for_output(published_path, repo_root=repo_root)]
+        canonical_rel = state_path_for_output(canonical, repo_root=repo_root)
+        if snapshot and run(["ls-files", "--", canonical_rel], cwd=repo_root).strip():
+            paths.append(canonical_rel)
+        for candidate in candidates:
+            if candidate != snapshot and candidate.exists():
+                candidate.unlink()
+                paths.append(state_path_for_output(candidate, repo_root=repo_root))
     run(["add", "--", *paths], cwd=repo_root)
     staged = run(["diff", "--cached", "--name-only"], cwd=repo_root)
     if set(staged.splitlines()) - set(paths):
@@ -1137,7 +1191,7 @@ def publish_state(
             head_ref,
             remote=remote,
             git_runner=run,
-            max_attempts=3 if rebase_on_conflict else 1,
+            max_attempts=3 if rebase_on_conflict and not (archive and exclusive) else 1,
         )
         print(f"Pushed state update for Leader branch {head_ref}")
     else:
@@ -1145,7 +1199,7 @@ def publish_state(
     sha = run(["rev-parse", "HEAD"], cwd=repo_root)
     if not sha:
         raise GapPrMonitorError("Could not resolve published commit SHA after publish.")
-    return PublishResult(sha=sha, committed=committed, dry_run=False)
+    return PublishResult(sha=sha, committed=committed, dry_run=False, state_path=published_path)
 
 
 # Back-compat alias used by older schedule helpers/tests.
@@ -1261,6 +1315,7 @@ def _post_leader_failure_summary(
     dry_run: bool,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
     tracking: dict | None = None,
+    finalized: bool = False,
 ) -> None:
     """Upsert the Leader failure/pending/closed summary comment (best-effort).
 
@@ -1280,6 +1335,7 @@ def _post_leader_failure_summary(
         gh_runner=gh_runner,
         reuse_monitor_evidence=build_status_source() == "konflux",
         tracking=tracking,
+        allow_archived=finalized,
     )
     prefix = "[dry-run] " if dry_run else ""
     action = "create" if summary.created else ("update" if summary.updated else "noop")
@@ -1307,14 +1363,14 @@ def retire_previous_leader(
             or old.get("head", {}).get("ref") != branch
             or old.get("state") != "open" or old.get("merged")):
         raise GapPrMonitorError("Leader changed before rollover; reload its branch and retry")
-    # Only the canonical state for this Leader can be frozen.
+    # Only this Leader record can be finalized or retried.
     trigger = str(branch).removeprefix("gap-leader/")
     labels = {item.get("name") for item in old.get("labels", []) if isinstance(item, dict)}
     if (old.get("draft") or not str(branch).startswith("gap-leader/gap-")
             or (old.get("head", {}).get("repo") or {}).get("full_name") != ref.slug
             or not {DEFAULT_LEADER_LABEL, trigger}.issubset(labels)):
         raise GapPrMonitorError("Refusing to retire a PR without its GAP Leader identity")
-    relative = state_path.resolve().relative_to(repo_root.resolve())
+    relative = canonical_state_path(repo_root, state_path).relative_to(repo_root.resolve())
     if (len(relative.parts) != 3 or relative.parts[0] != GAP_LEADERS_DIR
             or relative.parts[2] != "state.json"
             or not relative.parts[1].endswith("_" + trigger)):
@@ -1330,8 +1386,9 @@ def retire_previous_leader(
             "Leader includes changes outside its run record; refusing automatic history merge"
         )
     payload = load_state(state_path)
-    outcome = retired_outcome(payload)
-    if outcome is not None:
+    retired = retired_outcome(payload)
+    outcome = retired or history_state_outcome(state_path)
+    if retired is not None:
         expected = payload["leader-lifecycle"]["replacement-leader"]
         recorded_ref = parse_pr_url(expected)
         if recorded_ref.slug != ref.slug or recorded_ref.number <= ref.number:
@@ -1346,13 +1403,16 @@ def retire_previous_leader(
     if dry_run:
         print(f"[dry-run] would preserve {leader_pr_url} as {outcome}, without child statuses")
         return MonitorResult(state_path, [], [], [], [], True, overall_status=outcome)
-    save_state(state_path, payload)
+    if not is_history_state(state_path):
+        save_state(state_path, payload)
     published = publish_state(
         repo_root, state_path, branch, remote=remote, git_runner=git_runner,
         commit_message=f"Preserve replaced GAP Leader ({outcome})",
         # Never replay a retirement over a concurrently updated state.
         rebase_on_conflict=False,
+        archive=True,
     )
+    state_path = published.state_path or state_path
     factory = updater_factory or PRStatusUpdater
     updater = factory(check_name=check_name, dry_run=False)
     verify_leader_head(leader_pr_url, published.sha, updater=updater)
@@ -1360,6 +1420,20 @@ def retire_previous_leader(
         leader_pr_url, published.sha, overall_status=outcome,
         updater=updater, gh_runner=runner,
     )
+    if retired is None:
+        if early_gate_concluded(payload):
+            from scripts.gap_early_gate_results import post_child_statuses_for_early_gate
+            post_child_statuses_for_early_gate(
+                payload, overall_status=outcome, updater=updater, pinned_only=True,
+            )
+        try:
+            _post_leader_failure_summary(
+                leader_pr_url=leader_pr_url, repo_root=repo_root,
+                state_path=state_path, head_ref=branch, dry_run=False,
+                gh_runner=runner, finalized=True,
+            )
+        except Exception as exc:  # Best-effort, as on the first publication.
+            print(f"WARNING: Leader failure summary retry failed: {exc}", file=sys.stderr)
     return MonitorResult(
         state_path, [], [], [], [], False, overall_status=outcome,
         leader_status_posted=not posted.skipped, published_sha=published.sha,
@@ -1392,8 +1466,9 @@ def run_monitor_publish_and_signal(
       if required builds failed: post Leader green on the published SHA;
       always (when Leader URL known): upsert failure/pending/closed summary comment.
     """
+    state_path = resolve_finalized_state(repo_root, state_path, git_runner=git_runner)
     if publish and leader_pr_url and (
-        replacement_url or retired_outcome(load_state(state_path))
+        replacement_url or is_history_state(state_path) or retired_outcome(load_state(state_path))
     ):
         return retire_previous_leader(
             state_path, repo_root=repo_root, head_ref=head_ref,
@@ -1423,6 +1498,7 @@ def run_monitor_publish_and_signal(
     branch = (head_ref or "").strip() or current_git_branch(
         repo_root, git_runner=git_runner
     )
+    finalizing = bool(leader_pr_url and should_green_leader_for_build_failure(load_state(result.state_path)))
     published = publish_state(
         repo_root,
         result.state_path,
@@ -1430,7 +1506,10 @@ def run_monitor_publish_and_signal(
         remote=remote,
         dry_run=dry_run,
         git_runner=git_runner,
+        archive=finalizing,
     )
+
+    result = replace(result, state_path=published.state_path or result.state_path)
 
     notification_result = None
     notification_tracking = {"status": "not_checked"}
@@ -1447,6 +1526,7 @@ def run_monitor_publish_and_signal(
             notification_tracking = {"status": "unavailable"}
             notification_result = {"status": "error", "error_type": type(exc).__name__}
             print("WARNING: GAP notification hook failed: " + type(exc).__name__, file=sys.stderr)
+
 
     leader_url = (leader_pr_url or "").strip() or None
     leader_status_posted = False
@@ -1529,6 +1609,7 @@ def run_monitor_publish_and_signal(
                 leader_pr_url=leader_url,
                 repo_root=repo_root,
                 state_path=result.state_path,
+                finalized=finalizing,
                 head_ref=branch,
                 dry_run=dry_run,
                 gh_runner=gh_runner,
@@ -1914,7 +1995,7 @@ def run_monitor(
     """Evaluate build and feasibility gates, post statuses, and update state."""
     path = state_path.expanduser().resolve()
     payload = load_state(path)
-    retired = retired_outcome(payload)
+    retired = retired_outcome(payload) or history_state_outcome(path)
     if retired:
         return MonitorResult(path, [], [], [], [], dry_run, overall_status=retired,
                              reports=("Retired Leader: child evaluation is disabled",))
@@ -1982,6 +2063,7 @@ def _decide_url(
     build_app_id: int | None,
     retry_unknown: bool,
     component_repo_map: dict[str, frozenset[str]],
+    retry_manager: BuildRetryManager | None = None,
 ) -> RepositoryGateDecision:
     pull_request = fetch_repository_pull_request(
         url, gh_runner=runner, retry_unknown=retry_unknown
@@ -2075,6 +2157,16 @@ def _decide_url(
         allowed_components=repository_components(component_repo_map, pull_request.repo),
         build_gate_override=build_gate_override,
     )
+    if (retry_manager is not None and observations is not None
+            and decision.pr_status != PR_STATUS_MERGE_FAILURE):
+        build_gate_override, observations = retry_manager.apply(pull_request, build_gate_override, observations)
+        decision = decide_repository_pr(
+            pull_request, tekton_documents=tekton_documents, tekton_error=tekton_error,
+            check_runs=check_runs, check_query_error=check_query_error, feasibility=feasibility,
+            now=now, build_app_slug=build_app_slug, build_app_id=build_app_id,
+            allowed_components=repository_components(component_repo_map, pull_request.repo),
+            build_gate_override=build_gate_override,
+        )
     if observations is None and build_status_source() == "konflux":
         # Merge/conflict decisions need no build query, but the immediately
         # following comment can still reuse their freshly evaluated PR facts.
@@ -2121,6 +2213,7 @@ def _publish_gate_decision(
     batch_concluded: bool,
     overall_status: str | None,
     payload: dict[str, Any] | None = None,
+    retry_manager: BuildRetryManager | None = None,
 ) -> tuple[RepositoryGateDecision | None, StatusUpdateResult | None]:
     """Publish a decision, or re-evaluate once when the head has moved.
 
@@ -2149,7 +2242,21 @@ def _publish_gate_decision(
         build_app_id=build_app_id,
         retry_unknown=retry_unknown,
         component_repo_map=component_repo_map,
+        retry_manager=retry_manager,
     )
+    # The head changed after the batch refresh. Recompute the shared probe
+    # before posting this decision or any following sibling: an old terminal
+    # failure must not release greens when the new head is pending/recovered.
+    if payload is not None:
+        record_child_head_shas(payload, [fresh])
+        apply_pr_statuses(payload, {fresh.url: fresh.pr_status})
+        apply_component_builds_from_children(payload)
+        overall_status = derive_legacy_overall_status(payload)
+        batch_concluded = children_batch_concluded([
+            str(entry.get("pr-status") or "") for entry in payload.get("pull-requests", [])
+        ])
+    else:
+        batch_concluded, overall_status = False, None
     if fresh.skip_status_post:
         return fresh, None
     to_post = status_decision_for_post(
@@ -2161,6 +2268,9 @@ def _publish_gate_decision(
     assert isinstance(to_post, RepositoryGateDecision)
     result = _post_gate_status(updater, to_post, description)
     if result.deferred:
+        if payload is not None:
+            apply_pr_statuses(payload, {fresh.url: BUILD_PENDING_PR_STATUS})
+            apply_component_builds_from_children(payload)
         return None, result
     return fresh, result
 
@@ -2192,6 +2302,9 @@ def _publish_decisions(
     reports: list[str] = []
     post_errors: list[tuple[str, str]] = []
     evaluated_decisions: list[RepositoryGateDecision] = []
+    retry_manager = (BuildRetryManager(runner, payload, dry_run=dry_run)
+                     if retries_enabled() and build_status_source() == "konflux"
+                     and "GAP History" not in path.parts else None)
     ensure_promotion_gates(payload)
     migrate_legacy_overall_status(payload)
     if build_status_source() == "konflux":
@@ -2205,12 +2318,14 @@ def _publish_decisions(
                     decision.url, runner=runner, now=now, build_app_slug=build_app_slug,
                     build_app_id=build_app_id, retry_unknown=retry_unknown,
                     component_repo_map=component_repo_map,
+                    retry_manager=retry_manager,
                 )
                 for decision in decisions
             )
         except (GapPrMonitorError, GhCommandError, ValueError, RuntimeError) as exc:
-            # No status or state writes have happened: retain the prior batch
-            # rather than publishing a mix of refreshed and stale decisions.
+            # No commit status or state writes have happened: retain the prior
+            # batch. Any retry comments already sent carry their own recovery
+            # receipts, so the next poll cannot repeat them.
             raise GapPrMonitorError(f"Could not refresh child batch before publication: {exc}") from exc
     # One coherent batch decides both persisted outcomes and the child-green hold.
     child_head_changed = record_child_head_shas(payload, decisions)
@@ -2236,9 +2351,15 @@ def _publish_decisions(
                 batch_concluded=batch_concluded,
                 overall_status=overall_status,
                 payload=probe,
+                retry_manager=retry_manager,
             )
         except (ValueError, RuntimeError, GhCommandError, GapPrMonitorError) as exc:
             post_errors.append((url, str(exc)))
+            # A late refresh/action may have started a retry before its response
+            # was lost. Keep subsequent siblings held while this child is unknown.
+            status_updates[url] = BUILD_PENDING_PR_STATUS
+            apply_pr_statuses(probe, {url: BUILD_PENDING_PR_STATUS})
+            apply_component_builds_from_children(probe)
             if not continue_on_error:
                 if status_updates and not dry_run:
                     apply_pr_statuses(payload, status_updates)
@@ -2285,6 +2406,9 @@ def _publish_decisions(
                     from lib.gap_notifications.merge_receipts import unavailable_receipt
                     entry["merge-observations"] = unavailable_receipt(entry.get("merge-observations"))
                 if decision.build_observations is not None:
+                    previous_history = (entry.get("build-observations") or {}).get("retry-history")
+                    if previous_history and "retry-history" not in decision.build_observations:
+                        decision.build_observations["retry-history"] = previous_history
                     entry["build-observations"] = decision.build_observations
                 elif build_status_source() == "github":
                     # An explicit rollback must not leave obsolete Konflux
@@ -2472,6 +2596,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    """Run the scheduled or single-Leader monitor and expose its final published state path."""
     args = build_parser().parse_args(argv)
     repo_root = Path(args.repo_root)
     notification_config = None
@@ -2542,11 +2667,6 @@ def main(argv: list[str] | None = None) -> int:
             root=repo_root,
             allow_gap_dir_fallback=args.allow_gap_dir_fallback,
         )
-        # Emit path for thin Actions workflows (optional follow-up steps).
-        append_github_output(
-            "state_path",
-            state_path_for_output(state_path, repo_root=repo_root),
-        )
         result = run_monitor_publish_and_signal(
             state_path,
             repo_root=repo_root,
@@ -2557,6 +2677,11 @@ def main(argv: list[str] | None = None) -> int:
             dry_run=args.dry_run,
             continue_on_error=args.continue_on_error,
             description=args.description,
+        )
+        # Finalization may have moved the state; expose the published location.
+        append_github_output(
+            "state_path",
+            state_path_for_output(result.state_path, repo_root=repo_root),
         )
     except GapPrMonitorError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

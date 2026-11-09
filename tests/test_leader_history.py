@@ -137,7 +137,8 @@ def test_incomplete_runs_have_no_history_snapshot(tmp_path, outcome):
 
 
 @pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
-def test_snapshot_preserves_canonical_and_child_outcome(tmp_path, outcome, folder):
+def test_snapshot_moves_canonical_and_preserves_child_outcome(tmp_path, outcome, folder):
+    """Move terminal state once without changing child decisions, including on retry."""
     state = tmp_path / "GAP Leaders" / "2026-11-04_gap-test" / "state.json"
     state.parent.mkdir(parents=True)
     payload = {"overall-status": outcome, "pull-requests": [
@@ -147,7 +148,7 @@ def test_snapshot_preserves_canonical_and_child_outcome(tmp_path, outcome, folde
     snapshot = write_history_snapshot(tmp_path, state)
     assert snapshot == tmp_path / f"GAP History/{folder}/2026-11-04_gap-test/state.json"
     assert json.loads(snapshot.read_text()) == payload
-    assert json.loads(state.read_text()) == payload
+    assert not state.exists()
     first = snapshot.read_bytes()
     assert write_history_snapshot(tmp_path, state).read_bytes() == first
 
@@ -165,6 +166,7 @@ def test_snapshot_preserves_canonical_and_child_outcome(tmp_path, outcome, folde
     pytest.param(["failure", "pending", "pending"], "unsuccessful", id="component-failure"),
 ])
 def test_snapshot_uses_canonical_gates_without_changing_payload(tmp_path, statuses, folder, legacy):
+    """Gate outcomes override stale legacy status without rewriting the saved payload."""
     state = tmp_path / "GAP Leaders" / "2026-11-04_gap-test" / "state.json"
     state.parent.mkdir(parents=True)
     gate_ids = ("component-builds", "early-gate-build", "early-gate-test")
@@ -182,20 +184,21 @@ def test_snapshot_uses_canonical_gates_without_changing_payload(tmp_path, status
 
     snapshot = write_history_snapshot(tmp_path, state)
 
-    assert state.read_bytes() == original
     if folder is None:
+        assert state.read_bytes() == original
         assert snapshot is None
         assert not (tmp_path / "GAP History").exists()
     else:
         assert snapshot == tmp_path / f"GAP History/{folder}/2026-11-04_gap-test/state.json"
         assert json.loads(snapshot.read_text()) == payload
         assert write_history_snapshot(tmp_path, state).read_bytes() == snapshot.read_bytes()
-        assert state.read_bytes() == original
+        assert not state.exists()
 
 
 @pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
-def test_state_and_snapshot_land_in_same_real_git_commit(tmp_path, outcome, folder):
-    """Prove both copies survive a normal local push; no GitHub or mocks."""
+def test_archive_add_and_active_delete_land_in_same_real_git_commit(tmp_path, monkeypatch, outcome, folder):
+    """The remote tree must contain one record, including after a retry."""
+    monkeypatch.setenv("GAP_MOVE_FINAL_STATE", "true")
     remote = tmp_path / "remote.git"
     root = tmp_path / "leader"
     def git(args, cwd):
@@ -215,10 +218,14 @@ def test_state_and_snapshot_land_in_same_real_git_commit(tmp_path, outcome, fold
     git(["commit", "-m", "Pending run"], root)
     git(["push", "-u", "origin", "HEAD"], root)
     state.write_text(json.dumps({"pull-requests": [], "overall-status": outcome}))
-    result = publish_state(root, state, "gap-leader/gap-test", git_runner=git)
-    canonical = git(["show", f"{result.sha}:GAP Leaders/2026-11-04_gap-test/state.json"], root)
+    result = publish_state(root, state, "gap-leader/gap-test", git_runner=git, archive=True)
     archive = git(["show", f"{result.sha}:GAP History/{folder}/2026-11-04_gap-test/state.json"], root)
-    assert json.loads(canonical) == json.loads(archive)
+    assert not state.exists()
+    files = git(["ls-tree", "-r", "--name-only", result.sha], root).splitlines()
+    assert files == [f"GAP History/{folder}/2026-11-04_gap-test/state.json"]
+    retry = publish_state(root, state, "gap-leader/gap-test", git_runner=git, archive=True)
+    assert retry.sha == result.sha and not retry.committed
+    assert retry.state_path == result.state_path
     assert json.loads(archive)["overall-status"] == outcome
     assert git(["rev-parse", "origin/gap-leader/gap-test"], root) == result.sha
 
@@ -286,3 +293,34 @@ def test_result_label_does_not_shadow_leader_trigger(outcome, result_first):
     labels = [result_label, trigger] if result_first else [trigger, result_label]
     assert extract_trigger_id_from_labels(labels) == trigger
     assert extract_trigger_id_from_labels([result_label]) is None
+
+
+@pytest.mark.parametrize("outcome,folder", [("success", "successful"), ("failure", "unsuccessful")])
+def test_archive_lookup_by_old_path_and_trigger(tmp_path, outcome, folder):
+    """Old paths and trigger IDs continue to resolve after finalization moves a record."""
+    from lib.state_file import find_existing_state_path
+    from scripts.gap_pr_monitor import resolve_state_file, state_path_for_trigger
+    path = tmp_path / "GAP Leaders/2026-11-04_gap-test/state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"overall-status": outcome, "pull-requests": []}))
+    archive = write_history_snapshot(tmp_path, path)
+    assert resolve_state_file(root=tmp_path, state_file=str(path)) == archive
+    assert state_path_for_trigger("gap-test", root=tmp_path) == archive
+    assert find_existing_state_path(tmp_path, "gap-test") == archive.relative_to(tmp_path).as_posix()
+
+
+def test_ambiguous_or_mismatched_history_cannot_be_used(tmp_path):
+    """Reject conflicting archive locations and outcomes instead of guessing."""
+    from lib.leader_history import resolve_existing_state_path, history_state_outcome
+    from lib.state_file import find_existing_state_path
+    path = tmp_path / "GAP Leaders/2026-11-04_gap-test/state.json"
+    for folder in ("successful", "unsuccessful"):
+        archive = tmp_path / f"GAP History/{folder}/2026-11-04_gap-test/state.json"
+        archive.parent.mkdir(parents=True)
+        archive.write_text(json.dumps({"overall-status": "failure"}))
+    with pytest.raises(ValueError, match="Multiple archived"):
+        resolve_existing_state_path(tmp_path, path)
+    with pytest.raises(ValueError, match="Multiple archived"):
+        find_existing_state_path(tmp_path, "gap-test")
+    with pytest.raises(ValueError, match="does not match"):
+        history_state_outcome(tmp_path / "GAP History/successful/2026-11-04_gap-test/state.json")

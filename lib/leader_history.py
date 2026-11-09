@@ -20,26 +20,96 @@ RESULT_LABELS = {"success": "result-gap-success", "failure": "result-gap-failure
                  "superseded": "result-gap-superseded"}
 
 
-def write_history_snapshot(repo_root: Path, state_path: Path) -> Path | None:
-    """Copy either terminal outcome; retain the canonical monitor state path."""
-    payload = json.loads(state_path.read_text(encoding="utf-8"))
-    # Canonical gates take precedence, even when empty or incomplete. Derivation
-    # normalizes gates, so use a copy to preserve the exact archived payload.
-    overall = retired_outcome(payload) or (
+def state_outcome(payload: dict) -> str | None:
+    """Derive an archive outcome without normalizing the saved payload."""
+    return retired_outcome(payload) or (
         derive_legacy_overall_status(copy.deepcopy(payload))
-        if "promotion-gates" in payload
-        else payload.get("overall-status")
+        if "promotion-gates" in payload else payload.get("overall-status")
     )
+
+
+def is_history_state(path: Path) -> bool:
+    """Recognize state files beneath an outcome-specific history directory."""
+    return (path.name == "state.json" and path.parent.parent.name in HISTORY_FOLDERS.values()
+            and path.parent.parent.parent.name == str(HISTORY_ROOT))
+
+
+def history_state_outcome(path: Path) -> str | None:
+    """An archive is immutable and must agree with its outcome directory."""
+    if not is_history_state(path):
+        return None
+    outcome = state_outcome(json.loads(path.read_text(encoding="utf-8")))
+    if outcome not in HISTORY_FOLDERS or HISTORY_FOLDERS[outcome] != path.parent.parent.name:
+        raise ValueError("Archived Leader outcome does not match its history folder")
+    return outcome
+
+
+def canonical_state_path(repo_root: Path, state_path: Path) -> Path:
+    """Validate record layout and return its original active path within the repo."""
+    relative = state_path.resolve().relative_to(repo_root.resolve())
+    if is_history_state(state_path):
+        if len(relative.parts) != 4 or relative.parts[0] != str(HISTORY_ROOT):
+            raise ValueError("Expected a history path directly under the repository root")
+        relative = Path("GAP Leaders") / relative.parts[-2] / "state.json"
+    if len(relative.parts) != 3 or relative.parts[0] != "GAP Leaders" or relative.name != "state.json":
+        raise ValueError("Expected a Leader state or outcome history path")
+    return repo_root.resolve() / relative
+
+
+def resolve_existing_state_path(repo_root: Path, state_path: Path) -> Path:
+    """Follow a former active path after finalization; never guess between archives."""
+    repo_root = repo_root.expanduser().resolve()
+    path = state_path.expanduser().resolve()
+    if is_history_state(path):
+        history_state_outcome(path)
+        return path
+    if path.exists():
+        return path
+    try:
+        canonical = canonical_state_path(repo_root, path)
+    except ValueError:
+        return path
+    candidates = [repo_root / HISTORY_ROOT / folder / canonical.parent.name / "state.json"
+                  for folder in sorted(set(HISTORY_FOLDERS.values()))]
+    existing = [item for item in candidates if item.is_file()]
+    if len(existing) > 1:
+        raise ValueError("Multiple archived states for this Leader; refusing to choose")
+    if existing:
+        history_state_outcome(existing[0])
+        return existing[0].resolve()
+    return path
+
+
+def write_history_snapshot(repo_root: Path, state_path: Path, *, move: bool = True) -> Path | None:
+    """Archive a final record; move=False supports callers awaiting rollout."""
+    state_path = resolve_existing_state_path(repo_root, state_path)
+    payload = json.loads(state_path.read_text(encoding="utf-8"))
+    overall = state_outcome(payload)
     folder = HISTORY_FOLDERS.get(overall)
     if folder is None:
         return None
-    relative = state_path.resolve().relative_to(repo_root.resolve())
-    if relative.parts[0] == "GAP Leaders":
-        relative = Path(*relative.parts[1:])
-    snapshot = repo_root / HISTORY_ROOT / folder / relative
+    if not move:
+        relative = state_path.resolve().relative_to(repo_root.resolve())
+        if relative.parts[0] == "GAP Leaders":
+            relative = Path(*relative.parts[1:])
+        snapshot = repo_root / HISTORY_ROOT / folder / relative
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+        return snapshot
+    canonical = canonical_state_path(repo_root, state_path)
+    snapshot = repo_root / HISTORY_ROOT / folder / canonical.parent.name / "state.json"
+    if is_history_state(state_path):
+        history_state_outcome(state_path)
+        if canonical.exists():
+            if json.loads(canonical.read_text()) != payload:
+                raise ValueError("Active and archived Leader records disagree; refusing to remove either")
+            canonical.unlink()
+        return state_path
     snapshot.parent.mkdir(parents=True, exist_ok=True)
     snapshot.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    return snapshot
+    if canonical.exists():
+        canonical.unlink()
+    return snapshot.resolve()
 
 
 def prepare_leader_history_merge(

@@ -202,18 +202,22 @@ def state_path_for_trigger(
 
 def find_existing_state_path(repo_root: str | Path, trigger_id: str) -> str | None:
     """Reuse an existing dated folder for this trigger ID if present."""
-    root = Path(repo_root) / STATE_ROOT_DIR
-    if not root.is_dir():
-        return None
+    from lib.leader_history import history_state_outcome
+    base = Path(repo_root)
     suffix = f"_{trigger_id}"
-    matches = sorted(
-        child.name
-        for child in root.iterdir()
-        if child.is_dir() and child.name.endswith(suffix)
-    )
-    if not matches:
-        return None
-    return f"{STATE_ROOT_DIR}/{matches[-1]}/state.json"
+    active = sorted(path for path in (base / STATE_ROOT_DIR).glob("*/state.json")
+                    if path.parent.name.endswith(suffix))
+    if active:
+        return active[-1].relative_to(base).as_posix()
+    archived = sorted(path for folder in ("successful", "unsuccessful")
+                      for path in (base / "GAP History" / folder).glob("*/state.json")
+                      if path.parent.name.endswith(suffix))
+    if len(archived) > 1:
+        raise StateFileError(f"Multiple archived states for trigger {trigger_id}; refusing to choose")
+    if archived:
+        history_state_outcome(archived[0])
+        return archived[0].relative_to(base).as_posix()
+    return None
 
 
 def _normalize_overall_status(value: Any) -> str | None:

@@ -37,6 +37,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from lib.leader_lifecycle import retired_outcome
+from lib.leader_history import history_state_outcome, is_history_state
 
 from lib.gap_promotion_gates import (
     GATE_COMPONENT_BUILDS,
@@ -635,6 +636,7 @@ def post_child_statuses_for_early_gate(
     overall_status: str,
     updater: PRStatusUpdater,
     continue_on_error: bool = True,
+    pinned_only: bool = False,
 ) -> tuple[str, ...]:
     """Post phase-1 conclusion onto build-passing children; leave build-failures.
 
@@ -647,11 +649,25 @@ def post_child_statuses_for_early_gate(
     posted: list[str] = []
     errors: list[tuple[str, str]] = []
     for url in urls:
+        options = {}
+        if pinned_only:
+            eligible = [item for item in payload["pull-requests"]
+                        if str(item.get("pr-status") or "").strip() in CHILD_PASS_PR_STATUSES]
+            entry = next((item for item in eligible if item.get("pr-url") == url), None)
+            if entry is None:
+                entry = next((item for item in eligible
+                              if str(item.get("pr-url") or "").strip() == url), {})
+            sha = str(entry.get("head-sha") or (entry.get("build-observations") or {}).get("head-sha") or "")
+            if not re.fullmatch(r"[0-9a-f]{40}", sha):
+                print(f"WARNING: archived child {url} has no evaluated SHA; leaving its check unchanged.", file=sys.stderr)
+                continue
+            options = {"head_sha": sha, "defer_if_head_moved": True}
         try:
             result = updater.post_status_for_pr(
                 url,
                 cli_status,
                 description=description,
+                **options,
             )
         except (ValueError, RuntimeError, GhCommandError) as exc:
             errors.append((url, str(exc)))
@@ -660,7 +676,7 @@ def post_child_statuses_for_early_gate(
                     f"Failed to post Early Gate child status for {url}: {exc}"
                 ) from exc
             continue
-        if not result.skipped:
+        if not result.skipped and not getattr(result, "deferred", False):
             posted.append(url)
     if errors and not posted:
         lines = [f"  - {u}: {e}" for u, e in errors]
@@ -716,12 +732,38 @@ def run_early_gate_results(
         labels=resolved_labels,
         root=root,
     )
+    state_path = gpm.resolve_finalized_state(root, state_path, git_runner=git_runner)
     payload = load_state(state_path)
     retired = retired_outcome(payload)
     if retired:
         return EarlyGateResultsResult(
             state_path, retired, retired, False, False, None, dry_run,
             reason="Leader retired; ignoring late Early Gate results",
+        )
+    archived = history_state_outcome(state_path)
+    if archived:
+        # Do not reinterpret late comments or reopen the run. A publish retry
+        # can finish the original merge/status side effects from frozen state.
+        if not publish or dry_run:
+            return EarlyGateResultsResult(
+                state_path, archived, archived, False, False, None, dry_run,
+                reason="Leader archived; preserving its recorded Early Gate result",
+            )
+        published = publish_state(root, state_path, branch, remote=remote, git_runner=git_runner, archive=True)
+        updater = (updater_factory or PRStatusUpdater)(check_name=check_name, dry_run=False)
+        verify_leader_head(leader_url, published.sha, updater=updater)
+        leader_result = post_leader_conclusion(
+            leader_url, published.sha, overall_status=archived, updater=updater, gh_runner=gh_runner,
+        )
+        children = ()
+        if early_gate_concluded(payload):
+            children = post_child_statuses_for_early_gate(
+                payload, overall_status=archived, updater=updater, pinned_only=True,
+            )
+        return EarlyGateResultsResult(
+            state_path, archived, archived, False, not leader_result.skipped,
+            published.sha, False, reason="Resumed archived Leader finalization",
+            child_urls_posted=children,
         )
     ensure_promotion_gates(payload)
     migrate_legacy_overall_status(payload)
@@ -823,7 +865,10 @@ def run_early_gate_results(
             f"Update GAP promotion-gates from merge-orchestrator ({new_overall})"
         ),
         git_runner=git_runner,
+        archive=True,
     )
+
+    state_path = published.state_path or state_path
 
     factory = updater_factory or PRStatusUpdater
     updater = factory(check_name=check_name, dry_run=False)
@@ -841,6 +886,8 @@ def run_early_gate_results(
         payload,
         overall_status=new_overall,
         updater=updater,
+        # The first publication must honor the same frozen receipt as retries.
+        pinned_only=is_history_state(state_path),
     )
     return EarlyGateResultsResult(
         state_path=state_path,

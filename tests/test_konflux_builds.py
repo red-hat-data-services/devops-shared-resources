@@ -146,6 +146,30 @@ def test_snapshot_key_resolves_unique_physical_component_only():
     assert observe([run(component="odh-foo-v3-6")]).status == "missing"
 
 
+@pytest.mark.parametrize("completion,expected", [
+    ("2026-11-05T13:01:00+01:00", "2026-11-05T12:01:00+00:00"),
+    ("2026-11-05T11:59:00Z", ""),
+    ("invalid", ""),
+])
+def test_retry_helper_preserves_pipeline_identity_and_validates_selected_completion(completion, expected):
+    """The retry helper has no select_latest locals and must use its own run timestamp."""
+    from lib.konflux_builds import _observation, DEFAULT_UI
+    item = run(name="retry-run", created="2026-11-05T12:00:00Z",
+               status="False", reason="Failed")
+    item["metadata"]["annotations"]["pipelinesascode.tekton.dev/original-prname"] = "foo-pull-request"
+    item["status"]["completionTime"] = completion
+    item["status"]["conditions"][0]["message"] = "infra detail " * 500
+    actual = _observation(item, SHA, "rhoai-tenant", DEFAULT_UI)
+    assert actual.pipeline_name == "foo-pull-request"
+    assert actual.completed_at == expected
+    assert actual.message == ("infra detail " * 500)[:4000]
+    assert actual.status == "failure"
+    old = run()
+    old["metadata"]["annotations"]["pipelinesascode.tekton.dev/original-prname"] = "foo-pull-request"
+    selected = observe([old, item], pipeline_names={"foo-pull-request"})
+    assert selected == actual
+
+
 # Completion metadata is retained from the selected attempt without changing the verdict.
 @pytest.mark.parametrize('status,reason', [('True', 'Succeeded'), ('False', 'Failed'),
     ('False', 'PipelineRunTimeout'), ('False', 'PipelineRunCancelled')])
