@@ -54,8 +54,10 @@ def prepare_inputs(repository: str, source_map: Path, releases_file: Path) -> tu
         raise ValueError(f"Expected one release source-map entry for {repo_url}")
     mapping = matches[0]
     if mapping.get("automerge") == "no":
-        print("Not applicable: release automerge is disabled.", file=sys.stderr)
-        return False, {"include": []}
+        raise ValueError(
+            f"Release automerge is disabled for {repository}; "
+            "set automerge: 'yes' in the release source map to enable the feasibility check."
+        )
     if mapping.get("automerge") != "yes":
         raise ValueError("automerge must be yes or no")
     releases = _read_config(releases_file).get("releases")

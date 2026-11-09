@@ -107,14 +107,20 @@ def test_missing_or_duplicate_mapping_fails(tmp_path, mappings):
     assert values["check"] == "false"
 
 
-def test_disabled_automerge_skips_even_with_manual_sync(tmp_path):
+@pytest.mark.parametrize("manual_sync", [None, "yes", "no"])
+@pytest.mark.parametrize("releases", [["rhoai-3.6"], []])
+def test_disabled_automerge_fails_even_with_manual_sync_or_no_releases(tmp_path, manual_sync, releases):
+    fields = {} if manual_sync is None else {"manual-sync": manual_sync}
     result, values = _select(tmp_path, [
-        _mapping(automerge="no", **{"manual-sync": "yes"}),
-    ], ["rhoai-3.6"])
-    assert result.returncode == 0
+        _mapping(automerge="no", **fields),
+    ], releases)
+    assert result.returncode == 1
     assert values["check"] == "false"
     assert json.loads(values["matrix"])["include"] == []
+    assert "ERROR:" in result.stderr
     assert "automerge is disabled" in result.stderr
+    assert "red-hat-data-services/component" in result.stderr
+    assert "Not applicable" not in result.stderr
 
 
 @pytest.mark.parametrize("releases", [[], ["rhoai-2.16"]])

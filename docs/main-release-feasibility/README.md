@@ -50,7 +50,11 @@ It emits `check` and `matrix` through `GITHUB_OUTPUT`, or stdout outside Actions
 The matrix has one `include` entry per active release, containing every non-secret
 action input: upstream/downstream repositories and branches, exclusions,
 `merge_args`, `spawn_logs`, and `dry_run`. Runtime credentials stay in the workflow.
-Disabled automerge or no active releases produces `check=false` and an empty matrix.
+Disabled automerge is an error: the script reports the affected repository and
+exits nonzero, failing setup and the required workflow rather than successfully
+skipping the check. Error outputs are `check=false` and an empty matrix, so no
+release jobs are scheduled. No active releases with automerge enabled still
+produces `check=false` and an empty matrix with a successful exit.
 
 Python and PyYAML (included in `requirements.txt`) are required. The script reads
 the supplied files directly, independent of its working directory. It does not
@@ -63,7 +67,8 @@ remains in the action logs.
 - Match the component by `repo-url`, case-insensitively, to accommodate names such
   as `mlserver` mapping to `red-hat-data-services/MLServer`.
 - Fail setup for a missing or duplicate mapping.
-- Skip repositories explicitly configured with `automerge: 'no'`.
+- Fail setup for repositories explicitly configured with `automerge: 'no'`, even
+  with `manual-sync: 'yes'` or no active releases.
 - Check every configured release except `rhoai-2.*`; no active releases means skip.
 - Use component-specific `ignore-files` plus `.github/renovate.json` and
   `.tekton/README.md`, matching the scheduled sync. `manual-sync: 'yes'` alone
