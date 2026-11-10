@@ -53,3 +53,22 @@ Existing replay suppression is unchanged. Runner Python HTTPS trust/access to
 internal GitLab is assumed; no CA provisioning or trust-store changes are made.
 TLS verification and the optional CA override remain in place. Tests inject
 mapping fetches and fake services; they require no authenticated access.
+
+### Repository ownership for conflict and feasibility
+
+Active policy loads additionally fetch the anonymous live
+[rhoai-ops repository mapping](https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml)
+once from raw GitHub main, with bounded size/time, TLS verification, no redirects,
+and no inherited credentials or internal GitLab CA override.
+`repo_to_component` (string or list of Jira component names) is required.
+`repo_to_slack_handle` (one explicit handle) is optional and defaults to an empty
+mapping for compatibility before the upstream rollout; when present it must be
+a mapping. Invalid schema fails policy loading conservatively. Repository keys are case-normalized;
+collisions are rejected. Bare slugs apply only to GitHub's
+`red-hat-data-services` organization, never other organizations or hosts.
+
+Only conflict/feasibility use these maps; build routing stays component-based.
+Unmapped repositories use configured Jira and Slack defaults independently.
+A mapped Jira owner does not imply a Slack owner: missing explicit Slack handles
+still use the Slack default, never inferred or multi-team mentions. Repository
+incident footers link to this source. Existing issues are not reassigned on replay.

@@ -29,6 +29,8 @@ def hook(tmp_path):
         assert channel == "C0883L8FARE"
         return slack
     def ownership_fetch(name):
+        if name == 'automerge_team_mapping.yaml':
+            return 'repo_to_component: {}\nrepo_to_slack_handle: {}'
         return "_default: DevOps\nmappings: {api: [API, Serving]}" if name.startswith("konflux") else "components:\n  default:\n    slack_team_handle: devops"
     defaults = dict(ownership_fetch=ownership_fetch, accepted_urls=[PR], leader_url=LEADER_URL, published_sha="b" * 40,
                     state_path=root / "state.json", repo_root=root,
@@ -478,3 +480,21 @@ def test_default_composite_hook_conflict_recovery_never_closes_build(hook):
     receipt['conflict'] = {'status': 'failure', 'mergeable': 'CONFLICTING', 'merge-state-status': 'DIRTY'}
     invoke(payload)
     assert len(jira.issues) == 2  # old pre-recovery replay is not recurrence
+
+@pytest.mark.parametrize('category', ['conflict', 'feasibility'])
+def test_repository_ownership_hook_and_replay(hook, category):
+    from gap_notification_fakes import observation
+    invoke, jira, slack, _, _ = hook
+    def fetch(name):
+        if name == 'automerge_team_mapping.yaml':
+            return 'repo_to_component: {notebooks: [Images, Server]}\nrepo_to_slack_handle: {notebooks: redhat-ai-notebooks}'
+        return 'mappings: {}' if name.startswith('konflux') else 'components: {default: {slack_team_handle: devops}}'
+    def collector(*args, **kwargs):
+        return [observation(category=category, repository='red-hat-data-services/notebooks')]
+    assert invoke(collector=collector, ownership_fetch=fetch)['status'] == 'settled'
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'Images'}, {'name': 'Server'}]
+    assert '@redhat-ai-notebooks' in str(slack.calls[0][1]['blocks'])
+    jira.issues['RHAI-1']['fields']['components'] = [{'name': 'Manual'}]
+    assert invoke(collector=collector, ownership_fetch=fetch)['status'] == 'settled'
+    assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'Manual'}]
+    assert len(slack.calls) == 1

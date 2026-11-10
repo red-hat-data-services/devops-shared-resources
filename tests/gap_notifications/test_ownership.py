@@ -94,9 +94,11 @@ def test_fetch_once_each():
     calls = []
     def fetch(name):
         calls.append(name)
+        if name == 'automerge_team_mapping.yaml':
+            return 'repo_to_component: {}\nrepo_to_slack_handle: {}'
         return '_default: DevOps\nmappings: {}' if name.startswith('konflux') else 'components: {default: {slack_team_handle: devops}}'
     OwnershipPolicy.load(fetch)
-    assert len(calls) == len(set(calls)) == 2
+    assert len(calls) == len(set(calls)) == 3
 
 
 def test_representative_upstream_schema_ignores_task_routing():
@@ -118,7 +120,7 @@ components:
     slack_team_handle: unknown
     slack_team_channel: ignored
 '''
-    p = OwnershipPolicy.load(lambda name: jira if name.startswith('konflux') else teams)
+    p = OwnershipPolicy.load(lambda name: 'repo_to_component: {}\nrepo_to_slack_handle: {}' if name == 'automerge_team_mapping.yaml' else jira if name.startswith('konflux') else teams)
     assert p.extra_fields({'component': 'api-v3-4', 'failed_task': 'clone-repository'}) == {
         'components': [{'name': 'API'}, {'name': 'Serving'}]}
     assert p.extra_fields({'component': 'api-v2'}) == {'components': [{'name': 'V2'}]}
@@ -137,3 +139,68 @@ components:
 def test_invalid_schema_rejected_safely(jira, teams):
     with pytest.raises(ValueError):
         OwnershipPolicy(jira, teams)
+
+@pytest.mark.parametrize('category', ['conflict', 'feasibility'])
+@pytest.mark.parametrize('repo,mapped', [('red-hat-data-services/notebooks', True), ('https://github.com/red-hat-data-services/notebooks', True), ('other/notebooks', False), ('https://example.com/red-hat-data-services/notebooks', False)])
+def test_repository_ownership(category, repo, mapped):
+    p = OwnershipPolicy({'mappings': {'api': 'API'}},
+                        {'components': {'default': {'slack_team_handle': 'devops'}}},
+                        {'repo_to_component': {'notebooks': ['Images', 'Server']},
+                         'repo_to_slack_handle': {'notebooks': 'redhat-ai-notebooks'}})
+    obs = dict(category=category, repository=repo, component='api', status='failure')
+    assert p.extra_fields(obs)['components'] == [{'name': n} for n in (['Images', 'Server'] if mapped else ['DevOps'])]
+    assert ('@redhat-ai-notebooks' if mapped else '@devops') in p.blocks(obs, 'body', root=True)[1]['text']['text']
+    assert 'Repository ownership' in p.blocks(obs, 'body', root=True)[-1]['elements'][0]['text']
+    assert p.extra_fields(dict(obs, category='build')) == {'components': [{'name': 'API'}]}
+
+@pytest.mark.parametrize('handle', ['here', 'CHANNEL', 'everyone', 'unknown', '@team', '', ['team']])
+def test_invalid_repository_handle(handle):
+    with pytest.raises(ValueError):
+        OwnershipPolicy({'mappings': {}}, {'components': {'default': {'slack_team_handle': 'devops'}}},
+                        {'repo_to_component': {}, 'repo_to_slack_handle': {'notebooks': handle}})
+
+
+def test_repository_missing_slack_and_duplicate_keys():
+    args = ({'mappings': {}}, {'components': {'default': {'slack_team_handle': 'devops'}}})
+    p = OwnershipPolicy(*args, {'repo_to_component': {'notebooks': 'Images'}, 'repo_to_slack_handle': {}})
+    obs = dict(category='conflict', repository='red-hat-data-services/notebooks', status='failure')
+    assert p.extra_fields(obs) == {'components': [{'name': 'Images'}]}
+    assert '@devops' in p.blocks(obs, 'body', root=True)[1]['text']['text']
+    with pytest.raises(ValueError):
+        OwnershipPolicy(*args, {'repo_to_component': {'notebooks': 'Images', 'NOTEBOOKS': 'Other'}, 'repo_to_slack_handle': {}})
+
+
+def test_current_upstream_without_repository_slack_map():
+    p = OwnershipPolicy({'mappings': {}}, {'components': {'default': {'slack_team_handle': 'devops'}}},
+                        {'repo_to_component': {'notebooks': 'Images'}})
+    obs = dict(category='feasibility', repository='red-hat-data-services/notebooks', status='failure')
+    assert p.extra_fields(obs) == {'components': [{'name': 'Images'}]}
+    assert '@devops' in p.blocks(obs, 'body', root=True)[1]['text']['text']
+
+@pytest.mark.parametrize('body', ['', 'null', '[]'])
+def test_fetched_repository_mapping_must_be_mapping(body):
+    def fetch(name):
+        if name == 'automerge_team_mapping.yaml':
+            return body
+        return 'mappings: {}' if name.startswith('konflux') else 'components: {default: {slack_team_handle: devops}}'
+    with pytest.raises(ValueError):
+        OwnershipPolicy.load(fetch)
+
+
+def test_github_fetch_transport(monkeypatch):
+    from lib.gap_notifications import ownership
+    class Response:
+        status_code = 200
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def iter_content(self, size): return iter([b'repo_to_component: {}'])
+    class Session:
+        def get(self, url, **kwargs):
+            assert self.trust_env is False
+            assert url == ownership.REPOSITORY_URL
+            assert kwargs == dict(timeout=(5, 15), allow_redirects=False, stream=True, verify=True)
+            assert not hasattr(self, 'auth')
+            return Response()
+        def close(self): pass
+    monkeypatch.setattr(ownership.requests, 'Session', Session)
+    assert ownership.fetch_mapping('automerge_team_mapping.yaml', ca_bundle='/internal.pem') == b'repo_to_component: {}'
