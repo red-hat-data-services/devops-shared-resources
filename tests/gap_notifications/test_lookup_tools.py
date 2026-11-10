@@ -190,9 +190,9 @@ def test_known_key_search_lag_revalidated_and_wrong_hints_rejected(populated, mo
     assert invalid['rows'][PR][0]['status'] == 'unavailable'
 
 
-# Condense only no-match rows while preserving distinct held, closed and unavailable details.
-def test_render_condenses_only_not_found_entries():
-    empty = [{'component': f'other-{i}', 'status': 'not_found'} for i in range(16)]
+# Name actionable missing matches while preserving held, closed and unavailable details.
+def test_render_names_not_found_entries():
+    empty = [{'component': f'other-{i}', 'status': 'not_found'} for i in range(2)]
     links = [
         {'component': 'cpu', 'pipeline': 'pr', 'jira_key': 'RHAI-1',
          'status': 'held', 'closed': False},
@@ -202,23 +202,57 @@ def test_render_condenses_only_not_found_entries():
     ]
     projection = {'status': 'checked', 'channel': 'C0883L8FARE', 'rows': {PR: empty + links}}
     cell = tracking_cell(projection, PR)
-    assert cell.count('No confirmed registry match') == 1
-    assert cell.endswith('No confirmed registry match (16 other components)')
-    assert cell.count('<br>') == 3
+    assert cell.count('No confirmed registry match') == 2
+    assert 'other\\-0: No confirmed registry match' in cell
+    assert 'other\\-1: No confirmed registry match' in cell
+    assert cell.count('<br>') == 4
     assert 'cpu / pr: [RHAI-1]' in cell and 'delivery held' in cell
     assert 'gpu: [RHAI-2]' in cell and '(Closed)' in cell
     assert 'arm: [RHAI-3]' in cell and '[Slack thread]' in cell
     assert 'Slack pending / unconfirmed' in cell
     projection['rows'][PR].append({'component': 'missing', 'status': 'unavailable'})
     cell = tracking_cell(projection, PR)
-    assert 'missing: Unavailable' in cell and '(16 other components)' in cell
-    projection['rows'][PR] = empty
-    assert tracking_cell(projection, PR) == 'No confirmed registry match (16 components)'
+    assert 'missing: Unavailable' in cell and 'other\\-0: No confirmed registry match' in cell
     projection['rows'][PR] = empty[:1]
-    assert tracking_cell(projection, PR) == 'No confirmed registry match (1 component)'
+    assert tracking_cell(projection, PR) == 'other\\-0: No confirmed registry match'
     projection['rows'][PR] += links[:1]
-    assert tracking_cell(projection, PR).endswith('No confirmed registry match (1 other component)')
+    assert 'other\\-0: No confirmed registry match' in tracking_cell(projection, PR)
     assert tracking_cell(None, PR) == 'Not checked'
+
+
+@pytest.mark.parametrize('status', ['success', 'unknown'])
+def test_no_record_nonfailure_is_not_a_missing_match(status):
+    observations = [observation(status=status, component='healthy', evidence={'pr_url': PR}),
+                    observation(status=status, category='conflict', component=None,
+                                evidence={'pr_url': PR})]
+    projection = project_tracking(observations, Jira(), trial_id='trial')
+    assert all(entry['observation_status'] == status for entry in projection['rows'][PR])
+    assert tracking_cell(projection, PR) == 'No failure records to link'
+
+
+@pytest.mark.parametrize('status', ['success', 'unknown'])
+@pytest.mark.parametrize('closed', [True, False])
+def test_nonfailure_preserves_confirmed_history_and_unavailable(populated, status, closed, monkeypatch):
+    jira, _, observations = populated
+    if closed:
+        jira.close('RHAI-1')
+    observations[0]['status'] = status
+    projection = project_tracking(observations[:1], jira, trial_id='trial')
+    assert '[RHAI-1]' in tracking_cell(projection, PR)
+    assert ('(Closed)' in tracking_cell(projection, PR)) == closed
+    def unavailable(*args):
+        raise RuntimeError('lookup unavailable')
+    monkeypatch.setattr(jira, 'find_by_label', unavailable)
+    projection = project_tracking(observations[:1], jira, trial_id='trial')
+    assert 'Unavailable' in tracking_cell(projection, PR)
+
+
+def test_mixed_observation_statuses_only_flag_missing_failures():
+    observations = [observation(status=status, component=name, oid=name, evidence={'pr_url': PR})
+                    for name, status in [('healthy', 'success'), ('pending', 'unknown'),
+                                         ('failed', 'failure')]]
+    projection = project_tracking(observations, Jira(), trial_id='trial')
+    assert tracking_cell(projection, PR) == 'failed: No confirmed registry match'
 
 
 # An adapter for the wrong origin must not be queried or used to publish links.

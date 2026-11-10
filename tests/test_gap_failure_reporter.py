@@ -320,6 +320,27 @@ def test_tracking_column_standalone_and_creator_only_refresh(monkeypatch, tmp_pa
     assert "Unavailable" in unavailable.body and "No confirmed registry match" not in unavailable.body
 
 
+# Healthy/unknown sibling observations must not produce registry-match warnings.
+def test_tracking_summary_omits_expected_empty_matches(tmp_path):
+    from gap_notification_fakes import Jira, Slack, observation
+    from lib.gap_notifications.dispatch_incidents import Dispatcher, Ledger
+    from lib.gap_notifications.lookup_tools import project_tracking
+
+    pr = "https://github.com/acme/repo/pull/1"
+    observations = [observation(status=status, component=name, oid=name, evidence={"pr_url": pr})
+                    for name, status in [("failed", "failure"), ("healthy", "success"),
+                                         ("unresolved", "unknown")]]
+    jira = Jira()
+    Dispatcher(Ledger(tmp_path / "journal"), jira, Slack(), trial_id="trial").run(observations)
+    tracking = project_tracking(observations, jira, trial_id="trial")
+    row = fr.ChildFailureRow("repo", pr, 1, "build-failure", "open", False, "failed")
+    body = fr.render_summary_markdown([row], leader_pr_url="https://github.com/acme/gap/pull/9",
+                                      tracking=tracking)
+    assert "failed: [RHAI-1]" in body and "[Slack thread]" in body
+    assert "No confirmed registry match" not in body
+    assert "healthy:" not in body and "unresolved:" not in body
+
+
 # Locate the existing managed summary by its marker rather than unrelated comments.
 def test_find_summary_comment() -> None:
     comments = [

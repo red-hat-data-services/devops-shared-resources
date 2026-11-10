@@ -7,9 +7,10 @@ root receipts, never history queries. Hints are revalidated, ambiguity stays
 unavailable, and closed fallbacks are explicitly marked.
 
 tracking_cell only formats a supplied ephemeral projection. It distinguishes
-not checked, unavailable, successful-empty and pending/held/closed results,
-condensing only empty matches. Lookup-only imports are deferred until lookup
-or inspection, not rendering. No client construction, credential/ledger access,
+not checked, unavailable, successful-empty and pending/held/closed results.
+Empty matches for success/unknown observations need no failure record; other
+empty matches retain their component/check labels for investigation. Lookup-only
+imports are deferred until lookup or inspection, not rendering. No client construction, credential/ledger access,
 mutation or resend is initiated here; display text is never routing authority.
 """
 from __future__ import annotations
@@ -42,7 +43,8 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
             continue
         identity = incident_key(obs)
         entry = {"component": obs.get("component") or obs["category"],
-                 "pipeline": obs.get("pipeline"), "status": "unavailable"}
+                 "pipeline": obs.get("pipeline"), "status": "unavailable",
+                 "observation_status": obs["status"]}
         if identity not in cache:
             try:
                 found = jira.find_by_label(incident_label(identity, trial_id))
@@ -102,7 +104,6 @@ def tracking_cell(tracking, pr_url):
     if not entries:
         return "Not checked"
     parts = []
-    unmatched = 0
     try:
         # Display-only allowlist: keep this renderer free of service-module imports.
         origin = tracking.get("jira_origin", "https://stage-redhat.atlassian.net")
@@ -116,9 +117,14 @@ def tracking_cell(tracking, pr_url):
             key = entry.get("jira_key")
             if key is None:
                 if status == "not_found":
-                    unmatched += 1
-                    continue
-                value = "Unavailable"
+                    # Only failures create incidents. Still look up all observations
+                    # so recovery/history links and unavailable lookups remain visible.
+                    # Legacy entries without observation_status stay fail-visible.
+                    if entry.get("observation_status") in {"success", "unknown"}:
+                        continue
+                    value = "No confirmed registry match"
+                else:
+                    value = "Unavailable"
             else:
                 if not re.fullmatch(r"RHAI-[1-9][0-9]*", key):
                     raise ValueError("invalid issue")
@@ -142,11 +148,7 @@ def tracking_cell(tracking, pr_url):
             parts.append(label + ": " + value)
     except (KeyError, TypeError, ValueError):
         return "Unavailable"
-    if unmatched:
-        qualifier = "other " if parts else ""
-        noun = "component" if unmatched == 1 else "components"
-        parts.append(f"No confirmed registry match ({unmatched} {qualifier}{noun})")
-    return "<br>".join(parts)
+    return "<br>".join(parts) if parts else "No failure records to link"
 
 
 def inspect_issue(jira, key, *, trial=None, jira_environment="stage", channel=None):
