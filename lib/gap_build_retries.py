@@ -202,7 +202,8 @@ class BuildRetryManager:
             return gate, evidence
         # Case-by-case ignore: operators opted this child out of gating; do not
         # keep firing automatic /retest while it remains ignored.
-        if pr.url in self.ignored_urls:
+        # getattr: some tests construct via object.__new__ without __init__.
+        if pr.url in getattr(self, "ignored_urls", ()):
             return gate, evidence
         evidence = deepcopy(evidence)
         if evidence.get("query-error"):
