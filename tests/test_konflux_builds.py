@@ -114,6 +114,52 @@ def test_unrelated_attempts_do_not_count(kind):
     assert observe([item]).status == "missing"
 
 
+@pytest.mark.parametrize(
+    "event",
+    [
+        "retest-all-comment",
+        "test-all-comment",
+        "ok-to-test-comment",
+        "pull_request_labeled",
+        "retest-comment",
+        "test-comment",
+        "on-comment",
+        "pull_request",
+    ],
+)
+def test_pac_pr_associated_events_are_accepted(event):
+    """GitOps /retest (retest-all-comment) must count — Leader #101 regression."""
+    # PipelineRun names are DNS-1123; map event labels to legal names.
+    safe = event.replace("_", "-")
+    item = run(name=f"run-{safe}")
+    item["metadata"]["labels"]["pipelinesascode.tekton.dev/event-type"] = event
+    assert observe([item]).status == "success"
+
+
+def test_retest_all_comment_success_supersedes_older_pull_request_failure():
+    older = run(name="older-pr", created="2026-11-05T10:00:00Z", status="False", reason="Failed")
+    older["metadata"]["labels"]["pipelinesascode.tekton.dev/event-type"] = "pull_request"
+    newer = run(name="newer-retest", created="2026-11-05T11:00:00Z")
+    newer["metadata"]["labels"]["pipelinesascode.tekton.dev/event-type"] = "retest-all-comment"
+    observed = observe([older, newer])
+    assert observed.status == "success"
+    assert observed.name == "newer-retest"
+
+
+def test_unknown_trigger_event_names_pipelinerun_and_event():
+    item = run(name="bad-event-run")
+    item["metadata"]["labels"]["pipelinesascode.tekton.dev/event-type"] = "not-a-real-event"
+    with pytest.raises(KonfluxQueryError, match="bad-event-run") as exc:
+        observe([item])
+    assert "not-a-real-event" in str(exc.value)
+
+
+def test_cancel_comment_is_skipped_not_selected():
+    item = run(name="cancel-run")
+    item["metadata"]["labels"]["pipelinesascode.tekton.dev/event-type"] = "cancel-all-comment"
+    assert observe([item]).status == "missing"
+
+
 def test_tied_attempt_creation_is_unknown_not_arbitrary_uid_order():
     with pytest.raises(KonfluxQueryError, match="ambiguous"):
         observe([run(), run(name="second")])
