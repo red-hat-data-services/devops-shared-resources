@@ -177,6 +177,35 @@ def test_apply_component_builds_from_children_any_failure() -> None:
     assert apply_component_builds_from_children(payload) == GATE_STATUS_FAILURE
 
 
+def test_apply_component_builds_ignores_flagged_failures() -> None:
+    payload = {
+        "pull-requests": [
+            {"pr-url": "https://ex/a/1", "pr-status": "success"},
+            {
+                "pr-url": "https://ex/b/2",
+                "pr-status": "build-failure",
+                "ignore": True,
+            },
+        ]
+    }
+    assert apply_component_builds_from_children(payload) == GATE_STATUS_SUCCESS
+    assert get_gate_status(payload, GATE_COMPONENT_BUILDS) == GATE_STATUS_SUCCESS
+    assert should_trigger_early_gate(payload) is True
+
+
+def test_apply_component_builds_all_ignored_is_success() -> None:
+    payload = {
+        "pull-requests": [
+            {
+                "pr-url": "https://ex/b/2",
+                "pr-status": "build-failure",
+                "ignore": True,
+            },
+        ]
+    }
+    assert apply_component_builds_from_children(payload) == GATE_STATUS_SUCCESS
+
+
 def test_apply_component_builds_pending_while_open() -> None:
     payload = {
         "pull-requests": [

@@ -80,6 +80,7 @@ from lib.konflux_builds import build_status_source
 from lib.konflux_gate import evaluate_konflux_gate
 from lib.gap_build_retries import BuildRetryManager, retries_enabled
 from lib.gap_component_map import fetch_component_repo_map, repository_components
+from lib.state_file import child_entry_ignored
 from lib.gap_pr_gates import (
     PR_STATUS_BUILD_FAILURE,
     PR_STATUS_BUILD_PENDING,
@@ -445,7 +446,12 @@ def record_child_head_shas(
         if entry is None:
             continue
         previous = str(entry.get("head-sha") or "")
-        if previous and previous != decision.head_sha:
+        # Always record the live head; only non-ignored moves reset EG gates.
+        if (
+            previous
+            and previous != decision.head_sha
+            and not child_entry_ignored(entry)
+        ):
             changed = True
         entry["head-sha"] = decision.head_sha
     if changed:
@@ -520,6 +526,24 @@ def children_batch_concluded(pr_statuses: Sequence[str]) -> bool:
     if not pr_statuses:
         return False
     return all(status in STAGE1_TERMINAL_PR_STATUSES for status in pr_statuses)
+
+
+def non_ignored_child_statuses(
+    payload: dict[str, Any],
+    status_overrides: dict[str, str] | None = None,
+) -> list[str]:
+    """Child ``pr-status`` values that still participate in Stage-1 gating."""
+    overrides = status_overrides or {}
+    statuses: list[str] = []
+    for entry in payload.get("pull-requests") or []:
+        if not isinstance(entry, dict) or child_entry_ignored(entry):
+            continue
+        url = str(entry.get("pr-url") or "")
+        if url in overrides:
+            statuses.append(str(overrides[url]).strip())
+        else:
+            statuses.append(str(entry.get("pr-status") or "").strip())
+    return statuses
 
 
 def should_defer_child_success_status(
@@ -866,7 +890,7 @@ def run_stage1_monitor(
 
     # Evaluate batch + required promotion-gates before posting (8261).
     batch_concluded = children_batch_concluded(
-        [decision.pr_status for decision in decisions]
+        non_ignored_child_statuses(payload, status_updates)
     )
     ensure_promotion_gates(payload)
     migrate_legacy_overall_status(payload)
@@ -2269,9 +2293,9 @@ def _publish_gate_decision(
         apply_pr_statuses(payload, {fresh.url: fresh.pr_status})
         apply_component_builds_from_children(payload)
         overall_status = derive_legacy_overall_status(payload)
-        batch_concluded = children_batch_concluded([
-            str(entry.get("pr-status") or "") for entry in payload.get("pull-requests", [])
-        ])
+        batch_concluded = children_batch_concluded(
+            non_ignored_child_statuses(payload)
+        )
     else:
         batch_concluded, overall_status = False, None
     if fresh.skip_status_post:
@@ -2348,8 +2372,10 @@ def _publish_decisions(
     child_head_changed = record_child_head_shas(payload, decisions)
     # Provisional statuses from first-pass decisions (before head-move refresh).
     provisional_updates = {d.url: d.pr_status for d in decisions}
-    batch_concluded = children_batch_concluded(list(provisional_updates.values()))
     probe = provisional_payload_with_updates(payload, provisional_updates)
+    batch_concluded = children_batch_concluded(
+        non_ignored_child_statuses(probe, provisional_updates)
+    )
     overall_status = derive_legacy_overall_status(probe)
 
     for original in decisions:

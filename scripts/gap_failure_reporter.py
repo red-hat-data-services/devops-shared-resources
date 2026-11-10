@@ -551,6 +551,9 @@ def build_child_row(
         )
 
     reason_parts: list[str] = []
+    ignored = entry.get("ignore") is True
+    if ignored:
+        reason_parts.append("IGNORED (excluded from Early Gate gating)")
     if pr_state == "closed":
         reason_parts.append("CLOSED" + (" (merged)" if merged else " (not merged)"))
         if close_reason:
@@ -582,11 +585,14 @@ def build_child_row(
     if evidence_reason and status_key not in {"build-pending", "new"}:
         reason_parts.append(evidence_reason)
     reason = " — ".join(reason_parts) if reason_parts else state_status or pr_state
+    status_label = state_status or "unknown"
+    if ignored:
+        status_label = f"{status_label} (ignored)"
     return ChildFailureRow(
         repo=repo,
         pr_url=pr_url,
         pr_number=number,
-        state_status=state_status or "unknown",
+        state_status=status_label,
         pr_state=pr_state,
         merged=merged,
         reason=reason,

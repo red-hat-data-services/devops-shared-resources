@@ -81,6 +81,9 @@ class StatePullRequest:
     build_observations: dict[str, Any] | None = None
     head_sha: str | None = None
     merge_observations: dict[str, Any] | None = None
+    # Manual escape hatch (Leader-branch PR): exclude from Stage-1 gating / EG
+    # auto-trigger while still tracking the child. Default false.
+    ignore: bool = False
 
     @classmethod
     def from_mapping(cls, data: dict[str, Any], *, index: int) -> "StatePullRequest":
@@ -92,6 +95,12 @@ class StatePullRequest:
         pr_url = str(data.get("pr-url") or data.get("pr_url") or "").strip()
         pr_status = str(data.get("pr-status") or data.get("pr_status") or "").strip()
         raw_builds = data.get("builds")
+        if "ignore" not in data:
+            ignore = False
+        elif isinstance(data.get("ignore"), bool):
+            ignore = bool(data.get("ignore"))
+        else:
+            raise StateFileError(f"{path}.ignore must be a boolean")
 
         if not repo:
             raise StateFileError(f"{path}.repo is required")
@@ -139,6 +148,7 @@ class StatePullRequest:
             build_observations=observations,
             head_sha=head_sha,
             merge_observations=merge,
+            ignore=ignore,
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -154,7 +164,14 @@ class StatePullRequest:
             result["merge-observations"] = self.merge_observations
         if self.head_sha is not None:
             result["head-sha"] = self.head_sha
+        if self.ignore:
+            result["ignore"] = True
         return result
+
+
+def child_entry_ignored(entry: dict[str, Any] | None) -> bool:
+    """True when a raw state.json child mapping opts out of Stage-1 gating."""
+    return isinstance(entry, dict) and entry.get("ignore") is True
 
 
 @dataclass

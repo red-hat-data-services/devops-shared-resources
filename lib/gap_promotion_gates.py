@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from lib.leader_lifecycle import retired_outcome
+from lib.state_file import child_entry_ignored
 
 GATE_COMPONENT_BUILDS = "component-builds"
 GATE_EARLY_GATE_BUILD = "early-gate-build"
@@ -268,9 +269,12 @@ def early_gate_pair_overall(payload: dict[str, Any]) -> str | None:
 def apply_component_builds_from_children(payload: dict[str, Any]) -> str:
     """Set ``component-builds`` from child ``pr-status`` values; return new status.
 
-    - any non-terminal child → pending
-    - all terminal and all pass → success
-    - all terminal and any fail → failure
+    Children with ``ignore: true`` are tracked but excluded from this gate.
+
+    - any non-ignored non-terminal child → pending
+    - all non-ignored terminal and all pass → success
+      (including vacuous success when every child is ignored)
+    - all non-ignored terminal and any fail → failure
     """
     ensure_promotion_gates(payload)
     entries = payload.get("pull-requests") or []
@@ -282,6 +286,8 @@ def apply_component_builds_from_children(payload: dict[str, Any]) -> str:
     for index, entry in enumerate(entries):
         if not isinstance(entry, dict):
             raise ValueError(f"pull-requests[{index}] must be an object.")
+        if child_entry_ignored(entry):
+            continue
         status = str(entry.get("pr-status") or "").strip()
         if status not in _CHILD_TERMINAL:
             set_gate_status(payload, GATE_COMPONENT_BUILDS, GATE_STATUS_PENDING)

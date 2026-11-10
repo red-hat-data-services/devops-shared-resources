@@ -76,6 +76,49 @@ def test_write_and_load_state_file(tmp_path: Path) -> None:
     }
 
 
+def test_ignore_flag_round_trip_and_default() -> None:
+    plain = validate_state(
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve",
+                    "pr-url": "https://github.com/acme/kserve/pull/1",
+                    "pr-status": "build-failure",
+                }
+            ]
+        }
+    )
+    assert "ignore" not in plain["pull-requests"][0]
+
+    ignored = validate_state(
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve",
+                    "pr-url": "https://github.com/acme/kserve/pull/1",
+                    "pr-status": "build-failure",
+                    "ignore": True,
+                }
+            ]
+        }
+    )
+    assert ignored["pull-requests"][0]["ignore"] is True
+
+    with pytest.raises(StateFileError, match="ignore must be a boolean"):
+        validate_state(
+            {
+                "pull-requests": [
+                    {
+                        "repo": "kserve",
+                        "pr-url": "https://github.com/acme/kserve/pull/1",
+                        "pr-status": "new",
+                        "ignore": "yes",
+                    }
+                ]
+            }
+        )
+
+
 def test_write_and_load_state_file_preserves_child_head_sha(tmp_path: Path) -> None:
     head_sha = "a" * 40
     state = build_state(

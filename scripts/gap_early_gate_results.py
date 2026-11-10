@@ -622,13 +622,18 @@ def child_pass_pr_urls(payload: dict[str, Any]) -> list[str]:
 
     Children that already failed their Stage-1 gate are omitted so EG-results
     does not overwrite their failing ``gated artifacts promoter`` check.
+    Ignored children are also omitted so EG does not approve them.
     """
+    from lib.state_file import child_entry_ignored
+
     if retired_outcome(payload):
         return []
     urls: list[str] = []
     for index, entry in enumerate(payload.get("pull-requests") or []):
         if not isinstance(entry, dict):
             raise GapPrMonitorError(f"pull-requests[{index}] must be an object.")
+        if child_entry_ignored(entry):
+            continue
         status = str(entry.get("pr-status") or "").strip()
         if status not in CHILD_PASS_PR_STATUSES:
             continue

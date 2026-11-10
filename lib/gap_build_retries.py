@@ -74,9 +74,15 @@ class BuildRetryManager:
         self.clock = clock or (lambda: datetime.now(timezone.utc))
         self.actor = os.environ.get("GAP_BUILD_RETRY_ACTOR", "rhods-devops-app[bot]")
         self.saved = {}
+        self.ignored_urls = set()
         for entry in payload.get("pull-requests", []):
+            if not isinstance(entry, dict):
+                continue
+            url = entry.get("pr-url")
             receipt = entry.get("build-observations") or {}
-            self.saved[entry.get("pr-url")] = deepcopy(receipt.get("retry-history", []))
+            self.saved[url] = deepcopy(receipt.get("retry-history", []))
+            if entry.get("ignore") is True:
+                self.ignored_urls.add(url)
 
     def _history(self, pr):
         """Reconcile trusted child comments with state across leaders/restarts."""
@@ -193,6 +199,10 @@ class BuildRetryManager:
     def apply(self, pr, gate, evidence):
         """Keep raw observations intact; pending retry never authorizes EG images."""
         if pr.state != "OPEN":
+            return gate, evidence
+        # Case-by-case ignore: operators opted this child out of gating; do not
+        # keep firing automatic /retest while it remains ignored.
+        if pr.url in self.ignored_urls:
             return gate, evidence
         evidence = deepcopy(evidence)
         if evidence.get("query-error"):

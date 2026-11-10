@@ -1029,6 +1029,25 @@ def test_child_pass_pr_urls_skips_build_failures() -> None:
     ]
 
 
+def test_child_pass_pr_urls_skips_ignored_success() -> None:
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "a",
+                "pr-url": "https://github.com/ex/a/pull/1",
+                "pr-status": "success",
+            },
+            {
+                "repo": "b",
+                "pr-url": "https://github.com/ex/b/pull/2",
+                "pr-status": "success",
+                "ignore": True,
+            },
+        ]
+    }
+    assert eg.child_pass_pr_urls(payload) == ["https://github.com/ex/a/pull/1"]
+
+
 def test_post_child_statuses_eg_failure_leaves_build_failure_alone() -> None:
     payload = {
         "pull-requests": [
