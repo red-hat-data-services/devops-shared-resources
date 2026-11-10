@@ -31,19 +31,18 @@ REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHA = re.compile(r"[0-9a-f]{40}")
 RELEASE_SUFFIX = re.compile(r"-v[0-9]+-[0-9]+(?:-ea-[0-9]+)?$")
 
-# PaC labels that authorize a PR-associated build attempt. Includes GitOps
-# retrigger variants (/retest, /test, /ok-to-test) and labeled-PR starts.
-# Missing entries (historically retest-all-comment) hard-fail the child lookup.
+# PaC labels that authorize a PR-associated build attempt.
+# Keep this tight: same repo/PR/SHA/type=build checks still apply below.
+# Only add GitOps "all pipelines" siblings of already-allowed single-pipeline
+# comments (Leader #101: retest-all-comment was rejected and froze children).
 PR_ASSOCIATED_EVENTS = frozenset(
     {
         "pull_request",
-        "pull_request_labeled",
         "on-comment",
         "retest-comment",
-        "retest-all-comment",
+        "retest-all-comment",  # /retest  (was missing → unknown trigger)
         "test-comment",
-        "test-all-comment",
-        "ok-to-test-comment",
+        "test-all-comment",  # /test   (pair of already-allowed test-comment)
     }
 )
 # Cancel ops are PR-scoped but must not be selected as build evidence.

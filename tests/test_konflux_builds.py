@@ -119,8 +119,6 @@ def test_unrelated_attempts_do_not_count(kind):
     [
         "retest-all-comment",
         "test-all-comment",
-        "ok-to-test-comment",
-        "pull_request_labeled",
         "retest-comment",
         "test-comment",
         "on-comment",
