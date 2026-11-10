@@ -8,13 +8,17 @@ dry-run paths do not fetch; preview fetches mappings but does not contact Jira
 or Slack. Direct Dispatcher callers retain previous behavior unless supplied
 an ownership policy.
 
-Access must work anonymously from the runner. TLS verification stays enabled;
+Internal GitLab access must work anonymously from the runner. TLS verification stays enabled;
 corporate CA chains may be supplied explicitly through the hook's
 `ownership_ca_bundle` argument (a CA bundle path), or the explicit non-secret
 `GAP_OWNERSHIP_CA_BUNDLE` environment setting for deployed CLI/workflow runs.
-The explicit hook argument wins; preview reads only this CA setting, not credentials.
-TLS verification remains enabled with the supplied bundle. No ambient credentials,
-netrc, proxies, or redirects are used for mapping fetches. Responses are capped
+The explicit hook argument wins. Active default mapping loads also read `GH_TOKEN`
+(or `GITHUB_TOKEN` as fallback), including in preview, for the private GitHub mapping
+below. Preview never reads Jira/Slack credentials or creates their clients/journal;
+injected offline mapping loads do not read GitHub credentials. Disabled/dry-run
+paths and passes without observations do not read the GitHub token.
+TLS verification remains enabled with the supplied bundle. GitLab requests remain
+anonymous. No netrc, ambient proxies, or redirects are used for mapping fetches. Responses are capped
 at 1 MiB and use 5-second connect / 15-second read timeouts. Fetches and schema
 or safe-YAML parsing failures isolate the notification pass: delivery stops,
 without affecting promotion decisions. No stale-map fallback is used.
@@ -56,10 +60,23 @@ mapping fetches and fake services; they require no authenticated access.
 
 ### Repository ownership for conflict and feasibility
 
-Active policy loads additionally fetch the anonymous live
+Active policy loads additionally fetch the live private
 [rhoai-ops repository mapping](https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml)
-once from raw GitHub main, with bounded size/time, TLS verification, no redirects,
-and no inherited credentials or internal GitLab CA override.
+once from the fixed GitHub Contents API endpoint on `api.github.com`, using its
+raw response media type and `ref=main`. The monitor explicitly passes its existing
+`GH_TOKEN` (or `GITHUB_TOKEN`) as a bearer token. The app installation/token must
+have Contents read access to `red-hat-data-services/rhoai-ops`; the monitor's
+ordinary GitHub repository access does not prove this permission. No new token
+is provisioned by this change, and installation access remains to be verified
+on the runner.
+
+Only this fixed API request receives the token. Each fetch uses a separate
+session with ambient authentication/proxies disabled, bounded size/time, TLS
+verification, no redirects, and no internal GitLab CA override for GitHub.
+Missing tokens, denied access (including private-file 404), and redirects fail
+closed without anonymous fallback or notification delivery. Direct policy callers
+using default fetching must pass `github_token` explicitly; injected fetchers
+remain supported for offline tests without credentials.
 `repo_to_component` (string or list of Jira component names) is required.
 `repo_to_slack_handle` (one explicit handle) is optional and defaults to an empty
 mapping for compatibility before the upstream rollout; when present it must be

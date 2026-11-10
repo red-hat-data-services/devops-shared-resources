@@ -1,26 +1,36 @@
-"""Live, anonymous component ownership policy. No routing or identity decisions."""
+"""Live ownership policy with anonymous GitLab and explicit GitHub access."""
 import re
 import yaml
 import requests
 from lib.gap_component_map import normalize_component_name
 
 BASE = "https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/raw/main/data/"
-REPOSITORY_URL = 'https://raw.githubusercontent.com/red-hat-data-services/rhoai-ops/main/config/automerge_team_mapping.yaml'
+REPOSITORY_URL = 'https://api.github.com/repos/red-hat-data-services/rhoai-ops/contents/config/automerge_team_mapping.yaml?ref=main'
 REPOSITORY_LINK = 'https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml'
 LIMIT = 1024 * 1024
 MAPPING_LINK_BASE = "https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/"
 
 
-def fetch_mapping(name, *, ca_bundle=None):
+def fetch_mapping(name, *, ca_bundle=None, github_token=None):
+    repository = name == 'automerge_team_mapping.yaml'
+    options = {}
+    if repository:
+        if not isinstance(github_token, str) or not github_token.strip():
+            raise ValueError("GitHub token required for repository ownership mapping")
+        # Explicit credentials go only to this fixed API URL, never GitLab or
+        # redirects. Do not reuse sessions between the two trust domains.
+        options['headers'] = {'Authorization': f'Bearer {github_token}',
+                              'Accept': 'application/vnd.github.raw+json'}
     session = requests.Session()
     session.trust_env = False
     try:
-        repository = name == 'automerge_team_mapping.yaml'
         with session.get(REPOSITORY_URL if repository else BASE + name,
                          timeout=(5, 15), allow_redirects=False,
-                         stream=True, verify=True if repository else (ca_bundle or True)) as response:
+                         stream=True, verify=True if repository else (ca_bundle or True),
+                         **options) as response:
             if response.status_code != 200:
-                raise ValueError("ownership mapping unavailable")
+                raise ValueError("repository ownership mapping unavailable" if repository
+                                 else "ownership mapping unavailable")
             body = bytearray()
             for chunk in response.iter_content(8192):
                 body.extend(chunk)
@@ -110,8 +120,8 @@ class OwnershipPolicy:
                         target[normalized] = _names(value)
 
     @classmethod
-    def load(cls, fetch=None, *, ca_bundle=None):
-        fetch = fetch or (lambda name: fetch_mapping(name, ca_bundle=ca_bundle))
+    def load(cls, fetch=None, *, ca_bundle=None, github_token=None):
+        fetch = fetch or (lambda name: fetch_mapping(name, ca_bundle=ca_bundle, github_token=github_token))
         jira = yaml.safe_load(fetch('konflux-to-jira-component-map.yaml'))
         teams = yaml.safe_load(fetch('rhoai-component-data.yaml'))
         repositories = yaml.safe_load(fetch('automerge_team_mapping.yaml'))

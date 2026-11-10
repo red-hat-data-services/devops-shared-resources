@@ -187,20 +187,33 @@ def test_fetched_repository_mapping_must_be_mapping(body):
         OwnershipPolicy.load(fetch)
 
 
-def test_github_fetch_transport(monkeypatch):
+@pytest.mark.parametrize('status', [200, 302, 401, 403, 404, 500])
+def test_github_fetch_transport(monkeypatch, status):
     from lib.gap_notifications import ownership
     class Response:
-        status_code = 200
+        status_code = status
         def __enter__(self): return self
         def __exit__(self, *args): pass
         def iter_content(self, size): return iter([b'repo_to_component: {}'])
     class Session:
+        closed = False
         def get(self, url, **kwargs):
             assert self.trust_env is False
-            assert url == ownership.REPOSITORY_URL
-            assert kwargs == dict(timeout=(5, 15), allow_redirects=False, stream=True, verify=True)
+            assert url == ('https://api.github.com/repos/red-hat-data-services/rhoai-ops/'
+                           'contents/config/automerge_team_mapping.yaml?ref=main')
+            assert kwargs == dict(timeout=(5, 15), allow_redirects=False, stream=True, verify=True,
+                                  headers={'Authorization': 'Bearer fake-github-token',
+                                           'Accept': 'application/vnd.github.raw+json'})
             assert not hasattr(self, 'auth')
             return Response()
-        def close(self): pass
-    monkeypatch.setattr(ownership.requests, 'Session', Session)
-    assert ownership.fetch_mapping('automerge_team_mapping.yaml', ca_bundle='/internal.pem') == b'repo_to_component: {}'
+        def close(self): self.closed = True
+    session = Session()
+    monkeypatch.setattr(ownership.requests, 'Session', lambda: session)
+    if status == 200:
+        assert ownership.fetch_mapping('automerge_team_mapping.yaml', ca_bundle='/internal.pem',
+                                       github_token='fake-github-token') == b'repo_to_component: {}'
+    else:
+        with pytest.raises(ValueError, match='^repository ownership mapping unavailable$'):
+            ownership.fetch_mapping('automerge_team_mapping.yaml', ca_bundle='/internal.pem',
+                                    github_token='fake-github-token')
+    assert session.closed

@@ -68,7 +68,9 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
                          dry_run=False, collector=None, dispatcher_factory=None,
                          jira_factory=None, slack_factory=None, environ=None, tracking=None,
                          ownership_fetch=None, ownership_ca_bundle=None):
-    """Non-blocking. No credential/client/ledger access unless explicitly write-enabled.
+    """Non-blocking. Jira/Slack credential/client/ledger access is write-only.
+
+    Active default mapping loads also need GitHub read credentials in preview.
 
     Input is the published payload, restricted to this pass's accepted decisions.
     No reload of arbitrary historical children, aggregate-success inference, or live
@@ -117,7 +119,15 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
                 ownership_ca_bundle = os.environ.get('GAP_OWNERSHIP_CA_BUNDLE')
             else:
                 ownership_ca_bundle = environ.get('GAP_OWNERSHIP_CA_BUNDLE')
-        ownership = OwnershipPolicy.load(ownership_fetch, ca_bundle=ownership_ca_bundle) if observations else None
+        ownership_options = {'ca_bundle': ownership_ca_bundle}
+        if observations and ownership_fetch is None:
+            # The monitor already has GitHub read access; keep notification
+            # credentials untouched during preview and injected offline loads.
+            if environ is None:
+                import os
+                environ = os.environ
+            ownership_options['github_token'] = environ.get('GH_TOKEN') or environ.get('GITHUB_TOKEN')
+        ownership = OwnershipPolicy.load(ownership_fetch, **ownership_options) if observations else None
         counts = {s: sum(o["status"] == s for o in observations) for s in ("failure", "success", "unknown")}
         if config.mode == "preview" or not observations:
             result = {"status": "preview" if config.mode == "preview" else "no-observations", "counts": counts}

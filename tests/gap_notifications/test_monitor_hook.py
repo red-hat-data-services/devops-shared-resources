@@ -44,7 +44,7 @@ def hook(tmp_path):
 
 
 @pytest.mark.parametrize('explicit,expected', [(None, '/fake/env-ca.pem'), ('/fake/explicit.pem', '/fake/explicit.pem')])
-def test_ca_setting_forwarded_without_preview_credentials(hook, monkeypatch, explicit, expected):
+def test_ca_setting_forwarded_without_preview_notification_credentials(hook, monkeypatch, explicit, expected):
     from lib.gap_notifications.ownership import OwnershipPolicy
     invoke, _, _, opts, _ = hook
     original = OwnershipPolicy.load
@@ -60,6 +60,58 @@ def test_ca_setting_forwarded_without_preview_credentials(hook, monkeypatch, exp
     assert invoke(config=replace(opts['config'], mode='preview'), environ=Environment(),
                   ownership_ca_bundle=explicit)['status'] == 'preview'
     assert seen == [expected]
+
+
+@pytest.mark.parametrize('mode', ['preview', 'write'])
+@pytest.mark.parametrize('tokens,expected', [
+    ({'GH_TOKEN': 'fake-gh', 'GITHUB_TOKEN': 'fake-github'}, 'fake-gh'),
+    ({'GITHUB_TOKEN': 'fake-github'}, 'fake-github'),
+])
+def test_default_mapping_load_receives_github_token(hook, monkeypatch, mode, tokens, expected):
+    from lib.gap_notifications.ownership import OwnershipPolicy
+    invoke, _, _, opts, _ = hook
+    original = OwnershipPolicy.load
+    seen = []
+    def load(fetch=None, *, ca_bundle=None, github_token=None):
+        assert fetch is None
+        seen.append((ca_bundle, github_token))
+        return original(opts['ownership_fetch'])
+    monkeypatch.setattr(OwnershipPolicy, 'load', load)
+    class Environment:
+        def get(self, key):
+            if mode == 'preview':
+                assert key in {'GAP_OWNERSHIP_CA_BUNDLE', 'GH_TOKEN', 'GITHUB_TOKEN'}
+            return (opts['environ'] | tokens).get(key)
+    result = invoke(config=replace(opts['config'], mode=mode), environ=Environment(), ownership_fetch=None)
+    assert result['status'] == ('preview' if mode == 'preview' else 'settled')
+    assert seen == [(None, expected)]
+
+
+@pytest.mark.parametrize('changes,expected', [
+    ({'config': NotificationConfig()}, 'disabled'),
+    ({'dry_run': True}, 'monitor-dry-run'),
+    ({'collector': lambda *args, **kwargs: []}, 'no-observations'),
+])
+def test_inactive_default_mapping_load_does_not_read_token(hook, changes, expected):
+    invoke, _, _, _, _ = hook
+    result = invoke(ownership_fetch=None, environ=Bomb(), **changes)
+    assert result['status'] == expected
+
+
+def test_default_mapping_load_missing_github_token_isolated(hook, monkeypatch):
+    from lib.gap_notifications import ownership
+    invoke, jira, slack, _, calls = hook
+    def fetch(name, **options):
+        if name != 'automerge_team_mapping.yaml':
+            return ('mappings: {}' if name.startswith('konflux')
+                    else 'components: {default: {slack_team_handle: devops}}')
+        return original(name, **options)
+    original = ownership.fetch_mapping
+    monkeypatch.setattr(ownership, 'fetch_mapping', fetch)
+    tracking = {}
+    assert invoke(ownership_fetch=None, tracking=tracking)['error_type'] == 'ValueError'
+    assert tracking == {'status': 'unavailable'}
+    assert not calls and not jira.calls and not slack.calls
 
 
 def test_mapping_failure_isolated_and_no_services(hook):
@@ -128,8 +180,8 @@ def test_manual_close_same_failure_creates_successor(hook):
     assert slack.calls[1][1]["thread_ts"] is None
 
 
-# Preview mode must avoid credentials, clients, journals and external mutations.
-def test_preview_no_clients_credentials_or_journal(hook):
+# Preview mode must avoid Jira/Slack credentials, clients, journals and external mutations.
+def test_preview_no_notification_clients_credentials_or_journal(hook):
     invoke, jira, slack, defaults, calls = hook
     result = invoke(config=replace(defaults["config"], mode="preview"), environ=Bomb())
     assert result == {"status": "preview", "counts": {"failure": 1, "success": 0, "unknown": 0}}
