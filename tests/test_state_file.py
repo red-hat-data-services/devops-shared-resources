@@ -34,6 +34,7 @@ def test_build_and_validate_stage1_state() -> None:
         "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
         "pr-status": "new",
         "builds": [],
+        "ignore": False,
     }
     assert validate_state(payload)["pull-requests"][0]["pr-status"] == PR_STATUS_NEW
 
@@ -71,6 +72,7 @@ def test_write_and_load_state_file(tmp_path: Path) -> None:
                 "pr-url": "https://github.com/rhoai-rhtap/kubeflow/pull/81",
                 "pr-status": "new",
                 "builds": [],
+                "ignore": False,
             }
         ]
     }
