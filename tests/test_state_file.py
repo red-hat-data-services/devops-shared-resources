@@ -88,7 +88,8 @@ def test_ignore_flag_round_trip_and_default() -> None:
             ]
         }
     )
-    assert "ignore" not in plain["pull-requests"][0]
+    # Absent on input still normalizes to an explicit false for easy flipping.
+    assert plain["pull-requests"][0]["ignore"] is False
 
     ignored = validate_state(
         {
@@ -103,6 +104,20 @@ def test_ignore_flag_round_trip_and_default() -> None:
         }
     )
     assert ignored["pull-requests"][0]["ignore"] is True
+
+    explicit_false = validate_state(
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve",
+                    "pr-url": "https://github.com/acme/kserve/pull/1",
+                    "pr-status": "success",
+                    "ignore": False,
+                }
+            ]
+        }
+    )
+    assert explicit_false["pull-requests"][0]["ignore"] is False
 
     with pytest.raises(StateFileError, match="ignore must be a boolean"):
         validate_state(

@@ -164,8 +164,8 @@ class StatePullRequest:
             result["merge-observations"] = self.merge_observations
         if self.head_sha is not None:
             result["head-sha"] = self.head_sha
-        if self.ignore:
-            result["ignore"] = True
+        # Always serialize so operators can flip false→true in Leader PRs.
+        result["ignore"] = bool(self.ignore)
         return result
 
 
@@ -276,6 +276,8 @@ def build_state(
                 "pr-status": item.get("pr-status") or item.get("pr_status") or PR_STATUS_NEW,
                 "builds": item.get("builds") if "builds" in item else [],
                 "head-sha": item.get("head-sha"),
+                # Default false when omitted; always written back by to_dict.
+                "ignore": item.get("ignore", False),
             }
             # Accept owner/name and reduce to short slug.
             repo = str(payload["repo"] or "").strip()
