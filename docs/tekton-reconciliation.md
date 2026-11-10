@@ -247,6 +247,42 @@ apply. Appending after an end-of-file comment retains its text but can change it
 association with list items. Inspect the preview diff; byte-identical formatting
 or comment associations inside edited collections are not guaranteed.
 
+## Fleet Markdown report
+
+`scripts/report-tekton-run` is an offline presentation command. It reads downloaded
+per-component reconciliation artifacts and GitHub job metadata; it does not call
+GitHub, obtain credentials, execute artifact contents, validate candidates, or
+publish changes. Run it from an always-running consumer aggregation job:
+
+```bash
+uv run --no-project shared/scripts/report-tekton-run \
+  --artifacts diagnostics --jobs jobs.json \
+  --artifact-prefix plr-enforce-main- --owner red-hat-data-services \
+  --dry-run false \
+  --run-url https://github.com/red-hat-data-services/konflux-central/actions/runs/123 \
+  --output component-reconciliation-report.md --summary "$GITHUB_STEP_SUMMARY"
+```
+
+The consumer downloads artifacts without merging their directories and captures
+`gh api --paginate --slurp` output from the run's jobs endpoint (`filter=latest`).
+The report recognizes matrix job names `reconcile (REPOSITORY, REVISION)` and
+artifact directories `{artifact-prefix}{REPOSITORY}/enforcement-report/`, with
+`result.json`, optional `publication.json`, and `enforcement.patch`. Optional
+`enforcement.log` is one directory above. The prefix and repository owner are
+consumer inputs, not shared policy defaults. Jobs without reports remain visible.
+
+The appended, byte-bounded run summary lists created/existing PRs and all job
+outcomes. The full Markdown output includes planned deleted paths and expandable
+non-deletion diffs, escaped as data, plus failed steps and available error lines.
+Deleted file contents stay in the original patch rather than bloating the report.
+Only `published` outcomes confirm publication; previews and existing PRs are
+labeled separately. A failed job remains a failure even if planning succeeded.
+Candidates do not imply publication or merge; existing PR contents may differ.
+Missing or malformed result reports are not silently classified as no changes.
+Upload the Markdown as **component-reconciliation-report**, the artifact name
+linked by the summary. If the overview exceeds its display budget, the full file
+is preserved and the summary points to the artifact instead.
+
 ## Safe inventory before fleet fanout
 
 ```sh

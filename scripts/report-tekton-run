@@ -1,0 +1,14 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+"""Summarize downloaded reconciliation artifacts; no GitHub writes or execution."""
+from pathlib import Path
+import runpy
+
+# The renderer is standard-library-only. Avoid lib.__init__, which imports
+# unrelated configuration dependencies even for this offline presentation CLI.
+if __name__ == "__main__":
+    runpy.run_path(str(Path(__file__).resolve().parents[1] / "lib" / "tekton_run_report.py"),
+                   run_name="__main__")
