@@ -122,6 +122,40 @@ In validate mode: error if the field exists. In fix mode: removes it.
 some-optional-annotation: "{{ _? }}"
 ```
 
+### Native array expressions
+
+A whole-value expression ending in `| as_array` opts into native array rendering.
+Other expressions retain their existing string-rendering behavior, including
+numeric-looking strings and literal PaC variables. `_` and `_parent` retain
+native array values in this mode; `_?` and `_parent?` still remove missing fields.
+
+```yaml
+spec:
+  params:
+    - name: build-platforms
+      value: "{{ _? | exclude_values(['linux/ppc64le', 'linux/s390x'], delete_if_empty=true) | as_array }}"
+    - name: additional-labels
+      value: "{{ _? | replace_prefix('version=', 'version=on-pr-' ~ vars['revision']) | as_array }}"
+    - name: additional-tags
+      value: "{{ params.get('additional-tags', []) | append_unique('on-pr-{{pull_request_number}}') | as_array }}"
+```
+
+These reusable filters accept arrays of strings without modifying the input:
+
+- `exclude_values(values, delete_if_empty=false)` removes exact matches, preserving
+  other entries and order. If requested, an empty result signals whole-file
+  deletion through the existing `--fix` deletion mechanism.
+- `replace_prefix(prefix, replacement)` replaces only matching entries with the
+  supplied full replacement string; it neither adds missing entries nor changes
+  other entries.
+- `append_unique(item)` appends only if absent, retaining existing entries and order.
+- `as_array` requires a list and must be the terminal filter of a whole expression
+  to opt into typed rendering. It does not parse strings as YAML or coerce scalar types.
+
+Array differences are reported during validation and applied by `--fix`, just
+like literal template values. No platform, tag, or label policy is built into
+these filters: the template supplies all values and matching rules.
+
 ### Merge Behavior
 
 Fields defined in the template override the existing file. Fields in the existing file but not in the template are preserved (component-specific params like `dockerfile`, `prefetch-input`, `build-platforms`, etc.).

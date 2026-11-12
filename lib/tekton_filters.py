@@ -474,6 +474,42 @@ def to_pr_cel(value):
     return v.replace('event == "push"', 'event == "pull_request"')
 
 
+@jinja_filter
+def as_array(value):
+    """Opt in to native array rendering for a whole template expression."""
+    if not isinstance(value, list):
+        raise ValueError("as_array requires an array")
+    return value
+
+
+def _string_array(value):
+    if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
+        raise ValueError("expected an array of strings")
+    return value
+
+
+@jinja_filter
+def exclude_values(value, excluded, delete_if_empty=False):
+    """Remove exact array entries; optionally request whole-file deletion."""
+    result = [item for item in _string_array(value) if item not in excluded]
+    if not result and delete_if_empty:
+        raise DeleteFileError("array has no remaining values after exclusions")
+    return result
+
+
+@jinja_filter
+def replace_prefix(value, prefix, replacement):
+    """Replace only entries starting with prefix, preserving order and others."""
+    return [replacement if item.startswith(prefix) else item for item in _string_array(value)]
+
+
+@jinja_filter
+def append_unique(value, item):
+    """Append an array entry only if absent; preserve existing entries and order."""
+    items = _string_array(value)
+    return list(items) if item in items else [*items, item]
+
+
 # =============================================================================
 # Internal — filter wrapping and registration
 # =============================================================================
