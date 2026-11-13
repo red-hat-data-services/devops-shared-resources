@@ -403,26 +403,29 @@ def validate_cel_tekton_ignore(value):
 
 
 @jinja_filter
-def strip_release_push_selectors(value, filename=""):
-    """Remove push event/branch selectors, retaining guards and path conditions.
+def ensure_cel_selectors(value, desired):
+    """Build desired CEL; template comparison supplies validation and autofix."""
+    from lib.cel import ensure_cel_selectors as reconcile
+    from lib.tekton import ABSENT
 
-    Rewrite .tekton YAML filenames when filename is provided. Return "true"
-    when no conditions remain. This filter adds no event or repository policy.
-    """
-    from lib.cel import extract_push_conditions, path_conditions_to_text, replace_tekton_filename
-
-    expression = str(value)
-    if not expression.strip():
-        raise ValidationError("push CEL expression is empty")
+    if not isinstance(desired, dict):
+        raise ValidationError("selectors must be a mapping")
+    policy = {name: None if target == ABSENT else target for name, target in desired.items()}
     try:
-        guards, paths = extract_push_conditions(expression)
-    except ValueError as e:
-        raise ValidationError(f"cannot decompose push CEL: {e}") from e
-    if paths is not None:
-        if filename:
-            replace_tekton_filename(paths, filename)
-        guards.append(path_conditions_to_text(paths))
-    return "\n&& ".join(guards) or "true"
+        return reconcile(str(value), policy)
+    except ValueError as exc:
+        raise ValidationError(f"cannot reconcile CEL selectors: {exc}") from exc
+
+
+@jinja_filter
+def ensure_cel_tekton_filename(value, filename):
+    """Build desired filename references; template comparison validates/fixes."""
+    from lib.cel import ensure_cel_tekton_filename as rewrite_filename
+
+    try:
+        return rewrite_filename(str(value), filename)
+    except ValueError as exc:
+        raise ValidationError(f"cannot reconcile CEL filename: {exc}") from exc
 
 
 def _is_notebooks_sync_guard(guard):

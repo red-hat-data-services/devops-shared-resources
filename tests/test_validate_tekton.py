@@ -879,7 +879,7 @@ def test_pr_with_push_cel_is_not_misclassified_and_revalidated_as_push(tmp_path,
         assert fixed["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"] == 'event == "pull_request"'
         assert after[filename]["errors"] == []
     else:
-        assert any("cannot decompose push CEL" in error for error in after[filename]["errors"])
+        assert any("cannot reconcile CEL selectors" in error for error in after[filename]["errors"])
 
 
 def test_render_pr_reports_absent_annotations():
