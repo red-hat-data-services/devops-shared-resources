@@ -66,7 +66,7 @@ def localized_yaml(source, candidate):
     def remove(node, start):
         edits.append((line_start(start), line_end(content_end(node)), ""))
 
-    def replace(node, value, root):
+    def replace(node, value, root, scalar_indent=None):
         if root:
             raise ValueError("localized YAML edit would require whole-document emission")
         if ((isinstance(node, MappingNode) != isinstance(value, dict))
@@ -82,6 +82,10 @@ def localized_yaml(source, candidate):
             end = node.end_mark.index
             if source[end - 1:end] == "\n" and not text.endswith("\n"):
                 text += "\n"
+            elif emitted.style in ("|", ">") and text.endswith("\n") and source[end:].startswith(newline):
+                # Inline scalars exclude their line break from the node span;
+                # reuse that existing break instead of inserting a blank line.
+                text = text[:-1]
         else:
             end = content_end(node)
             if not node.flow_style:
@@ -93,10 +97,18 @@ def localized_yaml(source, candidate):
             if isinstance(node, SequenceNode) and not node.flow_style and not value:
                 text = "  " + text
         parts = text.splitlines(keepends=True)
-        text = parts[0] + "".join(" " * node.start_mark.column + line for line in parts[1:])
+        # Block bodies belong below the key/dash, not below the value marker.
+        # Root-scalar emission normally has zero body indent, but may declare
+        # an explicit indicator (e.g. |2-) for leading spaces or blank lines.
+        indent = node.start_mark.column
+        if (scalar_indent is not None and not isinstance(node, (MappingNode, SequenceNode))
+                and emitted.style in ("|", ">")):
+            emitted_indent = next((int(char) for char in parts[0] if char in "123456789"), 0)
+            indent = scalar_indent + 2 - emitted_indent
+        text = parts[0] + "".join(" " * indent + line for line in parts[1:])
         edits.append((node.start_mark.index, end, text.replace("\n", newline)))
 
-    def walk(node, old, new, root=False):
+    def walk(node, old, new, root=False, scalar_indent=None):
         if old == new:
             return
         if isinstance(node, (MappingNode, SequenceNode)) and isinstance(new, (dict, list)) and not new:
@@ -114,7 +126,7 @@ def localized_yaml(source, candidate):
                 if key not in new:
                     remove(value_node, key_node.start_mark.index)
                 else:
-                    walk(value_node, value, new[key])
+                    walk(value_node, value, new[key], scalar_indent=key_node.start_mark.column)
             added = {key: value for key, value in new.items() if key not in old}
             if added:
                 insert(node, added, node.start_mark.column)
@@ -130,20 +142,20 @@ def localized_yaml(source, candidate):
                 by_id = {item[identity]: item for item in new}
                 for child, item in zip(node.value, old):
                     if item[identity] in by_id:
-                        walk(child, item, by_id[item[identity]])
+                        walk(child, item, by_id[item[identity]], scalar_indent=node.start_mark.column)
                     else:
                         remove(child, child.start_mark.index)
                 tail = new[len(retained):]
             else:
                 for index in range(min(len(old), len(new))):
-                    walk(node.value[index], old[index], new[index])
+                    walk(node.value[index], old[index], new[index], scalar_indent=node.start_mark.column)
                 for child in node.value[len(new):]:
                     remove(child, child.start_mark.index)
                 tail = new[len(old):]
             if tail:
                 insert(node, tail, node.start_mark.column)
         else:
-            replace(node, new, root)
+            replace(node, new, root, scalar_indent)
 
     walk(tree, before, candidate, root=True)
     edits.sort(key=lambda edit: (edit[0], edit[1]))
