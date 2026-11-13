@@ -37,6 +37,22 @@ def test_extract_push_conditions_without_guards_or_paths():
     assert extract_push_conditions('event == "push"') == ([], None)
 
 
+@pytest.mark.parametrize("expression", [
+    "x == y", "x != y", "x < y", "x <= y", "x > y", "x >= y", "x in y",
+    "(x == y || x != z) && count >= 2",
+    'label == "a  ==  b"',
+    "label == 'a  ==  b'",
+])
+def test_path_conditions_comparison_spacing(expression):
+    import celpy
+
+    env = celpy.Environment()
+    tree = env.compile(expression)
+    result = path_conditions_to_text(tree)
+    assert result == expression
+    assert env.compile(result) == tree
+
+
 # --- replace_tekton_filename ---
 
 
