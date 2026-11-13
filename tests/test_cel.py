@@ -1,100 +1,40 @@
-"""Tests for CEL expression parsing, decomposition, and transformation."""
-
-from pathlib import Path
+"""Tests for CEL condition extraction and AST utilities."""
 
 import pytest
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-
 from lib.cel import (
-    build_stable_pr_cel,
-    decompose_push_cel,
+    extract_push_conditions,
     flatten_and,
-    parse_label_list,
     path_conditions_to_text,
     replace_tekton_filename,
 )
 
 
-# --- decompose_push_cel ---
+@pytest.mark.parametrize("branch", ["", ' && target_branch == "release"'])
+@pytest.mark.parametrize("condition", ["", ' && ("src/**".pathChanged() || "docs/**".pathChanged())'])
+def test_extract_push_conditions(branch, condition):
+    guards, path_tree = extract_push_conditions(
+        f'event == "push"{branch} && !skip_build{condition}',
+    )
+    assert guards == ["! skip_build"]
+    if condition:
+        assert path_conditions_to_text(path_tree) == condition.removeprefix(" && ")
+    else:
+        assert path_tree is None
 
 
-class TestDecomposePushCel:
-    """Tests for decomposing push CEL expressions into structural parts."""
+@pytest.mark.parametrize("expression,message", [
+    ("&&&", "failed to parse"),
+    ('target_branch == "release"', "no event clause"),
+    ('event == "push" || skip_build', "top-level OR"),
+])
+def test_extract_push_conditions_rejects_unsupported_input(expression, message):
+    with pytest.raises(ValueError, match=message):
+        extract_push_conditions(expression)
 
-    def test_broad_filter(self):
-        """Shape A: broad files.all.exists filter."""
-        cel = (
-            'event == "push" && target_branch == "rhoai-3.6"'
-            " && ( files.all.exists(p, !p.matches('^\\\\.tekton/'))"
-            ' || ".tekton/odh-dashboard-v3-6-push.yaml".pathChanged() )'
-        )
-        parts = decompose_push_cel(cel)
-        assert 'event' in parts["event"]
-        assert '"push"' in parts["event"]
-        assert 'target_branch' in parts["branch"]
-        assert '"rhoai-3.6"' in parts["branch"]
-        assert parts["negative_guards"] == []
-        assert "files.all.exists" in parts["path_conditions"]
-        assert "pathChanged" in parts["path_conditions"]
-        assert parts["path_conditions_tree"] is not None
 
-    def test_fine_grained_with_negative_guard(self):
-        """Shape B: fine-grained pathChanged with negative guard."""
-        cel = (
-            'event == "push" && target_branch == "rhoai-3.6"'
-            ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
-            ' && ( ".tekton/odh-workbench-v3-6-push.yaml".pathChanged()'
-            ' || "jupyter/utils/**".pathChanged()'
-            ' || "jupyter/minimal/ubi9-python-3.12/**".pathChanged() )'
-        )
-        parts = decompose_push_cel(cel)
-        assert '"push"' in parts["event"]
-        assert '"rhoai-3.6"' in parts["branch"]
-        assert len(parts["negative_guards"]) == 1
-        assert "manifests/rhoai/base/params-latest.env" in parts["negative_guards"][0]
-        assert "odh-workbench" in parts["path_conditions"]
-        assert "jupyter/utils" in parts["path_conditions"]
-
-    def test_custom_path_glob(self):
-        """Shape C: custom path glob for helm charts."""
-        cel = (
-            'event == "push" && target_branch == "rhoai-3.5-ea.2"'
-            ' && ( "helm/rhai-on-openshift-chart/**".pathChanged()'
-            ' || ".tekton/rhai-on-openshift-chart-v3-5-ea-2-push.yaml".pathChanged() )'
-        )
-        parts = decompose_push_cel(cel)
-        assert '"rhoai-3.5-ea.2"' in parts["branch"]
-        assert "helm/rhai-on-openshift-chart" in parts["path_conditions"]
-
-    def test_invalid_cel_raises(self):
-        with pytest.raises(ValueError, match="failed to parse"):
-            decompose_push_cel("this is not valid CEL &&& !!!")
-
-    def test_missing_event_raises(self):
-        with pytest.raises(ValueError, match="no event clause"):
-            decompose_push_cel('target_branch == "rhoai-3.6"')
-
-    @pytest.mark.parametrize("branch", ["", ' && target_branch == "rhoai-3.6"'])
-    def test_no_path_conditions(self, branch):
-        parts = decompose_push_cel(f'event == "push"{branch}')
-        assert '"push"' in parts["event"]
-        assert parts["path_conditions"] is None
-        assert parts["path_conditions_tree"] is None
-        assert parts["negative_guards"] == []
-
-    def test_only_negative_guard(self):
-        parts = decompose_push_cel(
-            'event == "push" && target_branch == "rhoai-3.6"'
-            ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
-        )
-        assert parts["path_conditions_tree"] is None
-        assert len(parts["negative_guards"]) == 1
-        assert "params-latest.env" in parts["negative_guards"][0]
-
-    def test_top_level_or_is_not_silently_discarded(self):
-        with pytest.raises(ValueError, match="top-level"):
-            decompose_push_cel('event == "push" || target_branch == "rhoai-3.6"')
+def test_extract_push_conditions_without_guards_or_paths():
+    assert extract_push_conditions('event == "push"') == ([], None)
 
 
 # --- replace_tekton_filename ---
@@ -156,269 +96,11 @@ class TestReplaceTektonFilename:
         assert "files.all.exists" in result
 
 
-# --- parse_label_list ---
-
-
-class TestParseLabelList:
-    def test_standard_format(self):
-        assert parse_label_list("[kfbuild-all, kfbuild-dashboard]") == [
-            "kfbuild-all",
-            "kfbuild-dashboard",
-        ]
-
-    def test_many_labels(self):
-        result = parse_label_list(
-            "[kfbuild-all, kfbuild-workbench, kfbuild-cpu, kfbuild-datascience]"
-        )
-        assert len(result) == 4
-        assert result[0] == "kfbuild-all"
-        assert result[3] == "kfbuild-datascience"
-
-    def test_empty_string(self):
-        assert parse_label_list("") == []
-
-    def test_none(self):
-        assert parse_label_list(None) == []
-
-    def test_empty_brackets(self):
-        assert parse_label_list("[]") == []
-
-
-# --- build_stable_pr_cel ---
-
-
-class TestBuildStablePrCel:
-    @pytest.mark.parametrize("labels", [None, ["kfbuild-all"]])
-    def test_without_path_conditions(self, labels):
-        assert build_stable_pr_cel("", labels=labels) == 'event == "pull_request"'
-
-    def test_without_paths_preserves_branch_and_guards(self):
-        import celpy
-
-        result = build_stable_pr_cel(
-            "", target_branch="stable", negative_guards=["!skip_build"],
-        )
-        assert 'target_branch == "stable"' in result
-        assert "!skip_build" in result
-        assert not result.rstrip().endswith("&&")
-        celpy.Environment().compile(result)
-
-    def test_basic_no_labels_no_branch(self):
-        result = build_stable_pr_cel(
-            path_conditions_text='".tekton/odh-dashboard-pull-request.yaml".pathChanged()',
-        )
-        assert 'event == "pull_request"' in result
-        assert "odh-dashboard-pull-request.yaml" in result
-        assert "has(body.pull_request.labels)" not in result
-        assert "target_branch" not in result
-
-    def test_with_target_branch(self):
-        result = build_stable_pr_cel(
-            path_conditions_text='".tekton/odh-dashboard-pull-request.yaml".pathChanged()',
-            target_branch="stable",
-        )
-        assert 'event == "pull_request"' in result
-        assert 'target_branch == "stable"' in result
-        assert "odh-dashboard-pull-request.yaml" in result
-
-    def test_with_labels(self):
-        result = build_stable_pr_cel(
-            path_conditions_text='".tekton/odh-dashboard-pull-request.yaml".pathChanged()',
-            labels=["kfbuild-all", "kfbuild-dashboard"],
-        )
-        assert 'event == "pull_request"' in result
-        assert "has(body.pull_request.labels)" in result
-        assert '"kfbuild-all"' in result
-        assert '"kfbuild-dashboard"' in result
-        assert "||" in result
-
-    def test_with_labels_and_branch(self):
-        result = build_stable_pr_cel(
-            path_conditions_text='".tekton/foo.yaml".pathChanged()',
-            labels=["kfbuild-all"],
-            target_branch="stable",
-        )
-        label_pos = result.index("has(body.pull_request.labels)")
-        stable_pos = result.index('target_branch == "stable"')
-        assert label_pos < stable_pos
-        assert "||" in result
-
-    def test_with_negative_guards(self):
-        result = build_stable_pr_cel(
-            path_conditions_text='".tekton/x.yaml".pathChanged()',
-            negative_guards=['!("manifests/rhoai/base/params-latest.env".pathChanged())'],
-        )
-        assert "manifests/rhoai/base/params-latest.env" in result
-        assert "x.yaml" in result
-
-
-# --- to_stable_pr_cel filter (end-to-end) ---
-
-
-class TestToStablePrCelFilter:
-    """End-to-end tests for the to_stable_pr_cel Jinja filter."""
-
-    @pytest.mark.parametrize("labels", ["", "[kfbuild-all]"])
-    @pytest.mark.parametrize("branch", ["", '\n&& target_branch == "rhoai-3.6"\n'])
-    def test_pathless_push_becomes_unrestricted_pr_trigger(self, labels, branch):
-        import celpy
-        from lib.tekton_filters import to_stable_pr_cel
-
-        result = to_stable_pr_cel(
-            f'event == "push"{branch}', "odh-must-gather-pull-request.yaml", labels,
-        )
-        assert result == 'event == "pull_request"'
-        env = celpy.Environment()
-        program = env.program(env.compile(result))
-        assert program.evaluate({"event": celpy.celtypes.StringType("pull_request")})
-        assert not program.evaluate({"event": celpy.celtypes.StringType("push")})
-
-    def test_pathless_push_preserves_negative_guard(self):
-        import celpy
-        from lib.tekton_filters import to_stable_pr_cel
-
-        result = to_stable_pr_cel(
-            'event == "push" && target_branch == "rhoai-3.6"'
-            ' && !("manifests/rhoai/base/params-latest.env".pathChanged())',
-            "odh-must-gather-pull-request.yaml",
-        )
-        assert 'event == "pull_request"' in result
-        assert 'event == "push"' not in result
-        assert 'target_branch == "rhoai-3.6"' not in result
-        assert "params-latest.env" in result
-        celpy.Environment().compile(result)
-
-    def test_broad_filter_no_labels(self):
-        from lib.tekton_filters import to_stable_pr_cel
-
-        push_cel = (
-            'event == "push" && target_branch == "rhoai-3.6"'
-            " && ( files.all.exists(p, !p.matches('^\\\\.tekton/'))"
-            ' || ".tekton/odh-dashboard-v3-6-push.yaml".pathChanged() )'
-        )
-        result = to_stable_pr_cel(
-            push_cel,
-            "odh-dashboard-pull-request.yaml",
-            "",
-        )
-        assert 'event == "pull_request"' in result
-        assert 'event == "push"' not in result
-        assert "target_branch" not in result
-        assert "odh-dashboard-pull-request.yaml" in result
-        assert "v3-6-push" not in result
-        assert "files.all.exists" in result
-        assert "has(body.pull_request.labels)" not in result
-
-    def test_broad_filter_with_labels(self):
-        from lib.tekton_filters import to_stable_pr_cel
-
-        push_cel = (
-            'event == "push" && target_branch == "rhoai-3.6"'
-            " && ( files.all.exists(p, !p.matches('^\\\\.tekton/'))"
-            ' || ".tekton/odh-dashboard-v3-6-push.yaml".pathChanged() )'
-        )
-        result = to_stable_pr_cel(
-            push_cel,
-            "odh-dashboard-pull-request.yaml",
-            "[kfbuild-all, kfbuild-dashboard]",
-        )
-        assert 'event == "pull_request"' in result
-        assert '"kfbuild-all"' in result
-        assert '"kfbuild-dashboard"' in result
-        assert "||" in result
-
-    def test_fine_grained_with_negative_guard(self):
-        from lib.tekton_filters import to_stable_pr_cel
-
-        push_cel = (
-            'event == "push" && target_branch == "rhoai-3.6"'
-            ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
-            ' && ( ".tekton/odh-workbench-v3-6-push.yaml".pathChanged()'
-            ' || "jupyter/utils/**".pathChanged() )'
-        )
-        result = to_stable_pr_cel(
-            push_cel,
-            "odh-workbench-pull-request.yaml",
-            "",
-        )
-        assert 'event == "pull_request"' in result
-        assert "manifests/rhoai/base/params-latest.env" in result
-        assert "odh-workbench-pull-request.yaml" in result
-        assert '"jupyter/utils/**"' in result
-        assert "has(body.pull_request.labels)" not in result
-
-    def test_empty_push_cel_raises(self):
-        from lib.tekton_filters import ValidationError, to_stable_pr_cel
-
-        with pytest.raises(ValidationError, match="empty"):
-            to_stable_pr_cel("", "foo.yaml", "")
-
-
-@pytest.mark.parametrize("source,target,event,params,image,expected", [
-    ("main", "stable", "pull_request", True, False, True),
-    ("main", "stable", "pull_request", True, True, True),
-    ("main", "stable", "push", True, True, False),
-    ("feature", "stable", "pull_request", True, True, False),
-    ("feature", "stable", "pull_request", False, True, True),
-    ("feature", "stable", "pull_request", False, False, False),
-    ("main", "other", "pull_request", True, False, False),
-])
-@pytest.mark.parametrize("labels", ["", "[kfbuild-all]"])
-def test_notebooks_sync_trigger_semantics(source, target, event, params, image, expected, labels):
+def test_flatten_and_preserves_nested_or():
     import celpy
-    from lib.tekton_filters import to_stable_pr_cel
 
-    expression = to_stable_pr_cel(
-        'event == "push" && target_branch == "rhoai-3.7-ea.1"'
-        ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
-        ' && ("jupyter/utils/**".pathChanged() || ".tekton/push.yaml".pathChanged())',
-        "pull-request.yaml", labels,
-    )
-    env = celpy.Environment()
-    program = env.program(env.compile(expression), functions={
-        "pathChanged": lambda path: celpy.celtypes.BoolType(
-            params if str(path) == "manifests/rhoai/base/params-latest.env" else image
-        ),
-    })
-    assert bool(program.evaluate({
-        "source_branch": celpy.celtypes.StringType(source),
-        "target_branch": celpy.celtypes.StringType(target),
-        "event": celpy.celtypes.StringType(event),
-        "body": celpy.json_to_cel({"pull_request": {"labels": []}}),
-    })) == expected
-
-
-@pytest.mark.parametrize("guard", [
-    '!skip_build',
-    '!("other/params-latest.env".pathChanged())',
-    '!("manifests/rhoai/base/params-latest.env".pathChanged() || skip_build)',
-])
-def test_unrelated_negative_guards_do_not_add_sync_escape(guard):
-    from lib.tekton_filters import to_stable_pr_cel
-
-    result = to_stable_pr_cel(
-        f'event == "push" && target_branch == "release" && {guard}'
-        ' && "src/**".pathChanged()', "pull-request.yaml",
-    )
-    assert "source_branch" not in result
-
-
-def test_notebooks_label_arm_still_bypasses_path_guard():
-    import celpy
-    from lib.tekton_filters import to_stable_pr_cel
-
-    result = to_stable_pr_cel(
-        'event == "push" && target_branch == "release"'
-        ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
-        ' && "src/**".pathChanged()', "pull-request.yaml", "[kfbuild-all]",
-    )
-    env = celpy.Environment()
-    program = env.program(env.compile(result), functions={
-        "pathChanged": lambda path: celpy.celtypes.BoolType(True),
-    })
-    assert program.evaluate({
-        "source_branch": celpy.celtypes.StringType("feature"),
-        "target_branch": celpy.celtypes.StringType("stable"),
-        "event": celpy.celtypes.StringType("pull_request"),
-        "body": celpy.json_to_cel({"pull_request": {"labels": [{"name": "kfbuild-all"}]}}),
-    })
+    ast = celpy.Environment().compile('a && (b || c) && d')
+    clauses = flatten_and(ast.children[0].children[0])
+    assert [path_conditions_to_text(clause) for clause in clauses] == [
+        "a", "(b || c)", "d",
+    ]

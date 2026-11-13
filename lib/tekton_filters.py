@@ -102,6 +102,19 @@ class SkipValidation(str):
 DELETE_FILE_PREFIX = "DELETE: "
 
 
+@jinja_filter
+def unique_item(items, key, target):
+    """Return a unique keyed mapping; ambiguous target identities fail closed."""
+    if items is None:
+        return {}
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("keyed collection must contain mappings")
+    matches = [item for item in items if item.get(key) == target]
+    if len(matches) > 1:
+        raise ValueError(f"duplicate {key}: {target}")
+    return matches[0] if matches else {}
+
+
 # =============================================================================
 # Transform filters
 # =============================================================================
@@ -388,77 +401,108 @@ def validate_cel_tekton_ignore(value):
         )
     return fixed
 
+
 @jinja_filter
-def to_stable_pr_cel(value, filename="", labels_str=""):
-    """Convert a push CEL expression into a PR CEL expression for stable branch.
+def ensure_cel_selectors(value, desired):
+    """Build desired CEL; template comparison supplies validation and autofix."""
+    from lib.cel import ensure_cel_selectors as reconcile
+    from lib.tekton import ABSENT
 
-    Takes the parent push pipeline's on-cel-expression and produces a PR CEL
-    that triggers on target_branch == "stable" with the same pathChanged
-    conditions. Optionally includes a label trigger arm if labels_str is
-    provided.
+    if not isinstance(desired, dict):
+        raise ValidationError("selectors must be a mapping")
+    policy = {name: None if target == ABSENT else target for name, target in desired.items()}
+    try:
+        return reconcile(str(value), policy)
+    except ValueError as exc:
+        raise ValidationError(f"cannot reconcile CEL selectors: {exc}") from exc
 
-    The path conditions (pathChanged, files.all.exists) are extracted from the
-    push CEL, with the .tekton filename updated to the PR filename.
-    Push triggers without path conditions remain unrestricted by paths.
-    The exact notebooks params-latest.env exclusion adds a main->stable sync
-    arm outside the entire path conjunction, so bump-only sync PRs also build.
 
-    Args:
-        value: The push pipeline's on-cel-expression string.
-        filename: The PR PipelineRun filename (e.g. "odh-dashboard-pull-request.yaml").
-        labels_str: The existing on-label annotation value
-                    (e.g. "[kfbuild-all, kfbuild-dashboard]"). When empty or
-                    not provided, only the stable+pathChanged arm is generated.
+@jinja_filter
+def ensure_cel_tekton_filename(value, filename):
+    """Build desired filename references; template comparison validates/fixes."""
+    from lib.cel import ensure_cel_tekton_filename as rewrite_filename
 
-    >>> to_stable_pr_cel('event == "push" && target_branch == "rhoai-3.6" && ".tekton/x-v3-6-push.yaml".pathChanged()', "x-pull-request.yaml", "")
-    'event == "pull_request"...'
+    try:
+        return rewrite_filename(str(value), filename)
+    except ValueError as exc:
+        raise ValidationError(f"cannot reconcile CEL filename: {exc}") from exc
+
+
+def _is_notebooks_sync_guard(guard):
+    """Only the exact params-latest.env exclusion permits the sync bypass."""
+    return re.fullmatch(
+        r'!\s*\(\s*"manifests/rhoai/base/params-latest\.env"\.pathChanged\(\)\s*\)',
+        guard,
+    ) is not None
+
+
+@jinja_filter
+def release_push_to_main_pr_cel(value, filename="", labels_str=""):
+    """Convert a push trigger into a PR trigger with optional bypass arms.
+
+    Ordinary PRs retain the push trigger's negative guards and path conditions,
+    but not its branch selector. Labels can bypass those conditions. The exact
+    notebooks params-latest.env exclusion also permits main-to-stable sync PRs
+    regardless of paths. Every arm still requires the pull_request event.
+
+    filename replaces the push PipelineRun filename in path conditions;
+    labels_str is the optional on-label annotation, e.g. "[kfbuild-all]".
     """
-    import copy
     from lib.cel import (
-        build_stable_pr_cel,
-        decompose_push_cel,
-        parse_label_list,
+        extract_push_conditions,
         path_conditions_to_text,
         replace_tekton_filename,
     )
 
-    v = str(value)
-    if not v.strip():
+    expression = str(value)
+    if not expression.strip():
         raise ValidationError("push CEL expression is empty")
-
     try:
-        parts = decompose_push_cel(v)
+        guards, path_tree = extract_push_conditions(expression)
     except ValueError as e:
-        raise ValidationError(f"cannot decompose push CEL: {e}")
+        raise ValidationError(f"cannot decompose push CEL: {e}") from e
 
-    # Parse labels from on-label annotation (optional)
-    labels = parse_label_list(labels_str) or None
-
-    # Notebooks main->stable sync PRs bump manifests/rhoai/base/params-latest.env,
-    # which the push trigger's negative guard excludes. Carry an escape-hatch arm
-    # so those sync PRs still trigger builds even when the changed files do not
-    # match the per-image path filters. Match only this exact exclusion, not arbitrary
-    # negative expressions that happen to mention params-latest.env.
-    stable_sync_escape = None
-    if any(re.fullmatch(
-        r'!\s*\(\s*"manifests/rhoai/base/params-latest\.env"\.pathChanged\(\)\s*\)',
-        guard,
-    ) for guard in parts["negative_guards"]):
-        stable_sync_escape = '(source_branch == "main" && target_branch == "stable")'
-
-    # Replace .tekton filename in path conditions
-    path_text = ""
-    if parts["path_conditions_tree"] is not None:
-        path_tree = copy.deepcopy(parts["path_conditions_tree"])
+    # The normal arm retains guards and rewrites the PR pipeline's own path.
+    path_parts = list(guards)
+    if path_tree is not None:
         if filename:
             replace_tekton_filename(path_tree, filename)
-        path_text = path_conditions_to_text(path_tree)
+        path_parts.append(path_conditions_to_text(path_tree))
+    if not path_parts:
+        # An unrestricted normal arm already permits every PR.
+        return 'event == "pull_request"'
 
-    # Build the CEL expression
-    return build_stable_pr_cel(
-        path_text, parts["negative_guards"], labels=labels,
-        stable_sync_escape=stable_sync_escape,
+    # Optional alternatives bypass the whole guarded path arm.
+    labels = [
+        label.strip()
+        for label in (labels_str or "").strip().strip("[]").split(",")
+        if label.strip()
+    ]
+    arms = []
+    if labels:
+        labels_quoted = ", ".join(f'"{label}"' for label in labels)
+        arms.append(
+            "has(body.pull_request.labels)\n"
+            f"    && body.pull_request.labels.exists(l, l.name in [{labels_quoted}])"
+        )
+    if any(_is_notebooks_sync_guard(guard) for guard in guards):
+        arms.append('(source_branch == "main" && target_branch == "stable")')
+
+    if not arms:
+        return 'event == "pull_request"\n&& ' + "\n&& ".join(path_parts)
+
+    arms.append("\n    && ".join(path_parts))
+    arms_text = "\n  )\n  ||\n  (\n    ".join(arms)
+    return (
+        'event == "pull_request"\n'
+        "&& (\n"
+        f"  (\n    {arms_text}\n  )\n"
+        ")"
     )
+
+
+# Compatibility alias for templates and Python callers migrating to the new name.
+to_stable_pr_cel = release_push_to_main_pr_cel
 
 
 @jinja_filter
@@ -508,6 +552,98 @@ def append_unique(value, item):
     """Append an array entry only if absent; preserve existing entries and order."""
     items = _string_array(value)
     return list(items) if item in items else [*items, item]
+
+
+@jinja_filter
+def shorten_name(value, max_length):
+    """Bound a name with a readable prefix and stable hash; leave short names intact."""
+    import hashlib
+    if not isinstance(value, str) or not isinstance(max_length, int) or isinstance(max_length, bool) or max_length < 10:
+        raise ValidationError("shorten_name requires a string and maximum length >= 10")
+    if len(value) <= max_length:
+        return value
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()[:8]
+    return value[:max_length - 9].rstrip("-") + "-" + digest
+
+
+@jinja_filter
+def to_release_pr_cel(value, branch, filename):
+    """Convert exact-release push CEL to PR CEL, retaining every other clause."""
+    import json
+    import celpy
+    from celpy.celparser import tree_dump
+    from lark import Token, Tree
+    from lib.cel import flatten_and
+
+    def unwrap(node):
+        """Remove expression wrappers without crossing operators or calls."""
+        wrappers = {"expr", "conditionalor", "conditionaland", "relation",
+                    "addition", "multiplication", "unary", "member", "primary", "paren_expr"}
+        while isinstance(node, Tree) and node.data in wrappers and len(node.children) == 1:
+            node = node.children[0]
+        return node
+
+    def selector_equality(node):
+        """Recognize a direct event/branch equality, not text inside literals."""
+        from ast import literal_eval
+        node = unwrap(node)
+        if not isinstance(node, Tree) or node.data != "relation" or len(node.children) != 2:
+            return None
+        left, right = node.children
+        if not isinstance(left, Tree) or left.data != "relation_eq":
+            return None
+        left, right = unwrap(left.children[0]), unwrap(right)
+        if (isinstance(left, Tree) and left.data == "ident"
+                and str(left.children[0]) in {"event", "target_branch"}
+                and isinstance(right, Tree) and right.data == "literal"):
+            return str(left.children[0]), literal_eval(str(right.children[0]))
+        return None
+
+    def rewrite_filename(node):
+        """Rewrite only literal YAML receivers of zero-argument pathChanged calls."""
+        if not isinstance(node, Tree):
+            return
+        if (node.data == "member_dot_arg" and len(node.children) == 2
+                and str(node.children[1]) == "pathChanged"):
+            receiver = unwrap(node.children[0])
+            if isinstance(receiver, Tree) and receiver.data == "literal":
+                token = receiver.children[0]
+                text = str(token)
+                if (isinstance(token, Token) and len(text) > 2
+                        and text[0] in ('\"', "'") and text[-1] == text[0]
+                        and text[1:-1].startswith(".tekton/")
+                        and text[1:-1].endswith((".yaml", ".yml"))):
+                    receiver.children[0] = Token(token.type, json.dumps(f".tekton/{filename}"))
+        for child in node.children:
+            rewrite_filename(child)
+
+    if not re.fullmatch(r"rhoai-\d+\.\d+(?:-ea\.\d+)?", branch):
+        raise ValidationError("expected a rhoai-x.y[-ea.z] release branch")
+    try:
+        ast = celpy.Environment().compile(str(value))
+        cor = ast.children[0]
+        if cor.data != "conditionalor" or len(cor.children) != 1:
+            raise ValueError("unsupported top-level OR in push CEL")
+        clauses = []
+        events = branches = 0
+        for clause in flatten_and(cor.children[0]):
+            wrapped = Tree("expr", [Tree("conditionalor", [Tree("conditionaland", [clause])])])
+            selector = selector_equality(clause)
+            if selector == ("event", "push"):
+                events += 1
+            elif selector == ("target_branch", branch):
+                branches += 1
+            else:
+                if any(str(node.children[0]) in {"event", "target_branch"}
+                       for node in wrapped.find_data("ident")):
+                    raise ValueError("unsupported event/branch predicate in push CEL")
+                rewrite_filename(wrapped)
+                clauses.append(tree_dump(wrapped))
+        if events != 1 or branches != 1:
+            raise ValueError("push CEL must select exactly this release and the push event")
+    except Exception as exc:
+        raise ValidationError(f"cannot convert release push CEL: {exc}") from exc
+    return '\n&& '.join(['event == "pull_request"', f'target_branch == {json.dumps(branch)}'] + [f'({c})' for c in clauses])
 
 
 # =============================================================================

@@ -33,6 +33,8 @@ from lib.tekton_filters import (
     to_private_gitlab,
     to_private_quay,
     to_pr_cel,
+    release_push_to_main_pr_cel,
+    to_stable_pr_cel,
     validate_cel,
     validate_cel_tekton_ignore,
 )
@@ -501,3 +503,268 @@ def test_must_be_approved_pipeline_fail():
     with pytest.raises(ValidationError) as exc:
         must_be_approved_pipeline("https://github.com/evil/pipeline.git")
     assert "not in approved" in str(exc.value)
+
+
+# --- release push to main PR CEL policy ---
+
+
+def test_release_push_to_main_pr_cel_legacy_alias():
+    assert to_stable_pr_cel is release_push_to_main_pr_cel
+
+
+@pytest.mark.parametrize("name", ["release_push_to_main_pr_cel", "to_stable_pr_cel"])
+@pytest.mark.parametrize("mode", ["validate", "fix"])
+@pytest.mark.parametrize("labels", ["", "[kfbuild-all]"])
+def test_release_push_to_main_pr_cel_jinja_names(name, mode, labels):
+    from jinja2 import Environment
+
+    errors = []
+    env = Environment()
+    env.filters.update(make_filters(mode, errors))
+    template = env.from_string("{{ value | " + name + "(filename, labels) }}")
+    value = 'event == "push" && ".tekton/push.yaml".pathChanged()'
+    assert template.render(value=value, filename="pr.yaml", labels=labels) == (
+        release_push_to_main_pr_cel(value, "pr.yaml", labels)
+    )
+    assert errors == []
+
+
+@pytest.mark.parametrize("name", ["release_push_to_main_pr_cel", "to_stable_pr_cel"])
+@pytest.mark.parametrize("mode", ["validate", "fix"])
+def test_release_push_to_main_pr_cel_jinja_names_report_errors(name, mode):
+    errors = []
+    filters = make_filters(mode, errors)
+    assert filters[name]("&&&") == "&&&"
+    assert len(errors) == 1
+    assert errors[0].startswith("cannot decompose push CEL: failed to parse")
+
+
+@pytest.mark.parametrize("labels", ["", "[kfbuild-all]"])
+def test_stable_pr_output_format(labels):
+    result = release_push_to_main_pr_cel(
+        'event == "push" && target_branch == "release"'
+        ' && ".tekton/push.yaml".pathChanged()',
+        "pull-request.yaml", labels,
+    )
+    path = '".tekton/pull-request.yaml".pathChanged()'
+    if labels:
+        expected = (
+            'event == "pull_request"\n&& (\n  (\n    '
+            'has(body.pull_request.labels)\n'
+            '    && body.pull_request.labels.exists(l, l.name in ["kfbuild-all"])'
+            '\n  )\n  ||\n  (\n    ' + path + '\n  )\n)'
+        )
+    else:
+        expected = 'event == "pull_request"\n&& ' + path
+    assert result == expected
+
+
+@pytest.mark.parametrize("value,message", [
+    ("   ", "push CEL expression is empty"),
+    ("&&&", "cannot decompose push CEL: failed to parse"),
+    ('target_branch == "release"', "cannot decompose push CEL: CEL expression has no event clause"),
+    ('event == "push" || skip_build', "cannot decompose push CEL: top-level OR"),
+])
+def test_stable_pr_filter_reports_invalid_input(value, message):
+    with pytest.raises(ValidationError, match=message) as exc:
+        release_push_to_main_pr_cel(value)
+    assert exc.value.fixed_value is None
+
+
+# --- release_push_to_main_pr_cel filter (end-to-end) ---
+
+
+class TestReleasePushToMainPrCelFilter:
+    """End-to-end tests for the release_push_to_main_pr_cel Jinja filter."""
+
+    @pytest.mark.parametrize("labels", ["", "[kfbuild-all]"])
+    @pytest.mark.parametrize("branch", ["", '\n&& target_branch == "rhoai-3.6"\n'])
+    def test_pathless_push_becomes_unrestricted_pr_trigger(self, labels, branch):
+        import celpy
+
+        result = release_push_to_main_pr_cel(
+            f'event == "push"{branch}', "odh-must-gather-pull-request.yaml", labels,
+        )
+        assert result == 'event == "pull_request"'
+        env = celpy.Environment()
+        program = env.program(env.compile(result))
+        assert program.evaluate({"event": celpy.celtypes.StringType("pull_request")})
+        assert not program.evaluate({"event": celpy.celtypes.StringType("push")})
+
+    def test_pathless_push_preserves_negative_guard(self):
+        import celpy
+
+        result = release_push_to_main_pr_cel(
+            'event == "push" && target_branch == "rhoai-3.6"'
+            ' && !("manifests/rhoai/base/params-latest.env".pathChanged())',
+            "odh-must-gather-pull-request.yaml",
+        )
+        assert 'event == "pull_request"' in result
+        assert 'event == "push"' not in result
+        assert 'target_branch == "rhoai-3.6"' not in result
+        assert "params-latest.env" in result
+        celpy.Environment().compile(result)
+
+    def test_broad_filter_no_labels(self):
+
+        push_cel = (
+            'event == "push" && target_branch == "rhoai-3.6"'
+            " && ( files.all.exists(p, !p.matches('^\\\\.tekton/'))"
+            ' || ".tekton/odh-dashboard-v3-6-push.yaml".pathChanged() )'
+        )
+        result = release_push_to_main_pr_cel(
+            push_cel,
+            "odh-dashboard-pull-request.yaml",
+            "",
+        )
+        assert 'event == "pull_request"' in result
+        assert 'event == "push"' not in result
+        assert "target_branch" not in result
+        assert "odh-dashboard-pull-request.yaml" in result
+        assert "v3-6-push" not in result
+        assert "files.all.exists" in result
+        assert "has(body.pull_request.labels)" not in result
+
+    def test_broad_filter_with_labels(self):
+
+        push_cel = (
+            'event == "push" && target_branch == "rhoai-3.6"'
+            " && ( files.all.exists(p, !p.matches('^\\\\.tekton/'))"
+            ' || ".tekton/odh-dashboard-v3-6-push.yaml".pathChanged() )'
+        )
+        result = release_push_to_main_pr_cel(
+            push_cel,
+            "odh-dashboard-pull-request.yaml",
+            "[kfbuild-all, kfbuild-dashboard]",
+        )
+        assert 'event == "pull_request"' in result
+        assert '"kfbuild-all"' in result
+        assert '"kfbuild-dashboard"' in result
+        assert "||" in result
+
+    def test_fine_grained_with_negative_guard(self):
+
+        push_cel = (
+            'event == "push" && target_branch == "rhoai-3.6"'
+            ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
+            ' && ( ".tekton/odh-workbench-v3-6-push.yaml".pathChanged()'
+            ' || "jupyter/utils/**".pathChanged() )'
+        )
+        result = release_push_to_main_pr_cel(
+            push_cel,
+            "odh-workbench-pull-request.yaml",
+            "",
+        )
+        assert 'event == "pull_request"' in result
+        assert "manifests/rhoai/base/params-latest.env" in result
+        assert "odh-workbench-pull-request.yaml" in result
+        assert '"jupyter/utils/**"' in result
+        assert "has(body.pull_request.labels)" not in result
+
+    def test_empty_push_cel_raises(self):
+
+        with pytest.raises(ValidationError, match="empty"):
+            release_push_to_main_pr_cel("", "foo.yaml", "")
+
+
+@pytest.mark.parametrize("source,target,event,params,image,expected", [
+    ("main", "stable", "pull_request", True, False, True),
+    ("main", "stable", "pull_request", True, True, True),
+    ("main", "stable", "push", True, True, False),
+    ("feature", "stable", "pull_request", True, True, False),
+    ("feature", "stable", "pull_request", False, True, True),
+    ("feature", "stable", "pull_request", False, False, False),
+    ("main", "other", "pull_request", True, False, False),
+])
+@pytest.mark.parametrize("labels", ["", "[kfbuild-all]"])
+def test_notebooks_sync_trigger_semantics(source, target, event, params, image, expected, labels):
+    import celpy
+
+    expression = release_push_to_main_pr_cel(
+        'event == "push" && target_branch == "rhoai-3.7-ea.1"'
+        ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
+        ' && ("jupyter/utils/**".pathChanged() || ".tekton/push.yaml".pathChanged())',
+        "pull-request.yaml", labels,
+    )
+    env = celpy.Environment()
+    program = env.program(env.compile(expression), functions={
+        "pathChanged": lambda path: celpy.celtypes.BoolType(
+            params if str(path) == "manifests/rhoai/base/params-latest.env" else image
+        ),
+    })
+    assert bool(program.evaluate({
+        "source_branch": celpy.celtypes.StringType(source),
+        "target_branch": celpy.celtypes.StringType(target),
+        "event": celpy.celtypes.StringType(event),
+        "body": celpy.json_to_cel({"pull_request": {"labels": []}}),
+    })) == expected
+
+
+@pytest.mark.parametrize("guard", [
+    '!skip_build',
+    '!("other/params-latest.env".pathChanged())',
+    '!("manifests/rhoai/base/params-latest.env".pathChanged() || skip_build)',
+])
+def test_unrelated_negative_guards_do_not_add_sync_escape(guard):
+
+    result = release_push_to_main_pr_cel(
+        f'event == "push" && target_branch == "release" && {guard}'
+        ' && "src/**".pathChanged()', "pull-request.yaml",
+    )
+    assert "source_branch" not in result
+
+
+def test_notebooks_label_arm_still_bypasses_path_guard():
+    import celpy
+
+    result = release_push_to_main_pr_cel(
+        'event == "push" && target_branch == "release"'
+        ' && !("manifests/rhoai/base/params-latest.env".pathChanged())'
+        ' && "src/**".pathChanged()', "pull-request.yaml", "[kfbuild-all]",
+    )
+    env = celpy.Environment()
+    program = env.program(env.compile(result), functions={
+        "pathChanged": lambda path: celpy.celtypes.BoolType(True),
+    })
+    assert program.evaluate({
+        "source_branch": celpy.celtypes.StringType("feature"),
+        "target_branch": celpy.celtypes.StringType("stable"),
+        "event": celpy.celtypes.StringType("pull_request"),
+        "body": celpy.json_to_cel({"pull_request": {"labels": [{"name": "kfbuild-all"}]}}),
+    })
+
+@pytest.mark.parametrize("labels_str,labels", [
+    ("", []),
+    (None, []),
+    ("[]", []),
+    (" [ kfbuild-all, , kfbuild-image ] ", ["kfbuild-all", "kfbuild-image"]),
+    ("[kfbuild-all, kfbuild-workbench, kfbuild-cpu, kfbuild-datascience]",
+     ["kfbuild-all", "kfbuild-workbench", "kfbuild-cpu", "kfbuild-datascience"]),
+])
+def test_stable_pr_label_annotation(labels_str, labels):
+    result = release_push_to_main_pr_cel(
+        'event == "push" && "src/**".pathChanged()', labels_str=labels_str,
+    )
+    if labels:
+        quoted = ", ".join(f'"{label}"' for label in labels)
+        assert f"l.name in [{quoted}]" in result
+    else:
+        assert "body.pull_request.labels" not in result
+
+
+def test_stable_pr_custom_path_glob():
+    result = release_push_to_main_pr_cel(
+        'event == "push" && target_branch == "rhoai-3.5-ea.2"'
+        ' && ("helm/rhai-on-openshift-chart/**".pathChanged()'
+        ' || ".tekton/chart-push.yaml".pathChanged())',
+        "chart-pull-request.yaml",
+    )
+    assert '"helm/rhai-on-openshift-chart/**".pathChanged()' in result
+    assert '".tekton/chart-pull-request.yaml".pathChanged()' in result
+    assert "target_branch" not in result
+
+
+def test_stable_pr_pathless_guard_is_preserved():
+    assert release_push_to_main_pr_cel('event == "push" && !skip_build') == (
+        'event == "pull_request"\n&& ! skip_build'
+    )

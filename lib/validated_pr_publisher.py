@@ -109,6 +109,69 @@ def verify(root, request, run=command):
     return root
 
 
+def pr_inventory(root, repository, base, run, *, head=None):
+    """Yield verified connection pages; absence is valid only after completion.
+
+    Open inventory must not be head-filtered: markers on other heads still
+    participate in lifecycle conflict detection. History is a separate exact-head
+    query, used only for create-or-report disposition checks.
+    """
+    owner, name = repository.split("/")
+    head_variable = ", $head: String!" if head is not None else ""
+    filters = ", headRefName: $head" if head is not None else ", states: [OPEN]"
+    query = (
+        "query($owner: String!, $name: String!, $base: String!, $after: String" + head_variable + ") {"
+        " repository(owner: $owner, name: $name) {"
+        " pullRequests(first: 100, after: $after, baseRefName: $base" + filters + ","
+        " orderBy: {field: CREATED_AT, direction: ASC}) {"
+        " nodes {number url state headRefName baseRefName body}"
+        " pageInfo {hasNextPage endCursor} } } }"
+    )
+    cursor, cursors, numbers = None, set(), set()
+    while True:
+        args = ["gh", "api", "graphql", "-f", "query=" + query,
+                "-f", "owner=" + owner, "-f", "name=" + name, "-f", "base=" + base]
+        if head is not None:
+            args += ["-f", "head=" + head]
+        if cursor is not None:
+            args += ["-f", "after=" + cursor]
+        payload = json.loads(run(args, root))
+        if not isinstance(payload, dict) or payload.get("errors"):
+            raise ValueError("PR inventory API errors")
+        data = payload.get("data")
+        repo = data.get("repository") if isinstance(data, dict) else None
+        connection = repo.get("pullRequests") if isinstance(repo, dict) else None
+        if not isinstance(connection, dict):
+            raise ValueError("missing PR inventory connection")
+        nodes, page = connection.get("nodes"), connection.get("pageInfo")
+        if (not isinstance(nodes, list) or len(nodes) > 100 or not isinstance(page, dict)
+                or type(page.get("hasNextPage")) is not bool
+                or "endCursor" not in page
+                or (page["endCursor"] is not None and (not isinstance(page["endCursor"], str) or not page["endCursor"]))):
+            raise ValueError("malformed PR inventory page")
+        next_cursor = page["endCursor"]
+        if ((nodes and (not next_cursor or next_cursor in cursors))
+                or (not nodes and (cursor is not None or page["hasNextPage"] or next_cursor is not None))):
+            raise ValueError("PR inventory pagination did not advance")
+        for pr in nodes:
+            if (not isinstance(pr, dict) or type(pr.get("number")) is not int or pr["number"] <= 0
+                    or pr["number"] in numbers or pr.get("baseRefName") != base
+                    or pr.get("state") not in ("OPEN", "CLOSED", "MERGED")
+                    or (head is None and pr["state"] != "OPEN")
+                    or not isinstance(pr.get("headRefName"), str) or not pr["headRefName"]
+                    or (head is not None and pr["headRefName"] != head)
+                    or not isinstance(pr.get("url"), str) or not pr["url"]
+                    or "body" not in pr or (pr["body"] is not None and not isinstance(pr["body"], str))):
+                raise ValueError("malformed or inconsistent PR inventory node")
+            numbers.add(pr["number"])
+        # Validate the entire page before exposing any of its rows.
+        yield from nodes
+        if not page["hasNextPage"]:
+            return
+        cursors.add(next_cursor)
+        cursor = next_cursor
+
+
 def publish(root, request, run=command):
     """Publish exact checked bytes with explicit PR lifecycle and no force-push."""
     root = verify(root, request, run)
@@ -120,18 +183,14 @@ def publish(root, request, run=command):
     remote = git("ls-remote", "--heads", "origin", base_ref).split()
     if not remote or remote[0] != request["base_oid"]:
         raise ValueError("remote base advanced; prepare again")
-    prs = json.loads(run(["gh", "pr", "list", "--repo", repo, "--base", base,
-                          "--state", "all", "--limit", "1000", "--json",
-                          "number,url,state,headRefName,body"], root))
-    if len(prs) >= 1000:
-        raise ValueError("PR inventory may be truncated")
+    prs = list(pr_inventory(root, repo, base, run))
     matching = [pr for pr in prs if pr["state"] == "OPEN" and
                 (pr["headRefName"] == head or request["marker"] in (pr.get("body") or ""))]
     if len(matching) > 1:
         raise ValueError("multiple matching PRs require review")
     if matching and request["lifecycle"] == "create-or-report":
         return {"status": "existing-pr", "url": matching[0]["url"]}
-    if request["lifecycle"] == "create-or-report" and any(pr["headRefName"] == head for pr in prs):
+    if request["lifecycle"] == "create-or-report" and next(pr_inventory(root, repo, base, run, head=head), None) is not None:
         raise ValueError("prior PR on publication branch requires disposition")
     if matching and matching[0]["headRefName"] != head:
         raise ValueError("cannot update a different policy branch")
@@ -147,7 +206,7 @@ def publish(root, request, run=command):
             raise ValueError("branch lacks generated commit marker")
     # Recheck after remote reads and immediately before staging the exact paths.
     verify(root, request, run)
-    git("add", "--", *(c["path"] for c in request["changes"]))
+    git("add", "-f", "--", *(c["path"] for c in request["changes"]))
     raw = git("diff", "--cached", "--no-renames", "--name-status", "-z")
     fields = raw.rstrip("\0").split("\0")
     if sorted(zip(fields[::2], fields[1::2])) != sorted((c["status"], c["path"]) for c in request["changes"]):

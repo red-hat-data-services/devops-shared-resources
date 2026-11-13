@@ -37,6 +37,13 @@ The tool uses an Ansible-style approach: templates are valid YAML with Jinja2 ex
 - **Validate** (`default`): transforms are skipped, filters check raw values, errors collected
 - **Fix** (`--fix`): transforms run, then filters validate the result, corrected files written
 
+## Generated children
+
+Templates can opt into creating missing child PipelineRuns and reconciling them
+from read-only working-tree parents using `generate`. See
+[generated-child and release PR maintenance](release-pr-maintenance.md).
+Existing template configurations remain unchanged.
+
 ## Template Sets
 
 Template sets live under `tekton-templates/`, each in its own subdirectory with a `config.yaml`:
@@ -166,6 +173,24 @@ For params and steps (lists keyed by `name`), merge is by name. For `taskRunSpec
 
 When `inherit_params: true` is set in the config, all parent params not explicitly declared in the template are automatically inherited. Semantically identical values with different formatting are preserved as-is (no cosmetic normalization).
 
+## Optional per-file selection
+
+Configs may declare `selection_template: selection.json.j2` and a list of fixed
+repository-relative `context_paths`. The ordinary validator/fixer uses this
+Jinja sidecar before rendering a file. It must emit exactly
+`{"status":"applicable|skipped|manual|unresolved","reason":"..."}`; only
+`applicable` files are rendered/fixed. Other statuses are reported with their
+reason. Existing configs without selection retain their current behavior.
+
+The sidecar receives ordinary template variables and detached
+`context = {branch, documents}`. Each declared context path maps to parsed YAML
+or `None`. It can use the generic `unique_item` filter for duplicate-safe keyed
+lookup and `fail(message)` for explicit errors. Context cannot be overwritten
+by `--var`. See [strict reconciliation](../tekton-reconciliation.md) for JSON
+limits, read-only context/provenance, optional post-merge guards and strict
+localized output. The standalone CLI keeps its existing whole-document writer;
+strict reconciliation invokes the same fix engine with a different writer profile.
+
 ## Config File
 
 The config file (`config.yaml`) declares templates, pipeline matchers, parent-child relationships, and optional settings for cross-branch parenting and directory layout.
@@ -240,7 +265,7 @@ Defined in `lib/tekton_matchers.py` with `@parent_matcher`. Each receives `(pare
 
 ## Template Overlays
 
-Overlays let specific components override individual template fields while inheriting the rest from the base template. Stored under `{config-dir}/{component-prefix}/{template-file}`. Deep-merged onto the base template before rendering.
+Overlays override individual template fields while inheriting the base template. Selection precedence is component label, component prefix, then explicitly configured directory mapping. Generation, validation and fix share this selection for flat and nested layouts. The selected overlay is deep-merged onto the base template before rendering, and all selectors are checked for traversal and symlink escapes.
 
 ## Filters
 
@@ -264,7 +289,9 @@ Filters are defined in `lib/tekton_filters.py`. Mark a function with `@jinja_fil
 | `validate_cel(branch, filename)` | CEL must reference branch and filename; auto-fixes wrong branch |
 | `validate_cel_tekton_ignore` | Replaces bad `!".tekton/**".pathChanged()` with `files.all.exists(...)` |
 | `to_pr_cel` | Replaces `event == "push"` with `event == "pull_request"` |
-| `to_stable_pr_cel(filename, labels_str)` | Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
+| `ensure_cel_selectors(desired)` | Reconciles explicitly named string-equality selectors to template-supplied values; `ABSENT` removes a selector. Preserves compliant text, unrelated guards, and paths. Template comparison reports drift in validation and writes the desired expression in fix mode. |
+| `ensure_cel_tekton_filename(filename)` | Declares the desired filename for literal `.tekton/*.yaml` or `.yml` receivers of zero-argument `pathChanged()` calls. Template comparison validates or autofixes drift. Compliant references and unrelated text stay byte-identical. |
+| `release_push_to_main_pr_cel(filename, labels_str)` | Legacy compatibility filter (also available as `to_stable_pr_cel`). Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
 
 ### Validation Filters
 
@@ -316,15 +343,31 @@ validate-tekton [OPTIONS]
 
 ## CEL Expression Parsing
 
-The `lib/cel.py` module uses [cel-python](https://github.com/cloud-custodian/cel-python) (Lark-based parser) to parse CEL expressions into ASTs for structural transformation.
+`ensure_cel_selectors(desired)` declares selector state, for example
+`_parent | ensure_cel_selectors({'event': 'pull_request', 'target_branch': ABSENT})`.
+String values add or replace selectors; `ABSENT` requests removal, not CEL null.
+Unrelated guards and paths are retained. A compliant expression is returned
+unchanged. Equality operands may be reversed or parenthesized; identical
+duplicates are normalized. Conflicting values, non-equality predicates, and
+selected identifiers embedded in ORs are rejected rather than weakened.
+Added selectors guard the whole expression, including any unrelated OR.
 
-Key functions:
+The filter constructs expected CEL without diagnosing a valid parent as wrong.
+Normal template comparison validates the child annotation or autofixes it.
+The helper contains no cluster names or repository-specific policy.
 
-- `decompose_push_cel(expr)` — splits a push CEL into event, branch, negative guards, and path conditions
-- `replace_tekton_filename(tree, filename)` — swaps `.tekton/*.yaml` string literals in pathChanged calls
-- `build_stable_pr_cel(path_conditions, negative_guards, labels, target_branch)` — assembles a PR CEL expression
 
-This powers the `to_stable_pr_cel` filter, which converts push pipeline CEL triggers into PR pipeline CEL triggers.
+Templates explicitly supply desired event, branch, or routing values, then use
+`ensure_cel_tekton_filename(filename)` separately. Both filters construct expected
+child values; normal template comparison supplies validation and autofix.
+Filename reconciliation never changes selector policy. Repository-specific bypass arms must be composed
+before applying their mandatory outer routing selector.
+
+The notebooks overlay in `tekton-templates/kc-migration/notebooks/pull-request.yaml.j2` owns the main-to-stable sync policy: it bypasses normal image paths only when `manifests/rhoai/base/params-latest.env` changes. It explicitly replaces the inherited, canonically rendered `!pathChanged(params)` veto with `files.all.exists(...)`, so mixed source-and-params changes build normally while ordinary params-only PRs do not. Release push files are not changed.
+
+`release_push_to_main_pr_cel` and its alias `to_stable_pr_cel` remain legacy compatibility entry points with their existing label and automatic notebooks bypass behavior. New templates do not call them.
+
+`lib/cel.py` owns structural parsing with [cel-python](https://github.com/cloud-custodian/cel-python): `extract_push_conditions` returns negative guards and the path subtree without choosing PR trigger arms. It also provides `flatten_and`, `replace_tekton_filename`, and `path_conditions_to_text`. Trigger policy tests live in `tests/test_tekton_filters.py`; parsing and AST utility tests live in `tests/test_cel.py`.
 
 ## File Layout
 
@@ -359,3 +402,21 @@ docs/
   validate-tekton/
     validate-tekton.md         # This file
 ```
+
+### Explicit directory overlays
+
+Configure source scopes explicitly; repository names do not select overlays:
+
+```yaml
+template_overlays:
+  - pipeline_dir: pipelineruns/notebooks
+    template_dir: notebooks
+```
+
+`pipeline_dir` is a normalized repository-root-relative directory scope (matched
+on directory boundaries); `template_dir` is relative to the configuration root
+and may have an unrelated name. Source scopes must not overlap. Template roots
+must exist and must not traverse symlinks. Absolute paths and traversal are
+rejected. Selection precedence is component label, component prefix, directory
+mapping, then base template. Without mappings only component overlays apply.
+The same mapping is used for generation, validation and fix.

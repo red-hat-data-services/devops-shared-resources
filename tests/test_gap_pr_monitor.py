@@ -41,6 +41,7 @@ from scripts.gap_pr_monitor import (
     post_leader_conclusion,
     publish_state,
     record_child_head_shas,
+    render_leader_body_omit_ignored,
     resolve_inputs_for_cli,
     resolve_leader_pr_url_input,
     resolve_leader_repo,
@@ -53,6 +54,7 @@ from scripts.gap_pr_monitor import (
     should_defer_child_success_status,
     should_run_schedule_mode,
     split_labels_csv,
+    sync_leader_body_omit_ignored,
     state_path_for_output,
     state_path_for_trigger,
     status_decision_for_post,
@@ -117,6 +119,11 @@ def _fake_child_monitor(
         )
 
     monkeypatch.setattr("scripts.gap_pr_monitor.run_monitor", fake_run)
+    # Coordinator always syncs Leader body after publish; stub network for unit tests.
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.sync_leader_body_omit_ignored",
+        lambda *a, **k: False,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -3597,3 +3604,215 @@ def test_run_monitor_greens_children_when_overall_already_success(
     result = run_monitor(path, updater_factory=factory, gh_runner=lambda *_: "")
     assert result.overall_status == "success"
     assert holder["u"].posts[0][:2] == (only, "success")
+
+
+def test_render_leader_body_omit_ignored_drops_ignored_keeps_existing_status() -> None:
+    """Only drop ignored links; never rewrite remaining (`new`) from state success."""
+    body = (
+        "## Gated Artifacts Promoter leader\n\n"
+        "- Trigger ID: `gap-test`\n"
+        "- State file: `GAP Leaders/2026-11-12_gap-test/state.json`\n\n"
+        "### Child PRs\n\n"
+        "- [keep](https://github.com/org/keep/pull/1) (`new`)\n"
+        "- [drop](https://github.com/org/drop/pull/2) (`new`)\n"
+    )
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "keep",
+                "pr-url": "https://github.com/org/keep/pull/1",
+                "pr-status": "success",
+                "ignore": False,
+                "builds": [],
+            },
+            {
+                "repo": "drop",
+                "pr-url": "https://github.com/org/drop/pull/2",
+                "pr-status": "build-failure",
+                "ignore": True,
+                "builds": [],
+            },
+        ]
+    }
+    rendered = render_leader_body_omit_ignored(body, payload)
+    assert "### Child PRs" in rendered
+    assert "- [keep](https://github.com/org/keep/pull/1) (`new`)" in rendered
+    assert "drop" not in rendered
+    assert "success" not in rendered
+    assert "Trigger ID: `gap-test`" in rendered
+
+
+def test_render_leader_body_omit_ignored_all_ignored_leaves_empty_section() -> None:
+    body = "## Leader\n\n### Child PRs\n\n- [a](https://github.com/org/a/pull/1) (`new`)\n"
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "a",
+                "pr-url": "https://github.com/org/a/pull/1",
+                "pr-status": "new",
+                "ignore": True,
+                "builds": [],
+            }
+        ]
+    }
+    rendered = render_leader_body_omit_ignored(body, payload)
+    assert "### Child PRs" in rendered
+    assert "github.com/org/a" not in rendered
+    assert "(`new`)" not in rendered
+
+
+def test_sync_leader_body_omit_ignored_edits_when_changed() -> None:
+    calls: list[list[str]] = []
+    body = (
+        "## Leader\n\n### Child PRs\n\n"
+        "- [keep](https://github.com/org/keep/pull/1) (`new`)\n"
+        "- [drop](https://github.com/org/drop/pull/2) (`new`)\n"
+    )
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "keep",
+                "pr-url": "https://github.com/org/keep/pull/1",
+                "pr-status": "success",
+                "ignore": False,
+                "builds": [],
+            },
+            {
+                "repo": "drop",
+                "pr-url": "https://github.com/org/drop/pull/2",
+                "pr-status": "build-failure",
+                "ignore": True,
+                "builds": [],
+            },
+        ]
+    }
+
+    def gh(args: list[str]) -> str:
+        calls.append(list(args))
+        if args[:2] == ["pr", "view"]:
+            return body
+        if args[:2] == ["pr", "edit"]:
+            return ""
+        raise AssertionError(args)
+
+    assert sync_leader_body_omit_ignored(
+        "https://github.com/org/gap/pull/9",
+        payload,
+        gh_runner=gh,
+    ) is True
+    assert any(c[:2] == ["pr", "edit"] for c in calls)
+    edit = next(c for c in calls if c[:2] == ["pr", "edit"])
+    edited_body = edit[edit.index("--body") + 1]
+    assert "- [keep](https://github.com/org/keep/pull/1) (`new`)" in edited_body
+    assert "drop" not in edited_body
+    assert "success" not in edited_body
+
+
+def test_sync_leader_body_omit_ignored_noop_when_already_trimmed() -> None:
+    body = (
+        "## Leader\n\n### Child PRs\n\n"
+        "- [keep](https://github.com/org/keep/pull/1) (`new`)\n"
+    )
+    payload = {
+        "pull-requests": [
+            {
+                "repo": "keep",
+                "pr-url": "https://github.com/org/keep/pull/1",
+                "pr-status": "success",
+                "ignore": False,
+                "builds": [],
+            },
+            {
+                "repo": "drop",
+                "pr-url": "https://github.com/org/drop/pull/2",
+                "pr-status": "build-failure",
+                "ignore": True,
+                "builds": [],
+            },
+        ]
+    }
+    calls: list[list[str]] = []
+
+    def gh(args: list[str]) -> str:
+        calls.append(list(args))
+        if args[:2] == ["pr", "view"]:
+            return body
+        raise AssertionError(f"unexpected gh call: {args}")
+
+    assert sync_leader_body_omit_ignored(
+        "https://github.com/org/gap/pull/9",
+        payload,
+        gh_runner=gh,
+    ) is False
+    assert all(c[:2] != ["pr", "edit"] for c in calls)
+
+
+def test_coordinator_syncs_leader_body_before_early_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "state.json"
+    keep = "https://github.com/rhoai-rhtap/kserve-branch/pull/15"
+    drop = "https://github.com/rhoai-rhtap/kubeflow/pull/85"
+    save_state(
+        path,
+        {
+            "pull-requests": [
+                {
+                    "repo": "kserve-branch",
+                    "pr-url": keep,
+                    "pr-status": "new",
+                    "ignore": False,
+                    "builds": [],
+                },
+                {
+                    "repo": "kubeflow",
+                    "pr-url": drop,
+                    "pr-status": "build-failure",
+                    "ignore": True,
+                    "builds": [],
+                },
+            ]
+        },
+    )
+    order: list[str] = []
+
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.publish_state",
+        lambda *a, **k: (
+            order.append("publish")
+            or PublishResult(sha="published-sha-abc", committed=True)
+        ),
+    )
+
+    def fake_sync(*a, **k):
+        order.append("body_sync")
+        return True
+
+    monkeypatch.setattr("scripts.gap_pr_monitor.sync_leader_body_omit_ignored", fake_sync)
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor.post_early_gate_trigger_comment",
+        lambda *a, **k: (order.append("eg_comment") or True),
+    )
+    monkeypatch.setattr(
+        "scripts.gap_pr_monitor._post_leader_failure_summary",
+        lambda **kwargs: None,
+    )
+    _fake_child_monitor(
+        monkeypatch,
+        statuses={keep: "success", drop: "build-failure"},
+        overall="early-gate-triggered",
+    )
+    # _fake_child_monitor stubs body sync; restore the ordering probe.
+    monkeypatch.setattr("scripts.gap_pr_monitor.sync_leader_body_omit_ignored", fake_sync)
+
+    result = run_monitor_publish_and_signal(
+        path,
+        repo_root=tmp_path,
+        head_ref="leader-branch",
+        leader_pr_url="https://github.com/org/gap/pull/9",
+        publish=True,
+        updater_factory=lambda **kw: FakeUpdater(**kw),
+    )
+    assert result.early_gate_comment_posted is True
+    assert order == ["publish", "body_sync", "eg_comment"]

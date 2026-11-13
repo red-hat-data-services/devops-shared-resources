@@ -333,6 +333,7 @@ def test_coordinator_only_invokes_after_publish_and_preserves_gate_result(tmp_pa
     monitor.save_state(path, payload)
     child = monitor.MonitorResult(path, [], [], [], [], False, overall_status="pending", notification_urls=(PR,))
     monkeypatch.setattr(monitor, "run_monitor", lambda *a, **kw: child)
+    monkeypatch.setattr(monitor, "sync_leader_body_omit_ignored", lambda *a, **k: False)
     order = []
     summaries = []
     def summary(**kw):

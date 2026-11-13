@@ -152,6 +152,7 @@ def test_hook_after_publish_and_applicable_signal(tmp_path, monkeypatch, signal,
     accepted = (payload['pull-requests'][0]['pr-url'],)
     result = monitor.MonitorResult(path, [], [], [], [], False, notification_urls=accepted)
     monkeypatch.setattr(monitor, 'run_monitor', lambda *a, **kw: result)
+    monkeypatch.setattr(monitor, 'sync_leader_body_omit_ignored', lambda *a, **k: False)
     order = []
     signal_shas = []
     published_path = tmp_path / 'GAP History/unsuccessful/fixture/state.json' if relocated else path

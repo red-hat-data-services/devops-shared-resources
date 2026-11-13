@@ -203,6 +203,22 @@ def test_component_prefix_no_match():
     assert extract_component_prefix("random-file.yaml") is None
 
 
+@pytest.mark.parametrize("placeholder", ["{{target_branch}}", "{{ target_branch }}"])
+@pytest.mark.parametrize("with_metadata", [False, True])
+def test_component_prefix_legacy_target_branch_placeholder(placeholder, with_metadata):
+    """Strip only the exact terminal release placeholder in legacy PR identities."""
+    name = f"odh-llm-d-kv-cache-{placeholder}-on-pull-request-43048"
+    data = {"metadata": {"name": name}} if with_metadata else None
+    assert extract_component_prefix(name + ".yaml", data) == "odh-llm-d-kv-cache"
+
+
+@pytest.mark.parametrize("placeholder", ["{{source_branch}}", "{{target_branch}}-extra"])
+def test_component_prefix_preserves_other_placeholders(placeholder):
+    """Do not broaden matching by stripping arbitrary template fragments."""
+    name = f"widget-{placeholder}-on-pull-request-123"
+    assert extract_component_prefix("", {"metadata": {"name": name}}) == f"widget-{placeholder}"
+
+
 # --- get_param ---
 
 
@@ -764,8 +780,8 @@ def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, so
     assert set(parents["push"]) == {"odh-operator"}
     parent = parents["push"]["odh-operator"]
     assert parent["metadata"]["name"] == "odh-operator-v3-6-on-push"
-    from lib.tekton_filters import to_stable_pr_cel
-    assert to_stable_pr_cel(
+    from lib.tekton_filters import release_push_to_main_pr_cel
+    assert release_push_to_main_pr_cel(
         parent["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"],
         "odh-operator-pull-request.yaml",
     ) == 'event == "pull_request"\n&& "src/**".pathChanged()'
@@ -863,7 +879,7 @@ def test_pr_with_push_cel_is_not_misclassified_and_revalidated_as_push(tmp_path,
         assert fixed["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"] == 'event == "pull_request"'
         assert after[filename]["errors"] == []
     else:
-        assert any("cannot decompose push CEL" in error for error in after[filename]["errors"])
+        assert any("cannot reconcile CEL selectors" in error for error in after[filename]["errors"])
 
 
 def test_render_pr_reports_absent_annotations():

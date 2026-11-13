@@ -25,6 +25,14 @@ def enable_exclusive_history(monkeypatch):
     monkeypatch.setenv("GAP_MOVE_FINAL_STATE", "true")
 
 
+@pytest.fixture(autouse=True)
+def stub_leader_body_sync(monkeypatch):
+    """Coordinator body sync needs live gh; unit tests cover it separately."""
+    monkeypatch.setattr(
+        monitor, "sync_leader_body_omit_ignored", lambda *a, **k: False
+    )
+
+
 def payload(status="build-pending"):
     return {
         "pull-requests": [{

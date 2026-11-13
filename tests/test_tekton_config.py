@@ -215,3 +215,47 @@ class TestLoadConfig:
 
         with pytest.raises(ValueError, match="must have 'name', 'file', and 'match_fn'"):
             load_config(str(tmp_path))
+
+
+@pytest.fixture
+def directory_overlay_config(tmp_path):
+    (tmp_path / "overlay").mkdir()
+    (tmp_path / "base.yaml.j2").write_text("kind: PipelineRun\n")
+    base = (
+        "templates:\n  - name: all\n    file: base.yaml.j2\n"
+        "    match_fn: is_pipeline_run\n"
+    )
+    def configure(mapping):
+        (tmp_path / "config.yaml").write_text(base + "template_overlays: " + mapping + "\n")
+        return load_config(str(tmp_path))
+    return configure
+
+
+def test_directory_overlay_mapping_loads(directory_overlay_config):
+    config = directory_overlay_config("[{pipeline_dir: sources/project, template_dir: overlay}]")
+    assert config.template_overlays == ({"pipeline_dir": "sources/project", "template_dir": "overlay"},)
+
+
+@pytest.mark.parametrize("mapping", [
+    "null", "{}", "[{}]", "[{pipeline_dir: src, template_dir: overlay, extra: x}]",
+    "[{pipeline_dir: /src, template_dir: overlay}]",
+    "[{pipeline_dir: src/../other, template_dir: overlay}]",
+    "[{pipeline_dir: src//other, template_dir: overlay}]",
+    "[{pipeline_dir: src, template_dir: missing}]",
+    "[{pipeline_dir: src, template_dir: overlay}, {pipeline_dir: src/child, template_dir: overlay}]",
+    "[{pipeline_dir: src, template_dir: overlay}, {pipeline_dir: src, template_dir: overlay}]",
+    "[{pipeline_dir: 42, template_dir: overlay}]",
+    "[{pipeline_dir: src, template_dir: /overlay}]",
+    "[{pipeline_dir: src, template_dir: ../overlay}]",
+    "[{pipeline_dir: src, template_dir: 'nested\\overlay'}]",
+    "[{pipeline_dir: '.', template_dir: overlay}]",
+])
+def test_invalid_directory_overlay_mapping(directory_overlay_config, mapping):
+    with pytest.raises(ValueError, match="template_overlays"):
+        directory_overlay_config(mapping)
+
+
+def test_directory_overlay_mapping_symlink_rejected(tmp_path, directory_overlay_config):
+    (tmp_path / "linked").symlink_to(tmp_path / "overlay", target_is_directory=True)
+    with pytest.raises(ValueError, match="template_overlays.*non-symlink"):
+        directory_overlay_config("[{pipeline_dir: sources/project, template_dir: linked}]")

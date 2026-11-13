@@ -1,22 +1,11 @@
-"""CEL expression parsing, decomposition, and transformation for Tekton PipelineRuns.
+"""CEL parsing, condition extraction, and AST utilities for Tekton filters."""
 
-Uses cel-python (cloud-custodian) to parse CEL expressions into Lark ASTs,
-decompose them into structural components, and reassemble them into new forms.
-
-The primary use case is transforming push pipeline CEL triggers into
-consolidated pull-request CEL triggers with label and stable-branch arms.
-"""
-
-import copy
+import ast as python_ast
 import re
 
 import celpy
 from celpy.celparser import tree_dump
 from lark import Token, Tree
-
-
-def _cel_env():
-    return celpy.Environment()
 
 
 def flatten_and(node):
@@ -40,89 +29,173 @@ def flatten_and(node):
     return [node]
 
 
-def classify_clause(clause_text):
-    """Classify a single top-level && clause by its content.
+def ensure_cel_selectors(expression, desired):
+    """Reconcile named string selectors; None requests their absence.
 
-    Returns one of:
-        "event"    — e.g. ``event == "push"``
-        "branch"   — e.g. ``target_branch == "rhoai-3.6"``
-        "negative" — e.g. ``!("manifests/...".pathChanged())``
-        "paths"    — everything else (path conditions, files.all.exists, etc.)
+    Only standalone equality conjuncts can be changed. A valid, compliant
+    expression is returned verbatim. Unknown predicate shapes are never
+    weakened. Callers supply policy; this function knows no event or cluster.
     """
-    stripped = clause_text.strip()
-    if stripped.startswith("event"):
-        return "event"
-    if stripped.startswith("target_branch"):
-        return "branch"
-    # Negative guards: !(...) or !files.all.all(...)
-    if stripped.startswith("!") or stripped.startswith("! "):
-        return "negative"
-    return "paths"
+    import json
 
-
-def decompose_push_cel(cel_expr):
-    """Parse a push CEL expression and decompose into structural parts.
-
-    Args:
-        cel_expr: A push pipeline's on-cel-expression string.
-
-    Returns:
-        dict with keys:
-            event: str — the event clause text (e.g. ``event ==  "push"``)
-            branch: str — the branch clause text
-            negative_guards: list[str] — negative guard clause texts
-            path_conditions: str | None — the optional path condition clause text
-            path_conditions_tree: lark.Tree | None — the optional path conditions AST
-
-    Raises:
-        ValueError: If the CEL cannot be parsed or has unexpected structure.
-    """
-    env = _cel_env()
+    if not isinstance(desired, dict) or any(
+        not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name)
+        or (value is not None and not isinstance(value, str))
+        for name, value in desired.items()
+    ):
+        raise ValueError("selectors must map simple CEL identifiers to strings or absence")
     try:
-        ast = env.compile(cel_expr)
+        tree = celpy.Environment().compile(expression)
+    except Exception as exc:
+        raise ValueError(f"failed to parse CEL expression: {exc}") from exc
+
+    def unwrap(node):
+        while isinstance(node, Tree) and len(node.children) == 1 and isinstance(node.children[0], Tree):
+            node = node.children[0]
+        return node
+
+    def conjuncts(node):
+        original = node
+        node = unwrap(node)
+        if isinstance(node, Tree) and node.data == "conditionaland":
+            return [part for child in node.children for part in conjuncts(child)]
+        return [original]
+
+    def grouped(node):
+        while isinstance(node, Tree) and len(node.children) == 1 and isinstance(node.children[0], Tree):
+            if node.data == "paren_expr":
+                return True
+            node = node.children[0]
+        return False
+
+    kept, found = [], {}
+    for clause in conjuncts(tree):
+        references = [ident for ident in clause.find_data("ident") if str(ident.children[0]) in desired]
+        if not references:
+            node = unwrap(clause)
+            text = path_conditions_to_text(clause)
+            if node.data == "conditionalor" and len(node.children) > 1 and not grouped(clause):
+                text = f"({text})"
+            kept.append(text)
+            continue
+        node = unwrap(clause)
+        if node.data == "relation" and len(node.children) == 2 and node.children[0].data == "relation_eq":
+            left, right = unwrap(node.children[0]), unwrap(node.children[1])
+            if right.data == "ident":
+                left, right = right, left
+            if (left.data == "ident" and str(left.children[0]) in desired
+                    and right.data == "literal" and len(references) == 1):
+                literal = str(right.children[0])
+                if literal.startswith(('"', "'")):
+                    found.setdefault(str(left.children[0]), []).append(python_ast.literal_eval(literal))
+                    continue
+        raise ValueError("selected identifiers must be standalone string equalities")
+    for name, values in found.items():
+        if len(set(values)) != 1:
+            raise ValueError(f"conflicting values for selector {name!r}")
+    if all(found.get(name, []) == ([] if value is None else [value]) for name, value in desired.items()):
+        return expression
+    selectors = [f"{name} == {json.dumps(value)}" for name, value in desired.items() if value is not None]
+    return "\n&& ".join(selectors + kept) or "true"
+
+
+def ensure_cel_tekton_filename(expression, filename):
+    """Reconcile pathChanged YAML receivers to the desired filename.
+
+    Compliant references and all unrelated expression text stay byte-identical.
+    Template comparison supplies validation/autofix against the child value.
+    """
+    import json
+
+    if not isinstance(filename, str) or not re.fullmatch(r"[^/\\\\]+\.ya?ml", filename):
+        raise ValueError("filename must be a YAML basename")
+    try:
+        tree = celpy.Environment().compile(expression)
+    except Exception as exc:
+        raise ValueError(f"failed to parse CEL expression: {exc}") from exc
+    replacements = []
+    for call in tree.find_data("member_dot_arg"):
+        if len(call.children) != 2 or str(call.children[1]) != "pathChanged":
+            continue
+        receiver = call.children[0]
+        while isinstance(receiver, Tree) and len(receiver.children) == 1 and isinstance(receiver.children[0], Tree):
+            receiver = receiver.children[0]
+        if not isinstance(receiver, Tree) or receiver.data != "literal":
+            continue
+        token = receiver.children[0]
+        literal = str(token)
+        if not literal.startswith(('"', "'")):
+            continue
+        path = python_ast.literal_eval(literal)
+        if (isinstance(path, str) and path.startswith(".tekton/")
+                and path.endswith((".yaml", ".yml")) and path != f".tekton/{filename}"):
+            replacements.append((token.start_pos, token.end_pos, json.dumps(f".tekton/{filename}")))
+    for start, end, replacement in sorted(replacements, reverse=True):
+        expression = expression[:start] + replacement + expression[end:]
+    return expression
+
+
+def extract_push_conditions(expression):
+    """Return negative guards and the path subtree, dropping push selectors.
+
+    Returns ``(guards, path_tree)``: guards are CEL strings, while path_tree is
+    a Lark subtree (or None). Use path_conditions_to_text to render the subtree.
+    Event and target_branch selectors are not included in either result.
+
+    A trigger without guards or paths has nothing left after selector removal:
+
+    >>> extract_push_conditions('event == "push" && target_branch == "rhoai-3.6"')
+    ([], None)
+
+    Negative guards stay separate from the parenthesized path expression:
+
+    >>> guards, paths = extract_push_conditions(
+    ...     'event == "push" && target_branch == "rhoai-3.6"'
+    ...     ' && !skip_build'
+    ...     ' && ("src/**".pathChanged() || ".tekton/push.yaml".pathChanged())'
+    ... )
+    >>> guards
+    ['! skip_build']
+    >>> path_conditions_to_text(paths)
+    '("src/**".pathChanged() || ".tekton/push.yaml".pathChanged())'
+
+    Multiple path clauses are retained as a conjunction; individual clauses
+    may contain parenthesized ORs. A top-level OR cannot be safely split:
+
+    >>> extract_push_conditions('event == "push" || skip_build')
+    Traceback (most recent call last):
+        ...
+    ValueError: top-level OR expressions cannot be decomposed safely
+    """
+    try:
+        ast = celpy.Environment().compile(expression)
     except Exception as e:
         raise ValueError(f"failed to parse CEL expression: {e}") from e
 
-    # Structure: expr -> conditionalor -> conditionaland (nested)
     if not isinstance(ast, Tree) or ast.data != "expr":
         raise ValueError(f"unexpected CEL AST root: {ast.data if isinstance(ast, Tree) else type(ast)}")
-
-    cor = ast.children[0]
-    if not isinstance(cor, Tree) or cor.data != "conditionalor":
-        raise ValueError(f"expected conditionalor, got {cor.data}")
-    if len(cor.children) != 1:
+    top_level_or = ast.children[0]
+    if not isinstance(top_level_or, Tree) or top_level_or.data != "conditionalor":
+        raise ValueError(f"expected conditionalor, got {top_level_or.data}")
+    if len(top_level_or.children) != 1:
         raise ValueError("top-level OR expressions cannot be decomposed safely")
 
-    cand = cor.children[0]
-    clauses = flatten_and(cand)
-
-    result = {
-        "event": None,
-        "branch": None,
-        "negative_guards": [],
-        "path_conditions": None,
-        "path_conditions_tree": None,
-    }
-
-    for clause in clauses:
-        # Wrap clause in full expr structure for tree_dump
-        wrapped = Tree("expr", [Tree("conditionalor", [Tree("conditionaland", [clause])])])
-        text = tree_dump(wrapped)
-
-        kind = classify_clause(text)
-        if kind == "event":
-            result["event"] = text
-        elif kind == "branch":
-            result["branch"] = text
-        elif kind == "negative":
-            result["negative_guards"].append(text)
+    has_event = False
+    guards = []
+    path_tree = None
+    for clause in flatten_and(top_level_or.children[0]):
+        text = path_conditions_to_text(clause)
+        if text.startswith("event"):
+            has_event = True
+        elif text.startswith("target_branch"):
+            continue
+        elif text.startswith("!"):
+            guards.append(text)
         else:
-            result["path_conditions"] = text
-            result["path_conditions_tree"] = copy.deepcopy(clause)
-
-    if result["event"] is None:
+            path_tree = clause if path_tree is None else Tree("conditionaland", [path_tree, clause])
+    if not has_event:
         raise ValueError("CEL expression has no event clause")
-    return result
+    return guards, path_tree
 
 
 def replace_tekton_filename(tree, new_filename):
@@ -161,83 +234,3 @@ def path_conditions_to_text(tree):
     """
     wrapped = Tree("expr", [Tree("conditionalor", [Tree("conditionaland", [tree])])])
     return tree_dump(wrapped)
-
-
-def parse_label_list(labels_str):
-    """Parse a PaC on-label annotation value into a list of label names.
-
-    Args:
-        labels_str: e.g. ``"[kfbuild-all, kfbuild-dashboard]"``
-
-    Returns:
-        list[str]: e.g. ``["kfbuild-all", "kfbuild-dashboard"]``
-    """
-    if not labels_str:
-        return []
-    # Strip brackets and split on commas
-    inner = labels_str.strip().strip("[]")
-    if not inner:
-        return []
-    return [label.strip() for label in inner.split(",") if label.strip()]
-
-
-def build_stable_pr_cel(path_conditions_text, negative_guards=None, labels=None,
-                        target_branch=None, stable_sync_escape=None):
-    """Build a PR CEL expression with pathChanged conditions, optionally scoped to a branch.
-
-    Args:
-        path_conditions_text: str — CEL text for path conditions (from push pipeline),
-            or an empty string when the push trigger has no path restriction.
-        negative_guards: list[str] | None — negative guard CEL clauses.
-        labels: list[str] | None — label names for an optional label trigger arm.
-            When provided, the CEL has two arms joined by ||: labels OR paths.
-        target_branch: str | None — when set, adds a target_branch == "..." check
-            to the path conditions arm.
-        stable_sync_escape: str | None -- when set, an extra || arm that bypasses
-            the negative guards and path conditions entirely. Used for
-            main->stable sync PRs in the notebooks repo, whose bumps of
-            params-latest.env would otherwise be excluded by the negative
-            guards carried over from the push trigger.
-
-    Returns:
-        str: The complete PR CEL expression, formatted for readability.
-    """
-    # Build the path arm
-    path_parts = []
-    if target_branch:
-        path_parts.append(f'target_branch == "{target_branch}"')
-    if negative_guards:
-        path_parts.extend(negative_guards)
-    if path_conditions_text:
-        path_parts.append(path_conditions_text)
-    if not path_parts:
-        # An unrestricted path arm already permits every PR, regardless of labels.
-        return 'event == "pull_request"'
-    path_arm = "\n&& ".join(path_parts)
-
-    if labels or stable_sync_escape:
-        # Multi-arm: labels / escape hatch / paths
-        arms = []
-        if labels:
-            labels_quoted = ", ".join(f'"{l}"' for l in labels)
-            arms.append(
-                "has(body.pull_request.labels)\n"
-                f"    && body.pull_request.labels.exists(l, l.name in [{labels_quoted}])"
-            )
-        if stable_sync_escape:
-            arms.append(stable_sync_escape)
-        arms.append("\n    && ".join(path_parts))
-        arms_text = "\n  )\n  ||\n  (\n    ".join(arms)
-        cel = (
-            'event == "pull_request"\n'
-            "&& (\n"
-            f"  (\n    {arms_text}\n  )\n"
-            ")"
-        )
-    else:
-        # Single arm: paths only
-        cel = (
-            'event == "pull_request"\n'
-            f"&& {path_arm}"
-        )
-    return cel

@@ -28,6 +28,18 @@ candidate checkouts and exact-change plans are temporary and are not copied into
 reports. Reports cannot be resumed, verified or used as input to a later command.
 Do not upload temporary stage trees.
 
+In GitHub Actions, successful previews automatically append a readable section to
+`GITHUB_STEP_SUMMARY` without replacing prior content or changing stdout JSON.
+It includes operation counts, planned paths, deferred manual/unresolved counts,
+and a collapsible escaped diff. Readiness applies to the plan, not complete
+branch alignment. Escaped UTF-8 output is bounded (48 KB paths, 160 KB diff,
+220 KB per preview, 900 KB total including prior summary text); truncation is
+explicit. Download the job's report artifact and open `enforcement.patch` for
+the full unchanged patch, or `result.json` for all paths and diagnostics.
+Workflows still upload those reports; the shared command does not upload them.
+Summary failures only warn on stderr. Local runs without `GITHUB_STEP_SUMMARY`,
+inventory calls, and publication calls do not append this preview section.
+
 Only existing regular-file changes are supported. The default is modifications
 only (`--allowed-operations M`). Explicit `M,D` also permits deletions, but only
 for matched PipelineRuns with an initial template deletion signal. Deletion
@@ -79,10 +91,122 @@ worker and publisher revisions come from the actual clean shared checkout.
 `--github-output FILE` emits `status=ready|no-changes`, `base`,
 `policy_digest_short`, and a `publication_url` when available. These describe the
 completed operation, not a gate for a second command. Publication details are
-saved separately in diagnostic `publication.json`. Publication to main/master is
-rejected. Caller-provided `--allowed-branches` restricts releases further.
+saved separately in diagnostic `publication.json`.
 
-## Scan-specific policy
+Trusted config may declare `publication_branches: [main, "rhoai-*"]` to restrict
+PR bases. Entries are exact names or literal prefixes with one trailing `*`;
+the wildcard must match a **nonempty** suffix (`rhoai-` does not match).
+Other wildcard forms, empty/null/non-list policies, invalid entries and duplicates
+are rejected, never treated as absence. With a configured policy, every publishing
+invocation must also include its exact target in `--allowed-branches`; this CLI
+list remains exact comma-separated tokens, not pattern matching. Thus a matched
+family without exact caller authorization is still denied.
+
+Publication scope is checked against clean trusted config before planning (even
+for no-change publication), then again at the direct publication boundary with
+the usual config digest/provenance checks. Preview and inventory do not enforce
+publication scope. Configs without the field retain legacy behavior: main/master
+PR bases are rejected; other bases retain the existing optional exact CLI scope.
+This is configurable adapter policy, not a hard-coded KC branch family.
+
+A PR base is not a push destination: publication still requires a distinct, valid
+`automation/` head and pushes only to that head, never directly to main/master
+or the target base. Partial/error results, stale provenance, dirty sources and
+unsafe heads remain unpublishable.
+
+## Complete PR lifecycle inventory
+
+Before any staging/push/PR write, both lifecycles cursor-paginate all open PRs
+for the exact target base using the repository GraphQL connection (not search).
+There is no fixed 1,000-PR cap. Matching still considers the generated marker
+**or** the head branch name across that whole base inventory, including forks;
+multiple matches remain a review-required error.
+
+`create-or-update` never queries historical PRs. `create-or-report` first returns
+an existing open match; otherwise it queries history narrowly by exact base and
+head name, retaining closed/merged same-head disposition safeguards. Historical
+absence requires completed pagination. API errors, malformed nodes/page metadata,
+repeated/nonadvancing cursors and incomplete pagination fail closed before writes.
+This does not change automation-head safety, marker ownership, append-only update
+history, remote-base freshness or non-force push requirements.
+
+## Partial previews for malformed files
+
+Strict reconciliation profiles (template selection or legacy document policy)
+isolate individual malformed YAML files instead of losing every valid-file
+preview. The ordinary standalone validator and the legacy no-policy subprocess
+reconciliation path retain their existing fail-closed behavior and schemas.
+
+Only these exact ruamel exceptions from safe per-file parsing are isolated:
+`DuplicateKeyError`, `ParserError`, `ScannerError`, and `ReaderError`. Invalid
+UTF-8 is included. An unparseable YAML candidate is reported as an error, never
+silently classified as an unrelated resource. Valid resource-only streams and
+the existing rejection of bundled PipelineRun streams are unchanged.
+
+Each diagnostic contains `path`, `error_class`, and a fixed-category `reason`
+with location where available. Raw parser messages/source snippets are not
+copied into diagnostics. `diagnostics.errors`, `counts.error`, and file rows
+with `status: error` remain distinct from unresolved/manual eligibility cases.
+The root excluded-file classifications and byte/mode identities are immutable;
+the initial stage and every phase must match them before and after processing.
+No newly malformed file, changed error classification, repaired excluded file,
+or excluded-byte/mode change is silently absorbed during a run.
+
+With any file error, the result is **`partial`**, including when there are no
+valid-file changes or every candidate is malformed. Exit code **2** accompanies
+useful stdout JSON, `result.json`, all phase diagnostics and `enforcement.patch`.
+The preview job summary lists bounded/escaped error paths and prominently marks
+the result **PARTIAL / INCOMPLETE / NOT PUBLISHABLE**. The patch includes only
+valid-file changes and is diagnostic, not resumable publication authority.
+
+`--publish` with any partial result is blocked **before** the publisher or the
+no-change publication branch: `publication.status` is `blocked`, diagnostics
+and JSON are retained, stderr explains the block, and exit code is 2. Publish
+invocations still do not append the preview job summary. There is no flag to
+allow partial publication. Complete operations return 0; fatal failures return 1.
+
+Inventory/path/mode/symlink/source/context failures, unknown YAML tags, alias
+composition/policy failures, graph/depth/type/security budgets, memory/recursion
+errors, guard rejection and unsupported serialization remain fatal, not partial.
+This does not relax parsing, repair malformed files or authorize rollout.
+
+## Template selection and optional guards
+
+An optional `selection_template` config key names a contained Jinja sidecar.
+It renders JSON with exactly two keys: `status` (`applicable`, `skipped`,
+`manual`, or `unresolved`) and string `reason`. Results are limited to 16 KiB;
+reasons to 4096 characters. Duplicate JSON keys and extra fields are rejected.
+No selection sidecar means the existing template matchers remain authoritative.
+
+Selection uses the ordinary renderer variables plus detached `context`:
+`{"branch": branch, "documents": {path: data_or_None}}`. Declare fixed
+branch-local inputs in config `context_paths`. These paths must be unique,
+contained and disjoint from writable scope. Existing inputs must be tracked;
+they are snapshotted, mode/hash recorded in provenance, and copied into the
+stage. Context is parsed once from that initial stage and copied into each
+selection/render/guard invocation; CLI variables cannot overwrite it. Context
+bytes and the stage index are checked after every phase.
+
+The generic `unique_item(items, key, target)` filter returns a matching mapping
+or an empty mapping, rejecting duplicate target identities. The Jinja global
+`fail(message)` raises an explicit validation error. Business decisions belong
+in the sidecar, not in a framework policy callback.
+
+With selection configured, `--policy-python` may supply only
+`check(original, candidate, context)` (and optional isolated `filters`). The
+post-merge guard must return `True`; all strict candidates are guarded and
+serialized before any strict file write. Without selection configured, the
+legacy `decision`/`check` contract below remains supported. No consumer migration
+is required to adopt this shared update.
+
+Both profiles use the ordinary `validate-tekton` fix engine. Strict reconciliation
+uses a localized, fail-closed writer; the ordinary CLI default retains its legacy
+whole-document round-trip writer and anchor support. Strict reports retain the
+existing `files` list and status `counts`, including manual/unresolved counts.
+Nested strict identities are repository-relative paths, not basenames. The
+ordinary CLI output schema and flat basename identities remain unchanged.
+
+## Legacy scan-specific policy
 
 Use `--policy-python source/script/scan_resource_policy.py` with the existing
 nested-layout config. Keep M-only unless the operation's profile explicitly
@@ -100,6 +224,64 @@ report selects executable code. Context files remain read-only across all phases
 For scan PRs, use literal `--head "automation/pipelinerun-conformance/$RELEASE"`,
 marker `Conformance-Generated: true`, the existing scan-review body file, and
 `--lifecycle create-or-update`.
+
+## Existing-file comments and formatting
+
+The ordinary template merge retains existing round-trip container comments and
+styles. Strict reconciliation (selection or legacy policy) emits localized source edits
+instead of dumping the entire document. Unchanged source spans are retained,
+including unrelated multiline flow values, null spelling and line endings.
+Changed fields and list items may be inserted, removed or updated.
+
+This is not a general lossless YAML editor. A changed flow collection or a
+structurally changed collection may be emitted as one bounded subtree; formatting
+inside that subtree can change. There is no whole-document formatting fallback.
+Edits are checked for valid, nonoverlapping source spans, and the complete emitted
+document must parse to the candidate before any file is written.
+
+Changed applicable files containing anchors or aliases currently fail closed,
+even when the anchor is outside the selected field: aliases do not have distinct
+source locations. Collection type changes and flow replacements without retained
+round-trip style also fail closed. Existing duplicate-key and policy checks still
+apply. Appending after an end-of-file comment retains its text but can change its
+association with list items. Inspect the preview diff; byte-identical formatting
+or comment associations inside edited collections are not guaranteed.
+
+## Fleet Markdown report
+
+`scripts/report-tekton-run` is an offline presentation command. It reads downloaded
+per-component reconciliation artifacts and GitHub job metadata; it does not call
+GitHub, obtain credentials, execute artifact contents, validate candidates, or
+publish changes. Run it from an always-running consumer aggregation job:
+
+```bash
+uv run --no-project shared/scripts/report-tekton-run \
+  --artifacts diagnostics --jobs jobs.json \
+  --artifact-prefix plr-enforce-main- --owner red-hat-data-services \
+  --dry-run false \
+  --run-url https://github.com/red-hat-data-services/konflux-central/actions/runs/123 \
+  --output component-reconciliation-report.md --summary "$GITHUB_STEP_SUMMARY"
+```
+
+The consumer downloads artifacts without merging their directories and captures
+`gh api --paginate --slurp` output from the run's jobs endpoint (`filter=latest`).
+The report recognizes matrix job names `reconcile (REPOSITORY, REVISION)` and
+artifact directories `{artifact-prefix}{REPOSITORY}/enforcement-report/`, with
+`result.json`, optional `publication.json`, and `enforcement.patch`. Optional
+`enforcement.log` is one directory above. The prefix and repository owner are
+consumer inputs, not shared policy defaults. Jobs without reports remain visible.
+
+The appended, byte-bounded run summary lists created/existing PRs and all job
+outcomes. The full Markdown output includes planned deleted paths and expandable
+non-deletion diffs, escaped as data, plus failed steps and available error lines.
+Deleted file contents stay in the original patch rather than bloating the report.
+Only `published` outcomes confirm publication; previews and existing PRs are
+labeled separately. A failed job remains a failure even if planning succeeded.
+Candidates do not imply publication or merge; existing PR contents may differ.
+Missing or malformed result reports are not silently classified as no changes.
+Upload the Markdown as **component-reconciliation-report**, the artifact name
+linked by the summary. If the overview exceeds its display budget, the full file
+is preserved and the summary points to the artifact instead.
 
 ## Safe inventory before fleet fanout
 

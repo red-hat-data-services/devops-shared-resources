@@ -92,6 +92,7 @@ from lib.gap_pr_gates import (
     expected_builds_for_pr,
 )
 from lib.github_check_runs import CheckQueryError, github_api_json, list_check_runs
+from lib.github_cli import run_gh as execute_gh
 from lib.pr_status_updater import (
     GhCommandError,
     PRStatusUpdater,
@@ -640,6 +641,144 @@ def provisional_payload_with_updates(
     return probe
 
 
+CHILD_PRS_HEADING = "### Child PRs"
+_CHILD_PR_BULLET_RE = re.compile(
+    r"^(\s*[-*]\s+)\[([^\]]+)\]\((https?://[^)\s]+)\)(.*)$"
+)
+
+
+def ignored_child_pr_urls(payload: dict[str, Any]) -> set[str]:
+    """PR URLs from state entries with ``ignore: true``."""
+    urls: set[str] = set()
+    for entry in payload.get("pull-requests") or []:
+        if not isinstance(entry, dict) or not child_entry_ignored(entry):
+            continue
+        url = str(entry.get("pr-url") or entry.get("pr_url") or "").strip()
+        if url:
+            urls.add(url.rstrip("/"))
+    return urls
+
+
+def render_leader_body_omit_ignored(
+    body: str,
+    payload: dict[str, Any],
+) -> str:
+    """Drop ``ignore: true`` child links from the Leader body; touch nothing else.
+
+    Remaining ``### Child PRs`` bullets keep their existing status text (usually
+    ``new``). Statuses are not rewritten from ``state.json``.
+    """
+    text = body if isinstance(body, str) else ""
+    ignored = ignored_child_pr_urls(payload)
+    if not ignored or not text:
+        return text
+
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    in_child_section = False
+    changed = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith(CHILD_PRS_HEADING):
+            in_child_section = True
+            out.append(line)
+            continue
+        if in_child_section and stripped.startswith("### ") and not stripped.startswith(
+            CHILD_PRS_HEADING
+        ):
+            in_child_section = False
+        if in_child_section:
+            match = _CHILD_PR_BULLET_RE.match(line.rstrip("\n"))
+            if match:
+                url = match.group(3).rstrip("/")
+                if url in ignored:
+                    changed = True
+                    continue
+        out.append(line)
+
+    if not changed:
+        return text
+    return "".join(out)
+
+
+def fetch_leader_pr_body(
+    leader_pr_url: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> str:
+    """Return the current Leader PR body markdown."""
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    raw = run(
+        [
+            "pr",
+            "view",
+            str(ref.number),
+            "-R",
+            f"{ref.owner}/{ref.repo}",
+            "--json",
+            "body",
+            "--jq",
+            ".body",
+        ]
+    )
+    if raw is None:
+        return ""
+    text = raw if isinstance(raw, str) else str(raw)
+    # gh --jq may print a JSON null for a missing body.
+    if text.strip() in {"", "null"}:
+        return ""
+    return text
+
+
+def update_leader_pr_body(
+    leader_pr_url: str,
+    body: str,
+    *,
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> None:
+    """Replace the Leader PR body via ``gh pr edit``."""
+    if dry_run:
+        print(f"[dry-run] would update Leader PR body on {leader_pr_url}")
+        return
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    run(
+        [
+            "pr",
+            "edit",
+            str(ref.number),
+            "-R",
+            f"{ref.owner}/{ref.repo}",
+            "--body",
+            body,
+        ]
+    )
+
+
+def sync_leader_body_omit_ignored(
+    leader_pr_url: str,
+    payload: dict[str, Any],
+    *,
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> bool:
+    """Drop ``ignore: true`` child links from the Leader body; return True if edited.
+
+    Only removes those bullets from the existing PR description. Does not rewrite
+    remaining status labels. Runs before ``/early-gate``.
+    """
+    current = fetch_leader_pr_body(leader_pr_url, gh_runner=gh_runner)
+    desired = render_leader_body_omit_ignored(current, payload)
+    if desired == current or desired.rstrip() == (current or "").rstrip():
+        return False
+    update_leader_pr_body(
+        leader_pr_url, desired, dry_run=dry_run, gh_runner=gh_runner
+    )
+    return True
+
+
 def early_gate_comment_already_present(
     leader_pr_url: str,
     *,
@@ -756,20 +895,8 @@ def post_early_gate_trigger_comment(
 
 
 def _run_gh(args: Sequence[str]) -> str:
-    command = ["gh", *args]
-    try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            capture_output=True,
-            text=True,
-        )
-    except FileNotFoundError as exc:
-        raise GhCommandError(command, 127, "gh executable not found") from exc
-    if completed.returncode != 0:
-        output = (completed.stderr or completed.stdout or "").strip()
-        raise GhCommandError(command, completed.returncode, output)
-    return completed.stdout
+    """Run a GitHub CLI command using the shared transient-retry policy."""
+    return execute_gh(args)
 
 
 def fetch_pr_merge_info(
@@ -1550,10 +1677,11 @@ def run_monitor_publish_and_signal(
     git_runner: Callable[..., str] | None = None,
     notification_config=None,
 ) -> MonitorResult:
-    """Coordinator: monitor → publish state → EG comment and/or Leader green.
+    """Coordinator: monitor → publish state → body sync → EG comment / summary.
 
     Ordering (RHOAIENG-97052 / RHAI-8079 / RHAI-10942):
       evaluate children → write ``promotion-gates`` → commit/push →
+      sync Leader body so ``ignore: true`` children are omitted from ``### Child PRs`` →
       if ``component-builds`` success: comment ``/early-gate`` on the Leader once;
       if required builds failed: retain the active Leader for retry/replacement;
       always (when Leader URL known): upsert failure/pending/closed summary comment.
@@ -1605,8 +1733,6 @@ def run_monitor_publish_and_signal(
 
     result = replace(result, state_path=published.state_path or result.state_path)
 
-
-
     leader_url = (leader_pr_url or "").strip() or None
     leader_status_posted = False
     early_gate_comment_posted = False
@@ -1617,6 +1743,23 @@ def run_monitor_publish_and_signal(
     state_payload = load_state(result.state_path)
     ensure_promotion_gates(state_payload)
     migrate_legacy_overall_status(state_payload)
+
+    # Drop ignore:true child links from the Leader body before /early-gate.
+    # Do not rewrite remaining bullet status text.
+    if leader_url:
+        try:
+            sync_leader_body_omit_ignored(
+                leader_url,
+                state_payload,
+                dry_run=dry_run,
+                gh_runner=gh_runner,
+            )
+        except (GhCommandError, ValueError, RuntimeError) as exc:
+            raise GapPrMonitorError(
+                f"Failed to sync Leader PR body for ignored children on "
+                f"{leader_url}: {exc}"
+            ) from exc
+
     # /early-gate only while builds passed and EG has not finished yet.
     early_gate = should_trigger_early_gate(
         state_payload

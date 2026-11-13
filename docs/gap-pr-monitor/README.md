@@ -166,9 +166,11 @@ off via `early-gate-triggered` and the `/early-gate` comment. Existing
 `success` / `failure` in state are never overwritten.
 
 With `--publish-state`, ordering is: evaluate children → write `state.json` →
-commit/push → then, when a Leader PR URL is provided
+commit/push → sync Leader PR body → then, when a Leader PR URL is provided
 (`GAP_LEADER_PR_URL` / `--leader-pr-url`):
 
+- drop `### Child PRs` bullets whose child has `ignore: true` (other bullets and
+  their status text are left unchanged)
 - `early-gate-triggered` → comment `/early-gate` on that Leader (idempotent)
 - `success` or `failure` → post `gated artifacts promoter` = **success** on the
   **published** Leader head SHA (RHAI-8079)
