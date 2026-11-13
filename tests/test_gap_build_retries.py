@@ -8,7 +8,8 @@ import pytest
 
 from lib.gap_build_retries import BuildRetryManager, classify_failure
 from lib.gap_pr_gates import RepositoryPullRequest
-from lib.github_check_runs import ExpectedCheck
+from lib.github_check_runs import CheckQueryError, ExpectedCheck
+from lib.github_cli import GhCommandError
 from lib.konflux_builds import KonfluxClient, KonfluxQueryError, select_latest, PAC, COMPONENT as LABEL
 from lib.konflux_gate import evaluate_konflux_gate
 from lib.konflux_retry_evidence import recent_push_health, failure_details
@@ -57,6 +58,7 @@ class FakeGitHub:
         self.comments, self.posts = [], []
         self.sha, self.state = SHA, "open"
         self.fail_after_post = False
+        self.fail_check_lookup = False
 
     def __call__(self, args):
         endpoint = args[1]
@@ -72,6 +74,10 @@ class FakeGitHub:
             return json.dumps(comment)
         if "/comments" in endpoint:
             return json.dumps(self.comments)
+        if "/check-runs" in endpoint:
+            if self.fail_check_lookup:
+                raise GhCommandError(["gh", *args], 1, "HTTP 503")
+            return json.dumps({"check_runs": getattr(self, "check_runs", [])})
         assert endpoint == "repos/acme/foo/pulls/123"
         return json.dumps({"state": self.state, "head": {"sha": self.sha}})
 
@@ -199,7 +205,7 @@ def test_persistent_errors_override_timeout_and_healthy_pushes(error, reason):
     ("resource quota evaluation timed out", True, True, True),
     ("TLS handshake timeout", False, True, False),
     ("TLS handshake timeout", True, False, False),
-    ("Step exited with code 1", True, True, False),
+    ("Step exited with code 1", True, True, True),
 ])
 def test_generic_failure_requires_positive_infra_evidence_and_push_health(details, healthy, tasks, eligible):
     assert classify_failure(observe([attempt("Failed")]).to_dict(), details,
@@ -256,7 +262,7 @@ def failed_task(message="TLS handshake timeout", name="build-container", uid="ui
 
 @pytest.mark.parametrize("message,healthy,posted", [
     ("TLS handshake timeout", True, True), ("TLS handshake timeout", False, False),
-    ("go.mod requires go >= 1.25", True, False), ("Step exited 1", True, False),
+    ("go.mod requires go >= 1.25", True, False), ("Step exited 1", True, True),
 ])
 def test_full_generic_failure_path(message, healthy, posted):
     gh, client = FakeGitHub(), FakeKonflux(attempt("Failed"))
@@ -264,6 +270,50 @@ def test_full_generic_failure_path(message, healthy, posted):
     gate, receipt = apply(manager(gh, client), client)
     assert bool(gh.posts) is posted
     assert gate.outcome == ("pending" if posted else "fail")
+
+
+
+def missing_evidence(client, *, cel=True):
+    client.items = []
+    gate, evidence = evaluate(client)
+    evidence.update({
+        "expected-components": [COMPONENT],
+        "cel-evaluated": cel,
+        "required-pipelines": {
+            "pipelines": [{"component": COMPONENT, "pipeline_name": PIPELINE}],
+        },
+    })
+    return gate, evidence
+
+
+def test_expected_missing_build_is_retriggered_when_no_github_check_exists():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+    assert gh.posts[0].startswith("/retest " + PIPELINE + "\n")
+    assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert evidence["retry-history"][0]["run_uid"].startswith("missing:")
+
+
+def test_missing_build_waits_when_github_check_already_exists():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gh.check_runs = [{"head_sha": SHA, "name": PIPELINE, "status": "queued"}]
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert not gh.posts
+    assert evidence["runs"][0]["retry"]["status"] == "build-trigger-pending"
+
+
+def test_missing_build_without_cel_evidence_stays_blocked_without_retry():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client, cel=False)
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert not gh.posts
+    assert evidence["runs"][0]["retry"]["status"] == "not-retried"
 
 
 def test_task_from_another_pipeline_uid_cannot_make_failure_retriable():
@@ -636,3 +686,116 @@ def test_lost_retry_response_during_late_refresh_holds_following_siblings(tmp_pa
     saved = json.loads(path.read_text())
     assert saved["pull-requests"][0]["pr-status"] == "build-pending"
     assert monitor.compute_overall_status(saved) is None
+
+
+def test_similar_pipeline_check_does_not_suppress_missing_retry():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gh.check_runs = [{"head_sha": SHA, "name": PIPELINE + "-extra", "status": "queued"}]
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+
+
+def test_missing_retry_receipts_use_unique_ids_and_exhaust_budget():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    _, saved = manager(gh, client).apply(PR, gate, evidence)
+    assert saved["retry-history"][0]["run_uid"].endswith(":1")
+
+    gate, evidence = missing_evidence(client)
+    _, saved = manager(gh, client, saved=saved, now=NOW + timedelta(hours=2)).apply(PR, gate, evidence)
+    assert len(gh.posts) == 2
+    assert saved["retry-history"][1]["run_uid"].endswith(":2")
+
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(hours=4)).apply(PR, gate, evidence)
+    assert len(gh.posts) == 2
+    assert evidence["runs"][0]["retry"]["status"] == "retry-exhausted"
+
+
+def test_empty_runs_are_normalized_to_missing_expected_components():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    evidence["runs"] = []
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+    assert evidence["runs"][0]["status"] == "missing"
+
+
+def test_no_build_expected_does_not_trigger_retest():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = evaluate_konflux_gate(repo=REPO, number=123, sha=SHA, expected=[], client=client)
+    evidence.update({"runs": [], "expected-components": [], "cel-evaluated": True})
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert not gh.posts
+    assert gate.outcome == "pass"
+
+
+def test_multiple_missing_components_only_retrigger_the_component_without_a_check():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gh.check_runs = [{"head_sha": SHA, "name": PIPELINE, "status": "queued"}]
+    gate, evidence = missing_evidence(client)
+    second_component = "odh-bar-v3-6"
+    second_pipeline = "bar-on-pull-request"
+    second = dict(evidence["runs"][0])
+    second.update(component=second_component)
+    evidence["runs"] = [evidence["runs"][0], second]
+    evidence["expected-components"] = [COMPONENT, second_component]
+    evidence["required-pipelines"]["pipelines"].append(
+        {"component": second_component, "pipeline_name": second_pipeline}
+    )
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert len(gh.posts) == 1
+    assert gh.posts[0].startswith("/retest " + second_pipeline + "\n")
+
+
+def test_ignored_child_never_retriggers_missing_or_failed_builds():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    payload = {"pull-requests": [{"pr-url": PR.url, "ignore": True}]}
+    ignored = BuildRetryManager(gh, payload, client_factory=lambda: client, clock=lambda: NOW)
+    gate, evidence = ignored.apply(PR, gate, evidence)
+    assert not gh.posts
+
+
+def test_missing_retry_check_lookup_failure_is_recorded_as_unavailable():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    retry_manager = manager(gh, client)
+
+    def unavailable(_pr, _pipeline):
+        raise CheckQueryError("GitHub check API unavailable")
+
+    retry_manager._pipeline_check_exists = unavailable
+    gate, evidence = retry_manager.apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert not gh.posts
+    assert evidence["runs"][0]["retry"]["status"] == "retry-evidence-unavailable"
+
+
+def test_missing_retry_cli_check_lookup_failure_is_recorded_as_unavailable():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gh.fail_check_lookup = True
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert not gh.posts
+    assert evidence["runs"][0]["retry"]["status"] == "retry-evidence-unavailable"
+
+
+def test_unmatched_running_observation_cannot_make_a_passing_gate():
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = evaluate_konflux_gate(repo=REPO, number=123, sha=SHA, expected=[], client=client)
+    evidence["runs"] = [{
+        "component": COMPONENT,
+        "status": "running",
+        "reason": "PipelineRun is still running",
+        "head_sha": SHA,
+        "name": "pipeline-run",
+    }]
+    gate, evidence = manager(gh, client).apply(PR, gate, evidence)
+    assert gate.outcome == "pending"
+    assert not gh.posts
