@@ -142,6 +142,57 @@ def test_unsupported_shape_or_unpreserved_flow_style_fails_closed(source, value,
         localized_yaml(source, {"changed": value})
 
 
+@pytest.mark.parametrize("style", ["literal", "folded", "quoted", "plain-wrapped"])
+@pytest.mark.parametrize("indent", [2, 4])
+@pytest.mark.parametrize("newline", ["\n", "\r\n"])
+def test_multiline_annotation_uses_key_indent_not_scalar_column(style, indent, newline):
+    from ruamel.yaml.scalarstring import LiteralScalarString
+    key = "pipelinesascode.tekton.dev/on-cel-expression"
+    prefix = "# keep header\nmetadata:\n" + " " * indent + "annotations:\n"
+    key_prefix = " " * (2 * indent) + key + ": "
+    body_prefix = " " * (2 * indent + 2)
+    old = {"literal": "|\n" + body_prefix + 'event == "push"\n',
+           "folded": ">-\n" + body_prefix + 'event == "push"\n',
+           "quoted": "'event == \"push\"'\n",
+           "plain-wrapped": 'event == "push" &&\n' + body_prefix + 'target_branch == "release"\n'}[style]
+    suffix = " " * indent + "labels: {keep: yes} # untouched\nfooter: Null\n"
+    source = (prefix + key_prefix + old + suffix).replace("\n", newline)
+    candidate = YAML().load(source)
+    candidate["metadata"]["annotations"][key] = LiteralScalarString('event == "push"\n&& konflux_cluster == "stone-prod-p02"')
+    output = localized_yaml(source, candidate)
+    expected = (prefix + key_prefix + "|-\n" + body_prefix + 'event == "push"\n'
+                + body_prefix + '&& konflux_cluster == "stone-prod-p02"\n' + suffix).replace("\n", newline)
+    assert output == expected
+    assert YAML().load(output) == candidate
+    assert localized_yaml(output, candidate) == output
+
+
+@pytest.mark.parametrize("indent", [0, 2])
+def test_multiline_sequence_scalar_uses_dash_indent(indent):
+    from ruamel.yaml.scalarstring import LiteralScalarString
+    source = "values:\n" + " " * indent + "- old\nfooter: Null\n"
+    candidate = {"values": [LiteralScalarString("new\ntext")], "footer": None}
+    expected = ("values:\n" + " " * indent + "- |-\n"
+                + " " * (indent + 2) + "new\n" + " " * (indent + 2) + "text\nfooter: Null\n")
+    output = localized_yaml(source, candidate)
+    assert output == expected
+    assert YAML().load(output) == candidate
+    assert localized_yaml(output, candidate) == output
+
+
+@pytest.mark.parametrize("value", ["  leading spaces\ntext", "\nleading blank\ntext"])
+def test_block_scalar_explicit_indent_preserves_content(value):
+    from ruamel.yaml.scalarstring import LiteralScalarString
+    source = "metadata:\n  annotations:\n    long-annotation-name: old\nfooter: Null\n"
+    candidate = YAML().load(source)
+    candidate["metadata"]["annotations"]["long-annotation-name"] = LiteralScalarString(value)
+    output = localized_yaml(source, candidate)
+    assert "long-annotation-name: |2-\n" in output
+    assert YAML().load(output) == candidate
+    assert localized_yaml(output, candidate) == output
+    assert output.endswith("footer: Null\n")
+
+
 def test_duplicate_keys_remain_rejected():
     with pytest.raises(Exception, match="duplicate key"):
         localized_yaml("a: 1\na: 2\n", {"a": 3})
