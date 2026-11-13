@@ -20,7 +20,7 @@ _repo_root = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_repo_root))
 
 from ruamel.yaml import YAML
-from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay
+from lib.tekton import classify_pipeline, extract_component_prefix, render_and_merge, resolve_overlay, pipeline_repository
 from lib.tekton_config import load_config
 from lib.tekton_children import plan_children
 from lib.tekton_filters import DELETE_FILE_PREFIX
@@ -228,12 +228,13 @@ def _find_parent_pipeline(child_data: dict, candidate_pipelines: dict, match_fn_
     return None
 
 
-def _resolve_pipeline_overlay(config, tmpl_config, filepath, data):
+def _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout):
     """Resolve a template overlay for a pipeline file."""
     prefix = extract_component_prefix(filepath.name, data)
     label = (data.get("metadata", {}).get("labels") or {}).get(
         "appstudio.openshift.io/component")
-    return resolve_overlay(config.config_dir, tmpl_config.file, prefix, label)
+    return resolve_overlay(config.config_dir, tmpl_config.file, prefix, label,
+                           repository=pipeline_repository(filepath, layout))
 
 
 def _selection_context(tekton_dir, layout, config, branch):
@@ -342,7 +343,7 @@ def validate_tekton_dir(
 
         template_path = str(Path(config.config_dir) / tmpl_config.file)
 
-        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout)
         if overlay:
             overlay_rel = str(Path(overlay).relative_to(config.config_dir))
             info(f"  {filepath.name}: using overlay {overlay_rel}")
@@ -354,7 +355,7 @@ def validate_tekton_dir(
             parent_tmpl = config.get_template(tmpl_config.parent.template)
             if parent_tmpl:
                 check_template = str(Path(config.config_dir) / parent_tmpl.file)
-                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data)
+                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data, layout)
                 check_errors = []
                 render_and_merge(
                     str(Path(check_template).parent), Path(check_template).name,
@@ -507,7 +508,7 @@ def fix_tekton_dir(
                 post_fix_data[filepath.name] = data
                 continue
 
-            overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+            overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout)
             if overlay:
                 overlay_rel = str(Path(overlay).relative_to(config.config_dir))
                 info(f"  {filepath.name}: using overlay {overlay_rel}")
@@ -552,7 +553,7 @@ def fix_tekton_dir(
         if not tmpl_config or not tmpl_config.parent:
             continue
 
-        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout)
         if overlay:
             overlay_rel = str(Path(overlay).relative_to(config.config_dir))
             info(f"  {filepath.name}: using overlay {overlay_rel}")
@@ -562,7 +563,7 @@ def fix_tekton_dir(
         if external_parent_indexes is None:
             parent_tmpl = config.get_template(tmpl_config.parent.template)
             if parent_tmpl:
-                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data)
+                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data, layout)
                 check_errors = []
                 render_and_merge(
                     config.config_dir, parent_tmpl.file, data, filepath.name, branch,

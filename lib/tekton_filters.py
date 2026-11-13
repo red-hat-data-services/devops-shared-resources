@@ -402,6 +402,29 @@ def validate_cel_tekton_ignore(value):
     return fixed
 
 
+@jinja_filter
+def strip_release_push_selectors(value, filename=""):
+    """Remove push event/branch selectors, retaining guards and path conditions.
+
+    Rewrite .tekton YAML filenames when filename is provided. Return "true"
+    when no conditions remain. This filter adds no event or repository policy.
+    """
+    from lib.cel import extract_push_conditions, path_conditions_to_text, replace_tekton_filename
+
+    expression = str(value)
+    if not expression.strip():
+        raise ValidationError("push CEL expression is empty")
+    try:
+        guards, paths = extract_push_conditions(expression)
+    except ValueError as e:
+        raise ValidationError(f"cannot decompose push CEL: {e}") from e
+    if paths is not None:
+        if filename:
+            replace_tekton_filename(paths, filename)
+        guards.append(path_conditions_to_text(paths))
+    return "\n&& ".join(guards) or "true"
+
+
 def _is_notebooks_sync_guard(guard):
     """Only the exact params-latest.env exclusion permits the sync bypass."""
     return re.fullmatch(

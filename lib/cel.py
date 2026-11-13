@@ -50,8 +50,8 @@ def extract_push_conditions(expression):
     >>> path_conditions_to_text(paths)
     '("src/**".pathChanged() || ".tekton/push.yaml".pathChanged())'
 
-    The supported shape is a top-level conjunction with a single path clause,
-    which may itself contain ORs. A top-level OR cannot be safely split:
+    Multiple path clauses are retained as a conjunction; individual clauses
+    may contain parenthesized ORs. A top-level OR cannot be safely split:
 
     >>> extract_push_conditions('event == "push" || skip_build')
     Traceback (most recent call last):
@@ -83,7 +83,7 @@ def extract_push_conditions(expression):
         elif text.startswith("!"):
             guards.append(text)
         else:
-            path_tree = clause
+            path_tree = clause if path_tree is None else Tree("conditionaland", [path_tree, clause])
     if not has_event:
         raise ValueError("CEL expression has no event clause")
     return guards, path_tree
