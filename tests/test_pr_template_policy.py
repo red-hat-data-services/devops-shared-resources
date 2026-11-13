@@ -79,6 +79,13 @@ def test_notebooks_rendered_trigger(source, target, event, changed, expected):
     result = render_and_merge(str(config), "pull-request.yaml.j2", child, "pr.yaml", "main",
                               parent_data=parent, mode="fix", errors=[], overlay_path=overlay)
     expression = str(result["metadata"]["annotations"][key])
+    assert expression.startswith('event == "pull_request"')
+    assert "\n    && (" in expression
+    from io import StringIO
+    output = StringIO()
+    yaml.dump(result, output)
+    assert "on-cel-expression: |-" in output.getvalue()
+    assert "on-cel-expression: |2-" not in output.getvalue()
     env = celpy.Environment()
     program = env.program(env.compile(expression), functions={
         "pathChanged": lambda path: celpy.celtypes.BoolType(str(path) in changed),
@@ -104,7 +111,27 @@ def test_pathless_template_matches_legacy_semantics(event):
     actual = str(result["metadata"]["annotations"][key])
     previous = release_push_to_main_pr_cel(expression, "pr.yaml")
     assert previous == 'event == "pull_request"'
+    assert actual == previous
     env = celpy.Environment()
     evaluate = lambda text: bool(env.program(env.compile(text)).evaluate(
         {"event": celpy.celtypes.StringType(event)}))
     assert evaluate(actual) == evaluate(previous) == (event == "pull_request")
+
+@pytest.mark.parametrize("conditions", [
+    '"src/**".pathChanged()',
+    '(files.all.exists(p, !p.matches(\'^\\\\\\\\.tekton/\')) || ".tekton/push.yaml".pathChanged())',
+    '!skip_build && ("src/**".pathChanged() || ".tekton/push.yaml".pathChanged())',
+])
+def test_default_template_preserves_legacy_cel_bytes(conditions):
+    from lib.tekton_filters import release_push_to_main_pr_cel
+
+    yaml = YAML()
+    parent = yaml.load((ROOT / "tests/fixtures/tekton/valid-push.yaml").read_text())
+    child = yaml.load((ROOT / "tests/fixtures/tekton/valid-pull-request.yaml").read_text())
+    key = "pipelinesascode.tekton.dev/on-cel-expression"
+    expression = 'event == "push" && target_branch == "rhoai-3.7" && ' + conditions
+    parent["metadata"]["annotations"][key] = expression
+    result = render_and_merge(str(ROOT / "tekton-templates/kc-migration"),
+                              "pull-request.yaml.j2", child, "pr.yaml", "main",
+                              parent_data=parent, mode="fix", errors=[])
+    assert str(result["metadata"]["annotations"][key]) == release_push_to_main_pr_cel(expression, "pr.yaml")

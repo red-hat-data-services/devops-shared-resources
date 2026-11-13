@@ -876,7 +876,7 @@ def test_pr_with_push_cel_is_not_misclassified_and_revalidated_as_push(tmp_path,
     assert after[filename]["pipeline_type"] == "pull-request"
     if valid_parent_cel:
         fixed = yaml.load(path.read_text())
-        assert fixed["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"] == 'event == "pull_request"\n&& (\n  true\n)'
+        assert fixed["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"] == 'event == "pull_request"'
         assert after[filename]["errors"] == []
     else:
         assert any("cannot decompose push CEL" in error for error in after[filename]["errors"])

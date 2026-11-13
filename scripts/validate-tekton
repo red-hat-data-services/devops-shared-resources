@@ -489,6 +489,11 @@ def fix_tekton_dir(
 
     fixed_files = []
     deleted_files = set()
+
+    def post_fix_key(filepath):
+        # Directory mappings need the original path during in-memory validation.
+        # Preserve the historical basename keys for flat-layout callers.
+        return str(filepath.resolve()) if layout == "nested" else filepath.name
     post_fix_data = {}
 
     # Phase 1: Fix non-child pipelines (those with no parent config).
@@ -501,11 +506,11 @@ def fix_tekton_dir(
             tmpl_config = config.get_template(pipeline_type)
 
             if tmpl_config and tmpl_config.parent:
-                post_fix_data[filepath.name] = data
+                post_fix_data[post_fix_key(filepath)] = data
                 continue
 
             if not tmpl_config:
-                post_fix_data[filepath.name] = data
+                post_fix_data[post_fix_key(filepath)] = data
                 continue
 
             overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout, tekton_dir if layout == 'nested' else tekton_dir.parent)
@@ -537,14 +542,14 @@ def fix_tekton_dir(
                 if prefix and pipeline_type in parent_indexes:
                     parent_indexes[pipeline_type][prefix] = result
 
-            post_fix_data[filepath.name] = result
+            post_fix_data[post_fix_key(filepath)] = result
     else:
         # With external parents, just populate post_fix_data for non-child pipelines
         for filepath, data in sorted(pipelines.items()):
             pipeline_type = classify_pipeline(filepath.name, data, config=config)
             tmpl_config = config.get_template(pipeline_type)
             if not tmpl_config or not tmpl_config.parent:
-                post_fix_data[filepath.name] = data
+                post_fix_data[post_fix_key(filepath)] = data
 
     # Phase 2: Fix child pipelines (those with a parent config, using fixed parent data)
     for filepath, data in sorted(pipelines.items()):
@@ -576,7 +581,7 @@ def fix_tekton_dir(
                     info(f"  {filepath.name}: {'deleted' if not dry_run else 'would delete'}")
                     fixed_files.append(filepath.name)
                     deleted_files.add(filepath.name)
-                    del post_fix_data[filepath.name]
+                    del post_fix_data[post_fix_key(filepath)]
                     continue
 
         parent_data = _find_parent_pipeline(
@@ -603,7 +608,7 @@ def fix_tekton_dir(
             info(f"  {filepath.name}: {'deleted' if not dry_run else 'would delete'}")
             fixed_files.append(filepath.name)
             deleted_files.add(filepath.name)
-            del post_fix_data[filepath.name]
+            del post_fix_data[post_fix_key(filepath)]
             continue
 
         if result != data:
@@ -611,7 +616,7 @@ def fix_tekton_dir(
             info(f"  {filepath.name}: {'fixed' if not dry_run else 'would fix'} via template")
             fixed_files.append(filepath.name)
 
-        post_fix_data[filepath.name] = result
+        post_fix_data[post_fix_key(filepath)] = result
 
     return fixed_files, post_fix_data
 
