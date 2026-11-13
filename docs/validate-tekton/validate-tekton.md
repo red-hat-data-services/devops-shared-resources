@@ -307,15 +307,11 @@ validate-tekton [OPTIONS]
 
 ## CEL Expression Parsing
 
-The `lib/cel.py` module uses [cel-python](https://github.com/cloud-custodian/cel-python) (Lark-based parser) to parse CEL expressions into ASTs for structural transformation.
+The `to_stable_pr_cel` filter in `lib/tekton_filters.py` owns the push-to-PR trigger policy. It uses `extract_push_conditions` from `lib/cel.py` to parse the push expression and remove push event/branch selectors, then rewrites the pipeline filename and assembles guarded path, optional label, and notebooks sync arms. The exact notebooks exception stays beside the filter in `_is_notebooks_sync_guard`.
 
-Key functions:
+Despite the historical name, ordinary PR triggers are not restricted to the stable branch; only the notebooks main-to-stable sync exception checks that branch. Label and sync arms bypass the entire guarded path conjunction, but every arm still requires the `pull_request` event.
 
-- `decompose_push_cel(expr)` — splits a push CEL into event, branch, negative guards, and path conditions
-- `replace_tekton_filename(tree, filename)` — swaps `.tekton/*.yaml` string literals in pathChanged calls
-- `build_stable_pr_cel(path_conditions, negative_guards, labels, target_branch)` — assembles a PR CEL expression
-
-This powers the `to_stable_pr_cel` filter, which converts push pipeline CEL triggers into PR pipeline CEL triggers.
+`lib/cel.py` owns structural parsing with [cel-python](https://github.com/cloud-custodian/cel-python): `extract_push_conditions` returns negative guards and the path subtree without choosing PR trigger arms. It also provides `flatten_and`, `replace_tekton_filename`, and `path_conditions_to_text`. Trigger policy tests live in `tests/test_tekton_filters.py`; parsing and AST utility tests live in `tests/test_cel.py`.
 
 ## File Layout
 
