@@ -298,10 +298,12 @@ def _resolve_and_render_tree(node, existing_data: dict, parent_data: dict | None
                 _resolve_and_render_tree(item, existing_data, parent_data, env, variables, path, skipped_paths)
 
 
-def _resolve_value(val: str, path: tuple, existing_data: dict, parent_data: dict | None, env, variables: dict) -> str:
-    """Resolve _ / _parent references in a Jinja expression, then render it."""
+def _resolve_value(val: str, path: tuple, existing_data: dict, parent_data: dict | None, env, variables: dict) -> str | list:
+    """Render a scalar, or a native list when opted in with terminal as_array."""
     no_parent_data = False
     optional_absent = False
+    array_expression = re.fullmatch(r"\s*{{\s*(.*?)\|\s*as_array\s*}}\s*", val, re.DOTALL)
+    render_variables = dict(variables)
 
     def replacer(m):
         nonlocal no_parent_data, optional_absent
@@ -322,6 +324,10 @@ def _resolve_value(val: str, path: tuple, existing_data: dict, parent_data: dict
             if optional:
                 optional_absent = True
             return '""'
+        if array_expression:
+            name = f"_native_ref_{len(render_variables)}"
+            render_variables[name] = resolved
+            return name
         return '"' + str(resolved).replace('\\', '\\\\').replace('"', '\\"') + '"'
 
     resolved_expr = _SELF_REF_RE.sub(replacer, val)
@@ -333,8 +339,11 @@ def _resolve_value(val: str, path: tuple, existing_data: dict, parent_data: dict
 
     # Render through Jinja — filters like default_label handle empty values
     from lib.tekton_filters import SkipValidation
-    jinja_template = env.from_string(resolved_expr)
-    result = jinja_template.render(**variables)
+    if array_expression:
+        result = env.compile_expression(resolved_expr.strip()[2:-2].strip())(**render_variables)
+    else:
+        jinja_template = env.from_string(resolved_expr)
+        result = jinja_template.render(**variables)
     if hasattr(env, '_skipped') and env._skipped:
         env._skipped = False
         return SkipValidation(result)
@@ -511,6 +520,8 @@ def _deep_merge(template, existing, errors: list | None = None, path: str = "", 
             if i < len(existing):
                 result[i] = _deep_merge(tv, existing[i], errors, f"{path}[{i}]", skipped_paths)
             else:
+                if errors is not None:
+                    errors.append(f"{path}[{i}]: missing")
                 empty = {} if isinstance(tv, dict) else [] if isinstance(tv, list) else None
                 result.append(_deep_merge(tv, empty) if empty is not None else copy.deepcopy(tv))
         if errors is not None and len(existing) > len(present_items):
