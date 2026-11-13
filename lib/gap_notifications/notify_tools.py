@@ -697,7 +697,7 @@ def _slack_text(value, limit=160):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "ˋ")
 
 
-def _slack_link(value, label):
+def _slack_link(value, kind, detail=None):
     """Optional bounded HTTPS link with a static label, never evidence-supplied markup."""
     try:
         url = https_url(value)
@@ -708,7 +708,7 @@ def _slack_link(value, label):
     url = url.replace("|", "%7C").replace("&", "&amp;")
     if len(url) > 700:
         return None
-    return f"<{url}|{label}>"
+    return {'url': url, 'kind': kind, 'detail': detail}
 
 
 def _slack_commit_link(observation, run):
@@ -729,10 +729,10 @@ def _slack_commit_link(observation, run):
     repo = repository(observation.get("repository"))
     if repo is None or ("repository" in evidence and repository(evidence["repository"]) != repo):
         return None
-    return _slack_link(f"https://github.com/{repo}/commit/{sha}", f"Commit {sha[:7]}")
+    return _slack_link(f"https://github.com/{repo}/commit/{sha}", 'commit', sha[:7])
 
 
-def _slack_build_time(run, status):
+def _slack_build_time(run):
     """Display the selected run's completion time, never the polling/creation time."""
     value = "Unavailable"
     try:
@@ -741,8 +741,7 @@ def _slack_build_time(run, status):
             value = completed.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     except (ValueError, TypeError, AttributeError, OverflowError):
         pass
-    label = "Build failed at" if status == "failure" else "Build completed at"
-    return f"*{label}:* {value}"
+    return value
 
 
 def _slack_merge_links(observation):
@@ -765,14 +764,14 @@ def _slack_merge_links(observation):
             or not re.fullmatch(r"https://github\.com/" + re.escape(repo) + r"/pull/[1-9][0-9]*", pr_url.lower())
             or not isinstance(sha, str) or not re.fullmatch(r"[a-fA-F0-9]{40}", sha)):
         return []
-    links = [_slack_link(f"https://github.com/{repo}/commit/{sha}", f"Commit {sha[:7]}")]
+    links = [_slack_link(f"https://github.com/{repo}/commit/{sha}", 'commit', sha[:7])]
     facts = evidence.get("merge-receipt")
     if observation["category"] == "feasibility" and isinstance(facts, dict):
         run_id, attempt = facts.get("run-id"), facts.get("attempt")
         if (type(run_id) is int and run_id > 0 and type(attempt) is int and attempt > 0
                 and facts.get("head-sha") == sha and facts.get("run-head-sha") == sha):
             links.append(_slack_link(f"https://github.com/{repo}/actions/runs/{run_id}/attempts/{attempt}",
-                                     "Feasibility run"))
+                                     'feasibility'))
     return links
 
 
@@ -785,11 +784,8 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
     """
     evidence = observation["evidence"]
     category, status = observation["category"], observation["status"]
-    failure = {"build": "Build failed", "conflict": "Merge conflict", "feasibility": "Promotion blocked"}
-    success = {"build": "Successful build observed", "conflict": "Conflict resolved", "feasibility": "Feasibility restored"}
     if status not in {"failure", "success"}:
         raise ValueError("Slack notifications require a definitive outcome")
-    heading = success[category] if status == "success" else ("Failure update" if reply else failure[category])
     target = jira_target(jira_environment)
     run = evidence.get("selected-run")
     run = run if isinstance(run, dict) else {}
@@ -798,28 +794,33 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
     if isinstance(reason, str) and reason.strip() and reason.strip().lower() not in {"failed", "failure", "success", "succeeded", "completed"}:
         reported_reason = _slack_text(reason, 240)
     jira_key = re.search(r"/browse/(RHAI-[1-9][0-9]{0,15})$", jira_url) if isinstance(jira_url, str) else None
-    jira = _slack_link(jira_url, f"Jira {jira_key[1]}" if jira_key else "Jira")
+    jira = _slack_link(jira_url, 'jira', jira_key[1] if jira_key else None)
     if jira is None:
         raise ValueError("a safe Jira link is required")
     links = [
-        _slack_link(evidence.get("build_url"), "Successful build" if status == "success" else "Failed build") if category == "build" else None,
+        _slack_link(evidence.get("build_url"), 'build') if category == "build" else None,
         _slack_commit_link(observation, run) if category == "build" else None,
         *_slack_merge_links(observation),
-        _slack_link(evidence.get("pr_url"), "Child PR"), jira,
+        _slack_link(evidence.get("pr_url"), 'pr'), jira,
     ]
     if not reply:
-        links.append(_slack_link(evidence.get("leader_url"), "GAP Leader"))
+        links.append(_slack_link(evidence.get("leader_url"), 'leader'))
     context = dict(
-        heading=heading, status=status, category=category, reply=reply,
+        status=status, category=category, reply=reply,
         jira_environment=target.name,
         component=_slack_text(observation.get("component")),
         repository=_slack_text(observation.get("repository")),
-        build_time=_slack_build_time(run, status), reason=reported_reason,
+        build_time=_slack_build_time(run), reason=reported_reason,
         links=[link for link in links if link], synthetic=evidence.get("synthetic") is True,
     )
+    return slack_template().render(**context).removesuffix("\n")
+
+
+def slack_template():
+    """Load shared message wording and ownership macros without clients or lookups."""
     template = files("lib.gap_notifications").joinpath("templates/slack.md.j2").read_text(encoding="utf-8")
     return Environment(undefined=StrictUndefined, autoescape=False, trim_blocks=True,
-                       lstrip_blocks=True).from_string(template).render(**context).removesuffix("\n")
+                       lstrip_blocks=True).from_string(template)
 
 
 def literal(value):
@@ -859,28 +860,42 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
     creator = e.get("creator-outcome") or {}
     context = {key: literal(observation.get(key)) for key in (
         "repository", "category", "source_branch", "destination_branch", "component", "pipeline", "observation_id")}
-    context.update(notification_heading=target.banner,
-                   destination_notice=("Staging notification only. This does not establish production failure or recovery."
-                                       if target.name == "stage" else
-                                       "Production Jira destination. Outcomes reflect only the explicitly supplied evidence."),
+    context.update(jira_environment=target.name,
+                   title_category=observation['category'], title_repository=observation['repository'],
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
                    revision=literal(e.get("head_sha") or e.get("head-sha")), links=[],
                    discussion_url=https_url(discussion_url) if discussion_url else None,
                    metadata_url=https_url(metadata_url) if metadata_url else None)
-    for label, value in [("Child PR", e.get("pr_url")), ("Leader", e.get("leader_url")),
-                         ("Build logs or PipelineRun", e.get("build_url")), ("State snapshot", e.get("state_url")),
-                         ("Feasibility run" if observation.get("category") == "feasibility" else "Creator workflow",
-                          e.get("workflow_url") or creator.get("workflow-url")),
-                         ("Creator PR", creator.get("pr-url"))]:
+    for kind, value in [('pr', e.get('pr_url')), ('leader', e.get('leader_url')),
+                        ('build', e.get('build_url')), ('state', e.get('state_url')),
+                        ('workflow', e.get('workflow_url') or creator.get('workflow-url')),
+                        ('creator_pr', creator.get('pr-url'))]:
         if value:
-            context["links"].append({"label": label, "url": https_url(value)})
+            context['links'].append({'kind': kind, 'url': https_url(value)})
     template = files("lib.gap_notifications").joinpath("templates/issue.md.j2").read_text(encoding="utf-8")
-    rendered = Environment(undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True).from_string(template).render(**context)
+    environment = Environment(undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True)
+    environment.filters['literal'] = literal
+    rendered = environment.from_string(template).render(**context)
     if len(rendered) > 24000:
         raise ValueError("presentation exceeds 24000 characters")
     return rendered
+
+
+def issue_summary(observation, *, jira_environment="stage", channel=None):
+    """Derive the Jira title from the first rendered H1, decoding literal escapes."""
+    markdown = render_markdown(observation, jira_environment=jira_environment, channel=channel)
+    heading = next((line[2:] for line in markdown.splitlines() if line.startswith('# ')), None)
+    if heading is None:
+        raise ValueError("issue template requires an H1 title")
+    nodes = _inline(heading)
+    if any(node.get('marks') for node in nodes):
+        raise ValueError("issue title must contain only literal text")
+    title = ''.join(node['text'] for node in nodes)
+    if not title.strip() or len(title) > 250:
+        raise ValueError("issue title must contain 1–250 characters")
+    return title
 
 
 def description(observation, *, discussion_url=None, metadata_url=None, jira_environment="stage", channel=None):

@@ -1,4 +1,16 @@
-{{ '🟢' if status == 'success' else '🔴' }} *GAP · {{ heading }} — {{ 'staging test' if jira_environment == 'stage' else 'production Jira' }}*
+{# Ownership macros are rendered separately into isolated Block Kit sections.
+   Only owning_team is mention-enabled; evidence and mapping links stay verbatim. #}
+{% macro failure_summary() -%}*Failure*{%- endmacro %}
+{% macro owning_team(handle) -%}
+*Owning team:* @{{ handle }}
+{%- endmacro %}
+{% macro ownership_mappings(repository_scoped) -%}
+Ownership mappings: <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/rhoai-component-data.yaml|Slack teams> · <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/konflux-to-jira-component-map.yaml|Jira components>{{ ' · <https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml|Repository ownership>' if repository_scoped else '' }}
+{%- endmacro %}
+{% if not ownership_only | default(false) %}
+{% set failure = {'build': 'Build failed', 'conflict': 'Merge conflict', 'feasibility': 'Promotion blocked'} %}
+{% set success = {'build': 'Successful build observed', 'conflict': 'Conflict resolved', 'feasibility': 'Feasibility restored'} %}
+{{ '🟢' if status == 'success' else '🔴' }} *GAP · {{ success[category] if status == 'success' else ('Failure update' if reply else failure[category]) }} — {{ 'staging test' if jira_environment == 'stage' else 'production Jira' }}*
 {% if category == 'build' %}
 *Component:* `{{ component }}`
 {% endif %}
@@ -6,7 +18,7 @@
 *Repository:* `{{ repository }}`
 {% endif %}
 {% if category == 'build' %}
-{{ build_time }}
+*{{ 'Build failed at' if status == 'failure' else 'Build completed at' }}:* {{ build_time }}
 {% endif %}
 {% if reason %}
 *Reported reason:* `{{ reason }}`
@@ -16,11 +28,14 @@
 *Main-to-release feasibility:* {{ 'The main to release feasibility job has failed. ' if status == 'failure' else '' }}This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes).{{ ' Please inspect the feasibility job for merge conflicts or configuration/workflow errors.' if status == 'failure' else '' }}
 {% endif %}
 
-{{ links | join(' · ') }}
+{% set link_labels = {'build': 'Successful build' if status == 'success' else 'Failed build', 'commit': 'Commit', 'feasibility': 'Feasibility run', 'pr': 'Child PR', 'jira': 'Jira', 'leader': 'GAP Leader'} %}
+{% for link in links %}<{{ link.url }}|{{ link_labels[link.kind] }}{{ ' ' ~ link.detail if link.detail else '' }}>{% if not loop.last %} · {% endif %}{% endfor %}
+
 {% if synthetic %}
 
 Synthetic evidence
 {% endif %}
 {% if status == 'success' %}
 {{ 'Staging result only; does not establish production recovery.' if jira_environment == 'stage' else 'Reported component outcome only; not a claim that the whole promotion is healthy.' }}
+{% endif %}
 {% endif %}

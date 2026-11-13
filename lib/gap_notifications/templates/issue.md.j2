@@ -1,6 +1,13 @@
-# {{ notification_heading }}
+{# The first H1 supplies the Jira summary. Keep this format compatible with existing issues. -#}
+{% set banner = 'GAP STAGING TEST' if jira_environment == 'stage' else 'GAP PRODUCTION' -%}
+{% set title = '[' ~ banner ~ '] ' ~ title_category ~ ' failure: ' ~ title_repository -%}
+# {{ title[:250] | literal }}
 
-{{ destination_notice }}
+{% if jira_environment == 'stage' %}
+Staging notification only. This does not establish production failure or recovery.
+{% else %}
+Production Jira destination. Outcomes reflect only the explicitly supplied evidence.
+{% endif %}
 
 {{ note }}
 
@@ -20,9 +27,18 @@ The main to release feasibility job has failed. This job dry-runs the normal syn
 
 ## Evidence links
 
-{% for link in links %}- [{{ link.label }}]({{ link.url }})
+{% set link_labels = {'pr': 'Child PR', 'leader': 'Leader', 'build': 'Build logs or PipelineRun', 'state': 'State snapshot', 'workflow': 'Feasibility run' if category == 'feasibility' else 'Creator workflow', 'creator_pr': 'Creator PR'} %}
+{% for link in links %}- [{{ link_labels[link.kind] }}]({{ link.url }})
 {% else %}Unavailable.
 {% endfor %}
+## Ownership mappings
+
+- [Slack teams](https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/rhoai-component-data.yaml)
+- [Jira components](https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/konflux-to-jira-component-map.yaml)
+{% if category in ['conflict', 'feasibility'] %}
+- [Repository ownership](https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml)
+{% endif %}
+
 ## Diagnostics
 
 - Revision: `{{ revision }}`

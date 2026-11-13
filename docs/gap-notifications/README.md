@@ -87,6 +87,33 @@ validation, truncation and escaping. Template changes do not change delivery,
 threading or replay identity. Both templates are included by the existing
 `templates/*.md.j2` package-data rule.
 
+Both templates own headings, environment notices, and evidence-link labels.
+Slack's `owning_team`, `ownership_mappings`, and `failure_summary` macros also own
+the text added by the ownership layout. Python invokes those macros separately:
+only the owning-team section enables mention parsing, and only failure roots
+include ownership and mapping references. Replies and recovery do not re-ping
+owners. Keep the owning-team macro limited to the validated handle and static
+wording; do not introduce observation/evidence text into that mention-enabled
+section. Python still owns Block Kit assembly and section-size handling.
+
+The first rendered H1 in the Jira template is also the issue summary. Its literal
+text must be nonempty and at most 250 characters, without inline links or code.
+The default template truncates the assembled title before applying the `literal`
+filter, preserving the existing `[GAP STAGING TEST]` / `[GAP PRODUCTION]` title
+formats and safe Markdown escaping. Title inputs are unescaped data: always apply
+`literal` to the final title, not to individual fragments before truncation.
+Other Jira text fields are already escaped. Changing title wording also changes
+the summary used to verify existing incidents; coordinate any such change with
+an explicit compatibility/migration plan rather than editing active titles
+casually. Jira descriptions link to the same ownership sources as Slack,
+including repository ownership for conflict and feasibility incidents.
+
+Validate template edits offline with:
+
+```sh
+uv run pytest tests/gap_notifications tests/test_gap_notify.py
+```
+
 Feasibility failure roots reuse the Jira feasibility paragraph, explaining that
 the job dry-runs the normal sync from the current configured source branch to
 configured active release branches, without testing the proposed stable PR contents

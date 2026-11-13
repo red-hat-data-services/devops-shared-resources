@@ -34,7 +34,7 @@ from jinja2 import UndefinedError
 import lib.gap_notifications.notify_tools as presentation
 from lib.gap_notifications.dispatch_incidents import _description, _summary
 from lib.gap_notifications.notify_tools import JiraNotifier
-from lib.gap_notifications.notify_tools import category_labels, render_markdown
+from lib.gap_notifications.notify_tools import category_labels, render_markdown, literal
 from gap_notification_fakes import make_runner, observation
 from lib.gap_notifications import dispatch_incidents as dispatch
 from lib.gap_notifications.notify_tools import slack_message
@@ -745,7 +745,8 @@ def test_jira_omits_provenance_boilerplate(environment, flags):
         assert 'synthetic evidence:' not in text
         assert 'Missing flags' not in text
         assert 'https://github.com/acme/repo/pull/1' in text
-    assert markdown.startswith('# GAP STAGING TEST' if environment == 'stage' else '# GAP PRODUCTION')
+    banner = 'GAP STAGING TEST' if environment == 'stage' else 'GAP PRODUCTION'
+    assert markdown.startswith('# ' + literal(f'[{banner}] build failure: acme/repo'))
 
 
 # Injected Markdown or template text must remain literal.
@@ -757,11 +758,11 @@ def test_literal_injection(monkeypatch, tmp_path):
     adf = _description(obs)
     JiraNotifier._validate_adf(adf)
     headings = [n for n in adf['content'] if n['type'] == 'heading']
-    assert len(headings) == 4
+    assert len(headings) == 5
     assert 'Actual promotion stream: main → stable' in md
     raw = json.dumps(adf)
     assert '# injected [evil](https://evil.test) <script> {{ missing }}' in raw
-    assert raw.count('"href"') == 1
+    assert raw.count('"href"') == 3
     assert 'GAP STAGING TEST' in raw
 
 
@@ -784,7 +785,7 @@ def test_jira_omits_affected_targets(category, evidence):
     for text in (markdown, json.dumps(adf)):
         assert 'Explicitly affected targets' not in text
         assert 'No targets inferred' not in text
-        assert 'rhoai' not in text
+        assert 'rhoai-3.2' not in text
         assert 'target-only reason' not in text
         assert 'FEEDBACK' not in text
         assert 'Evidence links' in text and 'Diagnostics' in text
@@ -1252,7 +1253,8 @@ def test_production_presentation_is_labeled_without_claiming_global_recovery():
     target = jira_target('production')
     obs = observation(environment=target.scope, evidence={'synthetic': True, 'historical_snapshot': True})
     markdown = render_markdown(obs, **target.options)
-    assert markdown.startswith('# GAP PRODUCTION') and 'Staging notification only' not in markdown
+    assert markdown.startswith('# ' + literal('[GAP PRODUCTION] build failure: acme/repo'))
+    assert 'Staging notification only' not in markdown
     assert 'Historical snapshot:' not in markdown and 'synthetic evidence:' not in markdown
     text = slack_message(dict(obs, status='success'), jira_url=target.url + '/browse/RHAI-1', **target.options)
     assert 'production Jira' in text and 'staging test' not in text

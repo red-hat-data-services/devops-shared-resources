@@ -20,7 +20,7 @@ Cosmetic ADF mechanics live in notify_tools; delivery never imports lookup_tools
 """
 from __future__ import annotations
 
-from lib.gap_notifications.notify_tools import (JiraNotifier, category_labels, description,
+from lib.gap_notifications.notify_tools import (JiraNotifier, category_labels, description, issue_summary,
     project_body, slack_message, routing_target, configured_channel, SLACK_ORIGIN, SlackRateLimitError, SlackPermanentError)
 import copy
 import json
@@ -262,7 +262,7 @@ def _closed(issue):
 
 
 def _summary(observation, *, jira_environment="stage", channel=None):
-    return f"[{routing_target(jira_environment, channel).banner}] {observation['category']} failure: {observation['repository']}"[:250]
+    return issue_summary(observation, **routing_target(jira_environment, channel).options)
 
 
 def _verify_issue(issue, episode, *, jira_environment="stage", channel=None):
