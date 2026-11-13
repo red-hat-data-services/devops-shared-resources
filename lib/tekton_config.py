@@ -46,6 +46,7 @@ class TemplateConfig:
     match_fns: list[str]
     parent: ParentConfig | None = None
     generate: dict | None = None
+    pipeline_ref: dict | None = None
 
 
 @dataclass
@@ -124,6 +125,15 @@ def _validate_config(config: PipelineConfig):
     template_names = {t.name for t in config.templates}
 
     for tmpl in config.templates:
+        ref = tmpl.pipeline_ref
+        if ref is not None and (
+            not isinstance(ref, dict) or set(ref) != {"resolver", "params"}
+            or not isinstance(ref["resolver"], str) or not ref["resolver"]
+            or not isinstance(ref["params"], dict) or not ref["params"]
+            or any(not isinstance(k, str) or not k or not isinstance(v, str)
+                   for k, v in ref["params"].items())
+        ):
+            raise ValueError("pipeline_ref requires a resolver and nonempty string params mapping")
         for fn_name in tmpl.match_fns:
             if fn_name not in pipeline_matchers:
                 raise ValueError(
@@ -204,6 +214,7 @@ def load_config(config_dir: str, config_file: str | None = None) -> PipelineConf
             match_fns=_normalize_match_fn(entry["match_fn"]),
             parent=parent,
             generate=generate,
+            pipeline_ref=entry.get("pipeline_ref"),
         ))
 
     aliases = dict(raw.get("component_aliases", {})) if raw.get("component_aliases") else None

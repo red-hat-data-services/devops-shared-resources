@@ -41,6 +41,23 @@ def parent_matcher(fn):
     return fn
 
 
+def pipeline_reference_matches(data, expected):
+    """Match literal resolver parameters supplied by trusted configuration."""
+    spec = data.get("spec", {})
+    if "pipelineSpec" in spec:
+        return False
+    ref = spec.get("pipelineRef", {})
+    if ref.get("resolver") != expected["resolver"]:
+        return False
+    params = {}
+    for item in ref.get("params", []):
+        name = item.get("name")
+        if name in params:
+            raise ValueError(f"duplicate pipeline reference parameter: {name}")
+        params[name] = item.get("value")
+    return all(params.get(k) == v for k, v in expected["params"].items())
+
+
 # --- Pipeline matchers ---
 
 
