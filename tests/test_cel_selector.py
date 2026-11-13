@@ -36,7 +36,7 @@ def test_compliant_selector_stays_byte_identical(expression):
 
 
 @pytest.mark.parametrize("spacing", [" ", "  ", "\n  "])
-def test_added_cluster_guard_keeps_branch_comparison_spacing(spacing):
+def test_added_cluster_guard_preserves_branch_comparison_spacing(spacing):
     expression = (
         'event == "push" && target_branch ==' + spacing + '"rhoai-3.7-ea.1"'
         ' && message == "keep  ==  spaces"'
@@ -46,7 +46,7 @@ def test_added_cluster_guard_keeps_branch_comparison_spacing(spacing):
     assert result == (
         'konflux_cluster == "stone-prod-p02"\n'
         '&& event == "push"\n'
-        '&& target_branch == "rhoai-3.7-ea.1"\n'
+        f'&& target_branch =={spacing}"rhoai-3.7-ea.1"\n'
         '&& message == "keep  ==  spaces"'
     )
     assert ensure_cel_selectors(result, desired) == result
