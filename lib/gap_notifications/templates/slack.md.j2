@@ -1,24 +1,20 @@
-{# Ownership macros are rendered separately into isolated Block Kit sections.
-   Only owning_team is mention-enabled; evidence and mapping links stay verbatim. #}
-{% macro failure_summary() -%}*Failure*{%- endmacro %}
-{% macro owning_team(handle) -%}
-*Owning team:* @{{ handle }}
-{%- endmacro %}
-{% macro ownership_mappings(repository_scoped) -%}
-Ownership mappings: <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/rhoai-component-data.yaml|Slack teams> · <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/konflux-to-jira-component-map.yaml|Jira components>{{ ' · <https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml|Repository ownership>' if repository_scoped else '' }}
-{%- endmacro %}
-{% if not ownership_only | default(false) %}
-{% set failure = {'build': 'Build failed', 'conflict': 'Merge conflict', 'feasibility': 'Promotion blocked'} %}
-{% set success = {'build': 'Successful build observed', 'conflict': 'Conflict resolved', 'feasibility': 'Feasibility restored'} %}
-{{ '🟢' if status == 'success' else '🔴' }} *GAP · {{ success[category] if status == 'success' else ('Failure update' if reply else failure[category]) }} — {{ 'staging test' if jira_environment == 'stage' else 'production Jira' }}*
+{% if status == 'success' %}
+🟢 *GAP · Recovery observed*
+{% else %}
+🔴 *GAP · Promotion gate failure*
+{% endif %}
 {% if category == 'build' %}
 *Component:* `{{ component }}`
+{% endif %}
+{% if owning_team %}
+*Owning team:* `@{{ owning_team }}`
 {% endif %}
 {% if not reply %}
 *Repository:* `{{ repository }}`
 {% endif %}
+*Jira:* {{ 'staging test' if jira_environment == 'stage' else 'production Jira' }}
 {% if category == 'build' %}
-*{{ 'Build failed at' if status == 'failure' else 'Build completed at' }}:* {{ build_time }}
+{{ build_time }}
 {% endif %}
 {% if reason %}
 *Reported reason:* `{{ reason }}`
@@ -28,14 +24,21 @@ Ownership mappings: <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/b
 *Main-to-release feasibility:* {{ 'The main to release feasibility job has failed. ' if status == 'failure' else '' }}This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes).{{ ' Please inspect the feasibility job for merge conflicts or configuration/workflow errors.' if status == 'failure' else '' }}
 {% endif %}
 
-{% set link_labels = {'build': 'Successful build' if status == 'success' else 'Failed build', 'commit': 'Commit', 'feasibility': 'Feasibility run', 'pr': 'Child PR', 'jira': 'Jira', 'leader': 'GAP Leader'} %}
-{% for link in links %}<{{ link.url }}|{{ link_labels[link.kind] }}{{ ' ' ~ link.detail if link.detail else '' }}>{% if not loop.last %} · {% endif %}{% endfor %}
+{# Jira is always present in delivered messages, so optional links can use it as the separator anchor. #}
+{% if links.build %}<{{ links.build.url }}|Build logs> · {% endif %}
+{% if links.commit %}<{{ links.commit.url }}|Commit {{ links.commit.detail }}> · {% endif %}
+{% if links.feasibility %}<{{ links.feasibility.url }}|Feasibility Workflow> · {% endif %}
+{% if links.pr %}<{{ links.pr.url }}|Child PR> · {% endif %}
+{% if links.jira %}<{{ links.jira.url }}|Jira{{ ' ' ~ links.jira.detail if links.jira.detail else '' }}>{% endif %}
+{% if links.leader %} · <{{ links.leader.url }}|GAP Leader>{% endif %}
 
 {% if synthetic %}
 
 Synthetic evidence
 {% endif %}
-{% if status == 'success' %}
-{{ 'Staging result only; does not establish production recovery.' if jira_environment == 'stage' else 'Reported component outcome only; not a claim that the whole promotion is healthy.' }}
+{% if owning_team %}
+Ownership mappings: <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/rhoai-component-data.yaml|Slack teams> · <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/konflux-to-jira-component-map.yaml|Jira components>
+{% if category in ['conflict', 'feasibility'] %}
+<https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml|Repository ownership>
 {% endif %}
 {% endif %}

@@ -3,7 +3,7 @@ import re
 import yaml
 import requests
 from lib.gap_component_map import normalize_component_name
-from lib.gap_notifications.notify_tools import slack_template
+from lib.gap_notifications.notify_tools import slack_ownership
 
 BASE = "https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/raw/main/data/"
 REPOSITORY_URL = 'https://api.github.com/repos/red-hat-data-services/rhoai-ops/contents/config/automerge_team_mapping.yaml?ref=main'
@@ -141,17 +141,17 @@ class OwnershipPolicy:
         return {'components': [{'name': name} for name in names]}
 
     def blocks(self, observation, text, *, root=False):
-        """Integrate ownership with the summary; only the mapped handle is parsed."""
+        """Integrate displayed ownership with the summary without parsing mentions."""
         blocks = []
         root_failure = root and observation.get("status") == "failure"
         if root_failure:
-            wording = slack_template().make_module({'ownership_only': True})
             handle = (self.repository_teams.get(_repository(observation.get('repository')), self.teams['default'])
                       if observation.get('category') in {'conflict', 'feasibility'} else
                       self._lookup(self.teams, observation.get("component"), self.teams["default"]))
+            fallback, owner_text, mappings = slack_ownership(handle, observation.get('category', 'build'))
             summary, _, body = text.partition("\n")
             if len(summary) > 2999:
-                summary, body = wording.failure_summary(), text
+                summary, body = fallback, text
             elif body.startswith("*Component:*"):
                 component, _, remaining = body.partition("\n")
                 if len(summary) + len(component) + 2 <= 3000:
@@ -159,9 +159,9 @@ class OwnershipPolicy:
             # Full-width sections avoid long names squeezing the ownership label.
             # Explicit newlines also separate sections when their text is copied.
             blocks.append({"type": "section", "text": {
-                "type": "mrkdwn", "text": (summary or wording.failure_summary()) + "\n", "verbatim": True}})
+                "type": "mrkdwn", "text": (summary or fallback) + "\n", "verbatim": True}})
             blocks.append({"type": "section", "text": {
-                "type": "mrkdwn", "text": wording.owning_team(handle) + "\n", "verbatim": False}})
+                "type": "mrkdwn", "text": owner_text + "\n", "verbatim": True}})
             text = body
         blocks.extend({"type": "section", "text": {
             "type": "mrkdwn", "text": text[i:i + 3000], "verbatim": True}}
@@ -169,7 +169,6 @@ class OwnershipPolicy:
         if root_failure:
             blocks.append({"type": "context", "elements": [{
                 "type": "mrkdwn", "verbatim": True,
-                "text": wording.ownership_mappings(
-                    observation.get('category') in {'conflict', 'feasibility'}),
+                "text": mappings,
             }]})
         return blocks

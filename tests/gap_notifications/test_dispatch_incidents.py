@@ -899,7 +899,8 @@ def test_environment_scoped_lifecycle(tmp_path, environment):
     assert jira.properties == original and len(slack.calls) == 1
     assert target.url + '/browse/RHAI-1' in slack.calls[0][0]
     assert target.url + '/rest/api/3/issue/RHAI-1/properties/' in json.dumps(jira.issues)
-    assert target.banner in jira.issues['RHAI-1']['fields']['summary']
+    prefix = 'JIRA STAGE - ' if environment == 'stage' else ''
+    assert jira.issues['RHAI-1']['fields']['summary'] == prefix + 'Promotion Gate Failure in acme/repo (cpu)'
     success = dict(obs, status='success', observation_id='passing-run')
     held = runner('no-transition').run([success])
     assert held['outbox'][0]['state'] != 'confirmed' and not jira.closed('RHAI-1')

@@ -24,8 +24,9 @@ def test_isolated_blocks_survive_sdk_transport():
     assert payload['client_msg_id'] == 'test-id'
     assert payload['unfurl_links'] is False and payload['unfurl_media'] is False
     assert blocks[0]['text'] == {'type': 'mrkdwn', 'text': body + '\n', 'verbatim': True}
-    assert blocks[1]['text'] == {'type': 'mrkdwn', 'text': '*Owning team:* @devops\n', 'verbatim': False}
+    assert blocks[1]['text'] == {'type': 'mrkdwn', 'text': '*Owning team:* `@devops`\n', 'verbatim': True}
     assert all('fields' not in block for block in blocks)
+    assert all(block['text']['verbatim'] for block in blocks if block['type'] == 'section')
     assert blocks[-1]['type'] == 'context'
     assert blocks[-1]['elements'][0]['verbatim'] is True
     assert not hasattr(SlackClient, 'usergroups')

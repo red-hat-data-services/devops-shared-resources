@@ -1,28 +1,30 @@
 {# The first H1 supplies the Jira summary. Keep this format compatible with existing issues. -#}
-{% set banner = 'GAP STAGING TEST' if jira_environment == 'stage' else 'GAP PRODUCTION' -%}
-{% set title = '[' ~ banner ~ '] ' ~ title_category ~ ' failure: ' ~ title_repository -%}
-# {{ title[:250] | literal }}
+{% set banner = 'JIRA STAGE - ' if jira_environment == 'stage' else '' -%}
+{% set context = 'merge feasibility' if category in ['feasibility', 'conflict'] else component -%}
+# {{ banner }}Promotion Gate Failure in {{ repository }} ({{ context }})
 
 {% if jira_environment == 'stage' %}
-Staging notification only. This does not establish production failure or recovery.
-{% else %}
-Production Jira destination. Outcomes reflect only the explicitly supplied evidence.
+STAGE JIRA ENVIRONMENT
 {% endif %}
 
-{{ note }}
+{% if category == 'feasibility' %}
+## Main-to-release feasibility
 
-## Failure
+The main to release feasibility job has failed. This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes). Please inspect the feasibility job for merge conflicts or configuration/workflow errors.
+{% elif category == 'build' %}
+## Component build failure
+
+This incident tracks a failed or timed-out component build required by the promotion gate. Inspect the linked build logs and reported reason to diagnose the failure.
+{% endif %}
+
+## Failure Details
 
 - Repository: {{ repository }}
 - Category: {{ category }}
 - Actual promotion stream: {{ source_branch }} → {{ destination_branch }}
 - Reason: {{ reason }}
+{% if category == 'build' %}
 - Component: {{ component }}
-- Pipeline: {{ pipeline }}
-{% if category == 'feasibility' %}
-## Main-to-release feasibility
-
-The main to release feasibility job has failed. This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes). Please inspect the feasibility job for merge conflicts or configuration/workflow errors.
 {% endif %}
 
 ## Evidence links

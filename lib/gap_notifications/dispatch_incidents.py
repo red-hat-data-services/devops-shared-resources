@@ -266,13 +266,13 @@ def _summary(observation, *, jira_environment="stage", channel=None):
 
 
 def _verify_issue(issue, episode, *, jira_environment="stage", channel=None):
+    # Titles are editable presentation, not incident or episode identity.
     fields = issue.get("fields", {})
     _key(issue.get("key"))
     if (fields.get("project", {}).get("key") != "RHAI"
             or not (fields.get("issuetype", {}).get("name") == "Bug"
                     or (jira_environment == "stage" and fields.get("issuetype", {}).get("id") == "10016"))
             or episode["label"] not in fields.get("labels", [])
-            or fields.get("summary") != _summary(episode["latest"], jira_environment=jira_environment)
             or fields.get("status", {}).get("statusCategory", {}).get("key") not in {"new", "indeterminate", "done"}):
         raise ValueError("Jira episode identity could not be verified")
     return _key(issue["key"])
@@ -791,16 +791,8 @@ def validated_property(issue, state, *, trial=None, identity=None, jira_environm
     label = incident_label(stored_identity, stored_trial)
     target = routing_target(jira_environment, channel)
     checked = _validate_state(state, stored_identity, stored_trial, label, **target.options)
-    # Summary retains caller repository spelling; identity canonicalizes it.
-    # Validate that spelling against the stored identity, never against body links.
-    prefix = f"[{target.banner}] {obs['category']} failure: "
-    summary = issue.get("fields", {}).get("summary", "")
-    if not isinstance(summary, str) or not summary.startswith(prefix):
-        raise ValueError("summary identity mismatch")
-    summary_obs = dict(obs, repository=summary[len(prefix):])
-    if incident_key(summary_obs) != stored_identity:
-        raise ValueError("summary repository mismatch")
-    _verify_issue(issue, {"label": label, "latest": summary_obs}, **target.options)
+    # Identity comes from the validated property and labels, never editable text.
+    _verify_issue(issue, {"label": label}, **target.options)
     if "gap-episode-" + uuid.UUID(checked["episode_id"]).hex not in issue["fields"]["labels"]:
         raise ValueError("episode mismatch")
     if checked["delivery"]["root"] is not None and checked["delivery"]["last_event"] is None:

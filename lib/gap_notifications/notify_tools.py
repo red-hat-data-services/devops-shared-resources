@@ -810,17 +810,53 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
         jira_environment=target.name,
         component=_slack_text(observation.get("component")),
         repository=_slack_text(observation.get("repository")),
-        build_time=_slack_build_time(run), reason=reported_reason,
-        links=[link for link in links if link], synthetic=evidence.get("synthetic") is True,
+        build_time=f"*{'Build failed at' if status == 'failure' else 'Build completed at'}:* {_slack_build_time(run)}",
+        reason=reported_reason, owning_team=None,
+        links=_slack_links_context(links), synthetic=evidence.get("synthetic") is True,
     )
     return slack_template().render(**context).removesuffix("\n")
 
 
 def slack_template():
-    """Load shared message wording and ownership macros without clients or lookups."""
+    """Load the plain message template without clients or lookups."""
     template = files("lib.gap_notifications").joinpath("templates/slack.md.j2").read_text(encoding="utf-8")
     return Environment(undefined=StrictUndefined, autoescape=False, trim_blocks=True,
                        lstrip_blocks=True).from_string(template)
+
+
+def _slack_links_context(links):
+    """Expose validated URLs and identifiers; the template owns their labels."""
+    context = dict.fromkeys(('build', 'commit', 'feasibility', 'pr', 'jira', 'leader'))
+    context.update((link['kind'], link) for link in links if link)
+    return context
+
+
+def slack_ownership(handle, category):
+    """Extract optional template text for isolated ownership blocks.
+
+    Render with and without ownership using static, non-evidence inputs. Only
+    inserted lines may differ: the code-formatted handle and trailing mapping references.
+    This keeps transport boundaries out of the editable message template.
+    """
+    from difflib import SequenceMatcher
+    template = slack_template()
+    context = dict(status='failure', category=category, reply=False,
+                   jira_environment='stage', component='', repository='',
+                   build_time='', reason=None, links=_slack_links_context([]), synthetic=False)
+    plain = template.render(**context, owning_team=None).splitlines()
+    owned = template.render(**context, owning_team=handle).splitlines()
+    additions = []
+    for operation, _, _, first, last in SequenceMatcher(None, plain, owned, autojunk=False).get_opcodes():
+        if operation == 'equal':
+            continue
+        if operation != 'insert':
+            raise ValueError('ownership must only add message content')
+        additions.append('\n'.join(owned[first:last]))
+    if len(additions) != 2 or '\n' in additions[0] or not additions[0].endswith('`@' + handle + '`'):
+        raise ValueError('ownership requires one inline-code handle line and a mapping footer')
+    if len(plain[0]) > 2999 or len(additions[0]) > 2999 or len(additions[1]) > 3000:
+        raise ValueError('ownership presentation exceeds Slack block limits')
+    return plain[0], additions[0], additions[1]
 
 
 def literal(value):

@@ -745,8 +745,8 @@ def test_jira_omits_provenance_boilerplate(environment, flags):
         assert 'synthetic evidence:' not in text
         assert 'Missing flags' not in text
         assert 'https://github.com/acme/repo/pull/1' in text
-    banner = 'GAP STAGING TEST' if environment == 'stage' else 'GAP PRODUCTION'
-    assert markdown.startswith('# ' + literal(f'[{banner}] build failure: acme/repo'))
+    prefix = 'JIRA STAGE - ' if environment == 'stage' else ''
+    assert markdown.startswith('# ' + prefix + 'Promotion Gate Failure in ' + literal('acme/repo') + ' (cpu)')
 
 
 # Injected Markdown or template text must remain literal.
@@ -758,12 +758,15 @@ def test_literal_injection(monkeypatch, tmp_path):
     adf = _description(obs)
     JiraNotifier._validate_adf(adf)
     headings = [n for n in adf['content'] if n['type'] == 'heading']
-    assert len(headings) == 5
+    assert [node['content'][0]['text'] for node in headings] == [
+        'JIRA STAGE - Promotion Gate Failure in acme/repo (cpu)',
+        'Component build failure', 'Failure Details', 'Evidence links', 'Ownership mappings', 'Diagnostics',
+    ]
     assert 'Actual promotion stream: main → stable' in md
     raw = json.dumps(adf)
     assert '# injected [evil](https://evil.test) <script> {{ missing }}' in raw
     assert raw.count('"href"') == 3
-    assert 'GAP STAGING TEST' in raw
+    assert 'JIRA STAGE' in raw
 
 
 # Unsafe evidence URLs must be rejected rather than rendered as links.
@@ -978,17 +981,14 @@ def render(**changes):
 @pytest.mark.parametrize("environment", ["stage", "production"])
 @pytest.mark.parametrize("synthetic", [False, True])
 def test_slack_template_layout(category, status, reply, environment, synthetic):
-    headings = {
-        "failure": {"build": "Build failed", "conflict": "Merge conflict", "feasibility": "Promotion blocked"},
-        "success": {"build": "Successful build observed", "conflict": "Conflict resolved", "feasibility": "Feasibility restored"},
-    }
-    heading = "Failure update" if reply and status == "failure" else headings[status][category]
+    heading = 'Recovery observed' if status == 'success' else 'Promotion gate failure'
     destination = "staging test" if environment == "stage" else "production Jira"
-    expected = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading} — {destination}*"]
+    expected = [f"{'🟢' if status == 'success' else '🔴'} *GAP · {heading}*"]
     if category == "build":
         expected.append("*Component:* `cpu`")
     if not reply:
         expected.append("*Repository:* `acme/repo`")
+    expected.append(f'*Jira:* {destination}')
     if category == "build":
         expected.append(f"*Build {'failed' if status == 'failure' else 'completed'} at:* Unavailable")
     expected.append("*Reported reason:* `A useful reason`")
@@ -1002,9 +1002,6 @@ def test_slack_template_layout(category, status, reply, environment, synthetic):
     expected.extend(["", f"<{JIRA}|Jira RHAI-177>"])
     if synthetic:
         expected.extend(["", "Synthetic evidence"])
-    if status == "success":
-        expected.append("Staging result only; does not establish production recovery." if environment == "stage"
-                        else "Reported component outcome only; not a claim that the whole promotion is healthy.")
     assert slack_message(observation(category=category, status=status,
                          evidence={"reason": "A useful reason", "synthetic": synthetic}),
                          jira_url=JIRA, reply=reply, jira_environment=environment) == "\n".join(expected)
@@ -1047,10 +1044,10 @@ def test_root_is_readable_and_selective():
         "selected-run": {"head_sha": "a" * 40, "completed_at": "2026-11-06T23:15:31+01:00"},
         "unrelated_debug_data": {"token": "NOT_FOR_DISPLAY"},
     })
-    assert "*GAP · Build failed — staging test*" in text
+    assert "*GAP · Promotion gate failure*" in text
     assert "*Component:* `cpu`" in text and "*Repository:* `acme/repo`" in text
     assert "*Promotion:*" not in text and "`main` → `stable`" not in text
-    assert "<https://build.example/run/1|Failed build>" in text
+    assert "<https://build.example/run/1|Build logs>" in text
     assert "<https://github.com/acme/repo/pull/1|Child PR>" in text
     assert "<https://github.com/acme/leader/pull/84|GAP Leader>" in text
     assert f"<{JIRA}|Jira RHAI-177>" in text
@@ -1062,24 +1059,22 @@ def test_root_is_readable_and_selective():
 
 
 # Every supported category must render sensibly even when optional evidence is absent.
-@pytest.mark.parametrize("category,heading", [("build", "Build failed"), ("conflict", "Merge conflict"), ("feasibility", "Promotion blocked")])
-def test_supported_categories_and_missing_evidence(category, heading):
+@pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
+def test_supported_categories_and_missing_evidence(category):
     text = render(category=category, evidence={})
-    assert heading in text and "Supplied evidence" not in text
+    assert 'Promotion gate failure' in text and "Supplied evidence" not in text
     assert ("*Build failed at:* Unavailable" in text) == (category == "build")
     assert ("*Component:*" in text) == (category == "build")
-    assert "Failed build>" not in text
+    assert "Build logs>" not in text
 
 
-# Recovery replies must stay concise and must not claim production recovery.
-@pytest.mark.parametrize("category,heading", [("build", "Successful build observed"), ("conflict", "Conflict resolved"), ("feasibility", "Feasibility restored")])
-def test_recovery_reply_is_short_and_scoped(category, heading):
+# Recovery replies use the common heading without repeating repository details.
+@pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
+def test_recovery_reply_is_short_and_scoped(category):
     text = slack_message(observation(status="success", category=category, evidence={"build_url": "https://build.example/run/2"}), jira_url=JIRA, reply=True)
-    assert heading in text and "does not establish production recovery" in text
+    assert 'Recovery observed' in text
     assert "*Repository:*" not in text and "*Promotion:*" not in text
-    if category == "build":
-        assert "|Successful build>" in text
-    assert "|Failed build>" not in text
+    assert ('|Build logs>' in text) == (category == 'build')
 
 
 # Evidence text must not inject mentions, control characters or Slack code fences.
@@ -1095,14 +1090,14 @@ def test_literal_text_cannot_inject_mentions_newlines_or_code_fences():
 @pytest.mark.parametrize("url", ["http://example.test", "https://user:pass@example.test", "https://example.test/<!here>", "https://example.test/\u202e", "https://example.test/" + "a" * 701, {"url": "https://example.test"}])
 def test_invalid_optional_urls_are_omitted(url):
     text = render(evidence={"build_url": url})
-    assert "|Failed build>" not in text
+    assert "|Build logs>" not in text
     assert JIRA in text
 
 
 # URL delimiters and entities must not escape the controlled Slack link syntax.
 def test_slack_url_delimiters_and_entities_are_escaped():
     text = render(evidence={"build_url": "https://example.test/a|b?q=1&x=2"})
-    assert "<https://example.test/a%7Cb?q=1&amp;x=2|Failed build>" in text
+    assert "<https://example.test/a%7Cb?q=1&amp;x=2|Build logs>" in text
 
 
 # Invalid or timezone-free completion times must never fall back to a check/creation timestamp.
@@ -1162,10 +1157,10 @@ def test_format_upgrade_does_not_resend_old_receipts_and_new_events_stay_threade
     assert jira.properties == before
     monkeypatch.setattr(dispatch, "slack_message", formatter)
     runner("update").run([observation(oid="new-build")])
-    assert "Failure update" in slack.calls[-1][0]
+    assert "Promotion gate failure" in slack.calls[-1][0]
     assert slack.calls[-1][1]["thread_ts"] == original_root["ts"]
     runner("recovery").run([observation("success", "passing-build")])
-    assert "Successful build observed" in slack.calls[-1][0]
+    assert "Recovery observed" in slack.calls[-1][0]
     assert slack.calls[-1][1]["thread_ts"] == original_root["ts"]
     assert jira.properties["RHAI-1"]["delivery"]["root"] == original_root
     assert len(slack.calls) == 3 and len(jira.issues) == 1
@@ -1253,13 +1248,13 @@ def test_production_presentation_is_labeled_without_claiming_global_recovery():
     target = jira_target('production')
     obs = observation(environment=target.scope, evidence={'synthetic': True, 'historical_snapshot': True})
     markdown = render_markdown(obs, **target.options)
-    assert markdown.startswith('# ' + literal('[GAP PRODUCTION] build failure: acme/repo'))
+    assert markdown.startswith('# Promotion Gate Failure in ' + literal('acme/repo') + ' (cpu)')
     assert 'Staging notification only' not in markdown
     assert 'Historical snapshot:' not in markdown and 'synthetic evidence:' not in markdown
     text = slack_message(dict(obs, status='success'), jira_url=target.url + '/browse/RHAI-1', **target.options)
     assert 'production Jira' in text and 'staging test' not in text
     assert 'Synthetic evidence' in text and 'Recorded snapshot' not in text
-    assert 'not a claim that the whole promotion is healthy' in text
+    assert 'Recovery observed' in text
 
 
 # Production creates must use Bug by name and atomically verify initial properties on that site.

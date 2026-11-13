@@ -27,7 +27,7 @@ def test_blocks_isolate_handle_and_bound_body():
     p = policy()
     body = "@everyone @here " + "x" * 6001
     blocks = p.blocks({"component": "api-v3-4", "status": "failure"}, body, root=True)
-    assert blocks[1]["text"] == {"type": "mrkdwn", "text": "*Owning team:* @api\n", "verbatim": False}
+    assert blocks[1]["text"] == {"type": "mrkdwn", "text": "*Owning team:* `@api`\n", "verbatim": True}
     assert "".join(b["text"]["text"] for b in blocks[2:-1]) == body
     assert all(b["text"]["verbatim"] and len(b["text"]["text"]) <= 3000 for b in blocks[2:-1])
     assert blocks[-1]["type"] == "context"
@@ -42,7 +42,7 @@ def test_failure_summary_integrates_team_and_links_to_both_mapping_files():
     blocks = policy().blocks({'component': 'api-v3-4', 'status': 'failure'}, body, root=True)
     summary, team = blocks[0]['text'], blocks[1]['text']
     assert summary == {'type': 'mrkdwn', 'text': body.split('\n*Repository:*')[0] + '\n', 'verbatim': True}
-    assert team == {'type': 'mrkdwn', 'text': '*Owning team:* @api\n', 'verbatim': False}
+    assert team == {'type': 'mrkdwn', 'text': '*Owning team:* `@api`\n', 'verbatim': True}
     assert blocks[2]['text']['text'] == '*Repository:* `example/repo`\nReported reason: @everyone @here'
     assert blocks[2]['text']['verbatim'] is True
     assert all('fields' not in block for block in blocks)
@@ -73,7 +73,7 @@ def test_long_component_and_owner_remain_separate_when_copied():
             '*Repository:* `red-hat-data-services/notebooks`\nBuild failed at: 2026-11-09 19:54:41 UTC')
     blocks = policy().blocks({'component': component, 'status': 'failure'}, body, root=True)
     copied = ''.join(block['text']['text'] for block in blocks[:-1])
-    assert f'*Component:* `{component}`\n*Owning team:* @devops\n*Repository:*' in copied
+    assert f'*Component:* `{component}`\n*Owning team:* `@devops`\n*Repository:*' in copied
     assert all('fields' not in block for block in blocks)
 
 
@@ -124,7 +124,7 @@ components:
     assert p.extra_fields({'component': 'api-v3-4', 'failed_task': 'clone-repository'}) == {
         'components': [{'name': 'API'}, {'name': 'Serving'}]}
     assert p.extra_fields({'component': 'api-v2'}) == {'components': [{'name': 'V2'}]}
-    assert p.blocks({'component': 'api', 'status': 'failure'}, 'body', root=True)[1]['text']['text'] == '*Owning team:* @devops\n'
+    assert p.blocks({'component': 'api', 'status': 'failure'}, 'body', root=True)[1]['text']['text'] == '*Owning team:* `@devops`\n'
     assert p.extra_fields({}) == {'components': [{'name': 'DevOps'}]}
 
 

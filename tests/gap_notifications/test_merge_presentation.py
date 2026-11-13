@@ -28,7 +28,7 @@ def render(obs, *, environment='stage', reply=False):
 def test_merge_links_are_bound_and_ignore_url_overrides(environment, reply, category):
     text = render(merge_observation(category), environment=environment, reply=reply)
     assert f'<https://github.com/acme/repo/commit/{SHA}|Commit aaaaaaa>' in text
-    expected = '<https://github.com/acme/repo/actions/runs/123/attempts/2|Feasibility run>'
+    expected = '<https://github.com/acme/repo/actions/runs/123/attempts/2|Feasibility Workflow>'
     assert (expected in text) == (category == 'feasibility')
     assert '|Child PR>' in text and '|Jira RHAI-1>' in text
     assert 'untrusted.example' not in text
@@ -46,7 +46,7 @@ def test_merge_identity_mismatch_omits_optional_links(field, value):
     obs = merge_observation()
     obs['evidence'][field] = value
     text = render(obs)
-    assert '|Commit ' not in text and '|Feasibility run>' not in text
+    assert '|Commit ' not in text and '|Feasibility Workflow>' not in text
     assert '|Jira RHAI-1>' in text
 
 
@@ -55,7 +55,7 @@ def test_merge_identity_mismatch_omits_optional_links(field, value):
 def test_unsafe_repository_cannot_supply_merge_links(repository):
     obs = merge_observation()
     obs['repository'] = repository
-    assert '|Commit ' not in render(obs) and '|Feasibility run>' not in render(obs)
+    assert '|Commit ' not in render(obs) and '|Feasibility Workflow>' not in render(obs)
 
 
 # Invalid or stale workflow execution identities omit only the workflow link, not a valid commit.
@@ -65,14 +65,14 @@ def test_workflow_link_requires_current_revision_and_real_attempt(field, value):
     obs = merge_observation()
     obs['evidence']['merge-receipt'][field] = value
     text = render(obs)
-    assert '|Feasibility run>' not in text and '|Commit aaaaaaa>' in text
+    assert '|Feasibility Workflow>' not in text and '|Commit aaaaaaa>' in text
 
 
 # Build messages must not inherit workflow links from unrelated merge receipt fields.
 def test_merge_links_do_not_apply_to_build_category():
     obs = merge_observation('build')
     text = render(obs)
-    assert '|Feasibility run>' not in text
+    assert '|Feasibility Workflow>' not in text
 
 
 # The same bound revision links remain useful in recovery replies without claiming build health.
@@ -80,5 +80,5 @@ def test_recovery_links_use_same_validated_evidence():
     obs = merge_observation()
     obs['status'] = obs['evidence']['status'] = 'success'
     text = render(obs, reply=True)
-    assert 'Feasibility restored' in text and '|Commit aaaaaaa>' in text and '|Feasibility run>' in text
+    assert 'Recovery observed' in text and '|Commit aaaaaaa>' in text and '|Feasibility Workflow>' in text
     assert 'Successful build' not in text
