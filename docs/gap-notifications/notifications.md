@@ -48,8 +48,8 @@ Note - the following additional fields also make up an incident, but these are n
 These fields are hashed to produce an "incident ID" for every observation. Once an incident ID is determined, the notification system goes through the following process.
 
 1. Search for an existing JIRA with a matching incident ID. 
-2. If it exists and is open, update the existing jira and slack thread with information about the new observation (this could mean closing the jira if the problem is resolved)
-3. If it does not exist, or a matching JIRA has already been closed, create a new JIRA and start a new slack notification thread.
+2. If an open match exists, update it and its Slack thread with information about the new observation — closing the Jira if the observation is a success and a verified done transition is configured.
+3. If no open match exists and the observation is a failure, create a new JIRA and start a new Slack notification thread. Unknown observations do none of these.
 
 ## Repo Secrets and Variables
 
@@ -60,7 +60,7 @@ These are the gap notification-related variables set in the gated-artifacts-prom
 | Variable | Description |
 |---|---|
 | `GAP_NOTIFICATION_MODE` | Selects `disabled` (default), `preview`, or `write` mode for monitor-run notifications. |
-| `GAP_JIRA_URL` | Selects the Jira destination — unset defaults to staging, `https://redhat.atlassian.net` selects production; anything else fails closed. |
+| `GAP_JIRA_URL` | Selects the Jira destination — unset defaults to staging; `https://stage-redhat.atlassian.net` and `https://redhat.atlassian.net` select staging and production respectively; anything else fails closed. |
 | `GAP_SLACK_CHANNEL` | The Slack channel ID that notifications are sent to |
 | `GAP_OWNERSHIP_CA_BUNDLE` | Optional path to a CA bundle for the internal GitLab ownership-mapping fetch. |
 | `JIRA_USER_EMAIL` | Jira account email (fallback name: `JIRA_API_EMAIL`) paired with the token below. |
@@ -75,9 +75,9 @@ These are the gap notification-related variables set in the gated-artifacts-prom
 ### Brief Overview of the Notification System's Pieces
 
 - `merge_receipts.py` — runs inside the PR monitor during gate evaluation, snapshotting conflict and feasibility evidence (PR mergeability, workflow runs/checks) into `state.json`. 
-- `monitor_hook.py` — runs after the PR monitor. It can be set to either `disabled|preview|write` to globally control notification behavior.
-- `analyze_leader_state.py` / `analyze_merge_state.py` — offline analyzers that read the published `state.json` (including `merge_receipts` output) and normalize it into observations. They never query live services or invent recovery from aggregate PR status (that is the job of the PR monitor).
-- `dispatch_incidents.py` — the dispatcher: takes observations and drives the incident lifecycle against the Jira registry (search/update/create/close via `notify_tools`). Failures create or reuse issues, explicit successes close them, and anything ambiguous holds rather than guessing.
+- `monitor_hook.py` — runs inside the PR monitor, after state publication, and controls monitor notifications (the standalone CLI writes independently). It can be set to either `disabled|preview|write` to control notification behavior.
+- `analyze_leader_state.py` / `analyze_merge_state.py` — offline analyzers that read the published `state.json` (including `merge_receipts` output) and normalize it into observations. They never query live services (the monitor has already captured the evidence) or invent recovery from aggregate PR status.
+- `dispatch_incidents.py` — the dispatcher: takes observations and drives the incident lifecycle against the Jira registry (search/update/create/close via `notify_tools`). Failures create or reuse issues, explicit successes close them when a verified done transition is configured, and anything ambiguous holds rather than guessing.
 - `notify_tools.py` — makes working with Jira/Slack easier. Jira/Slack facades, bounded content, templates (`templates/issue.md.j2`, `slack.md.j2`), managed ADF sections (the cosmetic "Slack discussion" and "notification metadata" projections).
 - `ownership.py` — live component/team ownership mapping (GitLab konflux-to-jira map + rhoai-ops GitHub repo map) used to assign Jira components and @-mention owning Slack teams.
 - `lookup_tools.py` — read-only inspection/tracking (feeds the "Jira / Slack" column in the Leader PR failure report comment table).
