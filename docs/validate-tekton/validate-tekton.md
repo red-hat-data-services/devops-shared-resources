@@ -231,7 +231,7 @@ Defined in `lib/tekton_matchers.py` with `@parent_matcher`. Each receives `(pare
 
 ## Template Overlays
 
-Overlays let specific components override individual template fields while inheriting the rest from the base template. Stored under `{config-dir}/{component-prefix}/{template-file}`. Deep-merged onto the base template before rendering.
+Overlays override individual template fields while inheriting the base template. Selection precedence is component label, component prefix, then explicitly configured directory mapping. Generation, validation and fix share this selection for flat and nested layouts. The selected overlay is deep-merged onto the base template before rendering, and all selectors are checked for traversal and symlink escapes.
 
 ## Filters
 
@@ -255,7 +255,8 @@ Filters are defined in `lib/tekton_filters.py`. Mark a function with `@jinja_fil
 | `validate_cel(branch, filename)` | CEL must reference branch and filename; auto-fixes wrong branch |
 | `validate_cel_tekton_ignore` | Replaces bad `!".tekton/**".pathChanged()` with `files.all.exists(...)` |
 | `to_pr_cel` | Replaces `event == "push"` with `event == "pull_request"` |
-| `to_stable_pr_cel(filename, labels_str)` | Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
+| `strip_release_push_selectors(filename)` | Removes push event/branch selectors, retaining all guards and path conditions and rewriting the optional pipeline filename. Returns `true` if unrestricted; adds no PR event or repository policy. |
+| `release_push_to_main_pr_cel(filename, labels_str)` | Legacy compatibility filter (also available as `to_stable_pr_cel`). Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
 
 ### Validation Filters
 
@@ -307,15 +308,13 @@ validate-tekton [OPTIONS]
 
 ## CEL Expression Parsing
 
-The `lib/cel.py` module uses [cel-python](https://github.com/cloud-custodian/cel-python) (Lark-based parser) to parse CEL expressions into ASTs for structural transformation.
+New templates use `strip_release_push_selectors` to retain push conditions while explicitly declaring the PR event and any additional CEL arms in YAML/Jinja. It uses `extract_push_conditions` from `lib/cel.py`, preserves multiple path clauses, rewrites the pipeline filename, and returns `true` when unrestricted. Unsupported top-level ORs are rejected.
 
-Key functions:
+The notebooks overlay in `tekton-templates/kc-migration/notebooks/pull-request.yaml.j2` owns the main-to-stable sync policy: it bypasses normal image paths only when `manifests/rhoai/base/params-latest.env` changes. It explicitly replaces the inherited, canonically rendered `!pathChanged(params)` veto with `files.all.exists(...)`, so mixed source-and-params changes build normally while ordinary params-only PRs do not. Release push files are not changed.
 
-- `decompose_push_cel(expr)` — splits a push CEL into event, branch, negative guards, and path conditions
-- `replace_tekton_filename(tree, filename)` — swaps `.tekton/*.yaml` string literals in pathChanged calls
-- `build_stable_pr_cel(path_conditions, negative_guards, labels, target_branch)` — assembles a PR CEL expression
+`release_push_to_main_pr_cel` and its alias `to_stable_pr_cel` remain legacy compatibility entry points with their existing label and automatic notebooks bypass behavior. New templates do not call them.
 
-This powers the `to_stable_pr_cel` filter, which converts push pipeline CEL triggers into PR pipeline CEL triggers.
+`lib/cel.py` owns structural parsing with [cel-python](https://github.com/cloud-custodian/cel-python): `extract_push_conditions` returns negative guards and the path subtree without choosing PR trigger arms. It also provides `flatten_and`, `replace_tekton_filename`, and `path_conditions_to_text`. Trigger policy tests live in `tests/test_tekton_filters.py`; parsing and AST utility tests live in `tests/test_cel.py`.
 
 ## File Layout
 
@@ -350,3 +349,21 @@ docs/
   validate-tekton/
     validate-tekton.md         # This file
 ```
+
+### Explicit directory overlays
+
+Configure source scopes explicitly; repository names do not select overlays:
+
+```yaml
+template_overlays:
+  - pipeline_dir: pipelineruns/notebooks
+    template_dir: notebooks
+```
+
+`pipeline_dir` is a normalized repository-root-relative directory scope (matched
+on directory boundaries); `template_dir` is relative to the configuration root
+and may have an unrelated name. Source scopes must not overlap. Template roots
+must exist and must not traverse symlinks. Absolute paths and traversal are
+rejected. Selection precedence is component label, component prefix, directory
+mapping, then base template. Without mappings only component overlays apply.
+The same mapping is used for generation, validation and fix.

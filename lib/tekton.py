@@ -341,21 +341,22 @@ def _resolve_value(val: str, path: tuple, existing_data: dict, parent_data: dict
     return result
 
 
-def resolve_overlay(config_dir, template_name, component_prefix, component_label):
-    """Find a component-specific template overlay.
-
-    Checks: {config_dir}/{component_label}/{template_name} (version-specific), then
-            {config_dir}/{component_prefix}/{template_name} (general fallback).
-
-    Both target-derived selectors are checked before selecting either candidate.
-    Absolute paths, traversal, malformed selectors and symlink escapes raise
-    ValueError before template reads/rendering, even when no overlay exists.
-    Nested names and symlinks contained within the trusted config root remain
-    supported; the caller must keep that trusted tree stable while rendering.
-    """
-    # Target metadata selects names, never executable template locations outside
-    # the trusted config root. Check BOTH selectors before honoring precedence:
-    # a valid label must not hide an unsafe derived-prefix fallback.
+def resolve_overlay(config_dir, template_name, component_prefix, component_label, *, pipeline_path=None, repository_root=None, mappings=()):
+    """Select label, prefix, then explicitly directory-mapped overlay; otherwise base."""
+    mapped = None
+    if mappings:
+        if repository_root is None or pipeline_path is None:
+            raise ValueError("directory overlays require explicit repository root and pipeline path")
+        root = Path(repository_root).resolve()
+        path = Path(pipeline_path)
+        if not path.is_absolute():
+            path = root / path
+        if not path.resolve().is_relative_to(root):
+            raise ValueError("pipeline path escapes repository root")
+        relative = path.resolve().relative_to(root)
+        for entry in mappings:
+            if relative.is_relative_to(entry["pipeline_dir"]):
+                mapped = entry["template_dir"]
     base = Path(config_dir)
     trusted_root = base.resolve()
 
@@ -369,7 +370,8 @@ def resolve_overlay(config_dir, template_name, component_prefix, component_label
     relative_name(template_name, "template name")
     candidates = []
     for field, selector in (("component label", component_label),
-                            ("component prefix", component_prefix)):
+                            ("component prefix", component_prefix),
+                            ("directory mapping", mapped)):
         if selector is None or selector == "":
             continue
         relative_name(selector, field)

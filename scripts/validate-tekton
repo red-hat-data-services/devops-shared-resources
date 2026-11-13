@@ -228,12 +228,13 @@ def _find_parent_pipeline(child_data: dict, candidate_pipelines: dict, match_fn_
     return None
 
 
-def _resolve_pipeline_overlay(config, tmpl_config, filepath, data):
+def _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout, repository_root):
     """Resolve a template overlay for a pipeline file."""
     prefix = extract_component_prefix(filepath.name, data)
     label = (data.get("metadata", {}).get("labels") or {}).get(
         "appstudio.openshift.io/component")
-    return resolve_overlay(config.config_dir, tmpl_config.file, prefix, label)
+    return resolve_overlay(config.config_dir, tmpl_config.file, prefix, label,
+                           pipeline_path=filepath, repository_root=repository_root, mappings=config.template_overlays)
 
 
 def _selection_context(tekton_dir, layout, config, branch):
@@ -305,7 +306,7 @@ def validate_tekton_dir(
             raise ValueError("generated children require working-tree parents, not parent_ref")
         if not yaml_errors:
             try:
-                expected, orphans = plan_children(pipelines, config, branch, cli_vars)
+                expected, orphans = plan_children(pipelines, config, branch, cli_vars, repository_root=tekton_dir if layout == 'nested' else tekton_dir.parent)
             except ValueError as exc:
                 results["generation"] = {"errors": [str(exc)], "warnings": []}
             else:
@@ -342,7 +343,7 @@ def validate_tekton_dir(
 
         template_path = str(Path(config.config_dir) / tmpl_config.file)
 
-        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout, tekton_dir if layout == 'nested' else tekton_dir.parent)
         if overlay:
             overlay_rel = str(Path(overlay).relative_to(config.config_dir))
             info(f"  {filepath.name}: using overlay {overlay_rel}")
@@ -354,7 +355,7 @@ def validate_tekton_dir(
             parent_tmpl = config.get_template(tmpl_config.parent.template)
             if parent_tmpl:
                 check_template = str(Path(config.config_dir) / parent_tmpl.file)
-                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data)
+                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data, layout, tekton_dir if layout == 'nested' else tekton_dir.parent)
                 check_errors = []
                 render_and_merge(
                     str(Path(check_template).parent), Path(check_template).name,
@@ -467,7 +468,7 @@ def fix_tekton_dir(
         if yaml_errors or external_parent_indexes is not None:
             return [], {str(path): data for path, data in pipelines.items()}
         try:
-            expected, _ = plan_children(pipelines, config, branch, cli_vars)
+            expected, _ = plan_children(pipelines, config, branch, cli_vars, repository_root=tekton_dir if layout == 'nested' else tekton_dir.parent)
         except ValueError as exc:
             warn(str(exc))
             return [], {str(path): data for path, data in pipelines.items()}
@@ -488,6 +489,11 @@ def fix_tekton_dir(
 
     fixed_files = []
     deleted_files = set()
+
+    def post_fix_key(filepath):
+        # Directory mappings need the original path during in-memory validation.
+        # Preserve the historical basename keys for flat-layout callers.
+        return str(filepath.resolve()) if layout == "nested" else filepath.name
     post_fix_data = {}
 
     # Phase 1: Fix non-child pipelines (those with no parent config).
@@ -500,14 +506,14 @@ def fix_tekton_dir(
             tmpl_config = config.get_template(pipeline_type)
 
             if tmpl_config and tmpl_config.parent:
-                post_fix_data[filepath.name] = data
+                post_fix_data[post_fix_key(filepath)] = data
                 continue
 
             if not tmpl_config:
-                post_fix_data[filepath.name] = data
+                post_fix_data[post_fix_key(filepath)] = data
                 continue
 
-            overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+            overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout, tekton_dir if layout == 'nested' else tekton_dir.parent)
             if overlay:
                 overlay_rel = str(Path(overlay).relative_to(config.config_dir))
                 info(f"  {filepath.name}: using overlay {overlay_rel}")
@@ -536,14 +542,14 @@ def fix_tekton_dir(
                 if prefix and pipeline_type in parent_indexes:
                     parent_indexes[pipeline_type][prefix] = result
 
-            post_fix_data[filepath.name] = result
+            post_fix_data[post_fix_key(filepath)] = result
     else:
         # With external parents, just populate post_fix_data for non-child pipelines
         for filepath, data in sorted(pipelines.items()):
             pipeline_type = classify_pipeline(filepath.name, data, config=config)
             tmpl_config = config.get_template(pipeline_type)
             if not tmpl_config or not tmpl_config.parent:
-                post_fix_data[filepath.name] = data
+                post_fix_data[post_fix_key(filepath)] = data
 
     # Phase 2: Fix child pipelines (those with a parent config, using fixed parent data)
     for filepath, data in sorted(pipelines.items()):
@@ -552,7 +558,7 @@ def fix_tekton_dir(
         if not tmpl_config or not tmpl_config.parent:
             continue
 
-        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data)
+        overlay = _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout, tekton_dir if layout == 'nested' else tekton_dir.parent)
         if overlay:
             overlay_rel = str(Path(overlay).relative_to(config.config_dir))
             info(f"  {filepath.name}: using overlay {overlay_rel}")
@@ -562,7 +568,7 @@ def fix_tekton_dir(
         if external_parent_indexes is None:
             parent_tmpl = config.get_template(tmpl_config.parent.template)
             if parent_tmpl:
-                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data)
+                check_overlay = _resolve_pipeline_overlay(config, parent_tmpl, filepath, data, layout, tekton_dir if layout == 'nested' else tekton_dir.parent)
                 check_errors = []
                 render_and_merge(
                     config.config_dir, parent_tmpl.file, data, filepath.name, branch,
@@ -575,7 +581,7 @@ def fix_tekton_dir(
                     info(f"  {filepath.name}: {'deleted' if not dry_run else 'would delete'}")
                     fixed_files.append(filepath.name)
                     deleted_files.add(filepath.name)
-                    del post_fix_data[filepath.name]
+                    del post_fix_data[post_fix_key(filepath)]
                     continue
 
         parent_data = _find_parent_pipeline(
@@ -602,7 +608,7 @@ def fix_tekton_dir(
             info(f"  {filepath.name}: {'deleted' if not dry_run else 'would delete'}")
             fixed_files.append(filepath.name)
             deleted_files.add(filepath.name)
-            del post_fix_data[filepath.name]
+            del post_fix_data[post_fix_key(filepath)]
             continue
 
         if result != data:
@@ -610,7 +616,7 @@ def fix_tekton_dir(
             info(f"  {filepath.name}: {'fixed' if not dry_run else 'would fix'} via template")
             fixed_files.append(filepath.name)
 
-        post_fix_data[filepath.name] = result
+        post_fix_data[post_fix_key(filepath)] = result
 
     return fixed_files, post_fix_data
 

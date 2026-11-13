@@ -10,7 +10,7 @@ from lib.tekton import classify_pipeline, extract_component_prefix, render_and_m
 from lib.tekton_matchers import make_parent_matchers
 
 
-def plan_children(pipelines, config, branch, cli_vars=None):
+def plan_children(pipelines, config, branch, cli_vars=None, *, repository_root=None):
     """Return expected {path: data}, orphan paths. Plan everything before writes.
 
     A generated child is rebuilt from its parent, not merged with stale child
@@ -97,7 +97,8 @@ def plan_children(pipelines, config, branch, cli_vars=None):
             if len({p["name"] for p in params}) != len(params):
                 raise ValueError(f"duplicate parent params: {parent_path}")
             overlay = resolve_overlay(config.config_dir, tmpl.file, prefix,
-                                      (parent.get("metadata", {}).get("labels") or {}).get("appstudio.openshift.io/component"))
+                                      (parent.get("metadata", {}).get("labels") or {}).get("appstudio.openshift.io/component"),
+                                      pipeline_path=path, repository_root=repository_root, mappings=config.template_overlays)
             errors = []
             result = render_and_merge(config.config_dir, tmpl.file, seed, path.name, branch,
                                       parent_data=parent, cli_vars=cli_vars, mode="fix", errors=errors,

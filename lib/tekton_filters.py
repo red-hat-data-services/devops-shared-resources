@@ -401,77 +401,105 @@ def validate_cel_tekton_ignore(value):
         )
     return fixed
 
+
 @jinja_filter
-def to_stable_pr_cel(value, filename="", labels_str=""):
-    """Convert a push CEL expression into a PR CEL expression for stable branch.
+def strip_release_push_selectors(value, filename=""):
+    """Remove push event/branch selectors, retaining guards and path conditions.
 
-    Takes the parent push pipeline's on-cel-expression and produces a PR CEL
-    that triggers on target_branch == "stable" with the same pathChanged
-    conditions. Optionally includes a label trigger arm if labels_str is
-    provided.
-
-    The path conditions (pathChanged, files.all.exists) are extracted from the
-    push CEL, with the .tekton filename updated to the PR filename.
-    Push triggers without path conditions remain unrestricted by paths.
-    The exact notebooks params-latest.env exclusion adds a main->stable sync
-    arm outside the entire path conjunction, so bump-only sync PRs also build.
-
-    Args:
-        value: The push pipeline's on-cel-expression string.
-        filename: The PR PipelineRun filename (e.g. "odh-dashboard-pull-request.yaml").
-        labels_str: The existing on-label annotation value
-                    (e.g. "[kfbuild-all, kfbuild-dashboard]"). When empty or
-                    not provided, only the stable+pathChanged arm is generated.
-
-    >>> to_stable_pr_cel('event == "push" && target_branch == "rhoai-3.6" && ".tekton/x-v3-6-push.yaml".pathChanged()', "x-pull-request.yaml", "")
-    'event == "pull_request"...'
+    Rewrite .tekton YAML filenames when filename is provided. Return "true"
+    when no conditions remain. This filter adds no event or repository policy.
     """
-    import copy
+    from lib.cel import extract_push_conditions, path_conditions_to_text, replace_tekton_filename
+
+    expression = str(value)
+    if not expression.strip():
+        raise ValidationError("push CEL expression is empty")
+    try:
+        guards, paths = extract_push_conditions(expression)
+    except ValueError as e:
+        raise ValidationError(f"cannot decompose push CEL: {e}") from e
+    if paths is not None:
+        if filename:
+            replace_tekton_filename(paths, filename)
+        guards.append(path_conditions_to_text(paths))
+    return "\n&& ".join(guards) or "true"
+
+
+def _is_notebooks_sync_guard(guard):
+    """Only the exact params-latest.env exclusion permits the sync bypass."""
+    return re.fullmatch(
+        r'!\s*\(\s*"manifests/rhoai/base/params-latest\.env"\.pathChanged\(\)\s*\)',
+        guard,
+    ) is not None
+
+
+@jinja_filter
+def release_push_to_main_pr_cel(value, filename="", labels_str=""):
+    """Convert a push trigger into a PR trigger with optional bypass arms.
+
+    Ordinary PRs retain the push trigger's negative guards and path conditions,
+    but not its branch selector. Labels can bypass those conditions. The exact
+    notebooks params-latest.env exclusion also permits main-to-stable sync PRs
+    regardless of paths. Every arm still requires the pull_request event.
+
+    filename replaces the push PipelineRun filename in path conditions;
+    labels_str is the optional on-label annotation, e.g. "[kfbuild-all]".
+    """
     from lib.cel import (
-        build_stable_pr_cel,
-        decompose_push_cel,
-        parse_label_list,
+        extract_push_conditions,
         path_conditions_to_text,
         replace_tekton_filename,
     )
 
-    v = str(value)
-    if not v.strip():
+    expression = str(value)
+    if not expression.strip():
         raise ValidationError("push CEL expression is empty")
-
     try:
-        parts = decompose_push_cel(v)
+        guards, path_tree = extract_push_conditions(expression)
     except ValueError as e:
-        raise ValidationError(f"cannot decompose push CEL: {e}")
+        raise ValidationError(f"cannot decompose push CEL: {e}") from e
 
-    # Parse labels from on-label annotation (optional)
-    labels = parse_label_list(labels_str) or None
-
-    # Notebooks main->stable sync PRs bump manifests/rhoai/base/params-latest.env,
-    # which the push trigger's negative guard excludes. Carry an escape-hatch arm
-    # so those sync PRs still trigger builds even when the changed files do not
-    # match the per-image path filters. Match only this exact exclusion, not arbitrary
-    # negative expressions that happen to mention params-latest.env.
-    stable_sync_escape = None
-    if any(re.fullmatch(
-        r'!\s*\(\s*"manifests/rhoai/base/params-latest\.env"\.pathChanged\(\)\s*\)',
-        guard,
-    ) for guard in parts["negative_guards"]):
-        stable_sync_escape = '(source_branch == "main" && target_branch == "stable")'
-
-    # Replace .tekton filename in path conditions
-    path_text = ""
-    if parts["path_conditions_tree"] is not None:
-        path_tree = copy.deepcopy(parts["path_conditions_tree"])
+    # The normal arm retains guards and rewrites the PR pipeline's own path.
+    path_parts = list(guards)
+    if path_tree is not None:
         if filename:
             replace_tekton_filename(path_tree, filename)
-        path_text = path_conditions_to_text(path_tree)
+        path_parts.append(path_conditions_to_text(path_tree))
+    if not path_parts:
+        # An unrestricted normal arm already permits every PR.
+        return 'event == "pull_request"'
 
-    # Build the CEL expression
-    return build_stable_pr_cel(
-        path_text, parts["negative_guards"], labels=labels,
-        stable_sync_escape=stable_sync_escape,
+    # Optional alternatives bypass the whole guarded path arm.
+    labels = [
+        label.strip()
+        for label in (labels_str or "").strip().strip("[]").split(",")
+        if label.strip()
+    ]
+    arms = []
+    if labels:
+        labels_quoted = ", ".join(f'"{label}"' for label in labels)
+        arms.append(
+            "has(body.pull_request.labels)\n"
+            f"    && body.pull_request.labels.exists(l, l.name in [{labels_quoted}])"
+        )
+    if any(_is_notebooks_sync_guard(guard) for guard in guards):
+        arms.append('(source_branch == "main" && target_branch == "stable")')
+
+    if not arms:
+        return 'event == "pull_request"\n&& ' + "\n&& ".join(path_parts)
+
+    arms.append("\n    && ".join(path_parts))
+    arms_text = "\n  )\n  ||\n  (\n    ".join(arms)
+    return (
+        'event == "pull_request"\n'
+        "&& (\n"
+        f"  (\n    {arms_text}\n  )\n"
+        ")"
     )
+
+
+# Compatibility alias for templates and Python callers migrating to the new name.
+to_stable_pr_cel = release_push_to_main_pr_cel
 
 
 @jinja_filter
