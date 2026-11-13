@@ -4,8 +4,21 @@ import ast as python_ast
 import re
 
 import celpy
-from celpy.celparser import tree_dump
+from celpy.celparser import DumpAST
 from lark import Token, Tree
+
+
+class _CELDumpAST(DumpAST):
+    """Avoid celpy's extra separator after comparison operators."""
+
+    def relation(self, tree):
+        if len(tree.children) == 1:
+            return
+        right = self.stack.pop()
+        left = self.stack.pop()
+        # relation_eq and its siblings already append the operator's space.
+        # Join AST fragments, not source text: literal whitespace stays intact.
+        self.stack.append(f"{left}{right}")
 
 
 def flatten_and(node):
@@ -233,4 +246,4 @@ def path_conditions_to_text(tree):
         str: The CEL text for the path conditions.
     """
     wrapped = Tree("expr", [Tree("conditionalor", [Tree("conditionaland", [tree])])])
-    return tree_dump(wrapped)
+    return _CELDumpAST.display(wrapped)

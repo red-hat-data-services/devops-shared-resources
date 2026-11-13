@@ -35,6 +35,31 @@ def test_compliant_selector_stays_byte_identical(expression):
     assert ensure_cel_selectors(expression, {"route": "old"}) == expression
 
 
+@pytest.mark.parametrize("spacing", [" ", "  ", "\n  "])
+def test_added_cluster_guard_keeps_branch_comparison_spacing(spacing):
+    expression = (
+        'event == "push" && target_branch ==' + spacing + '"rhoai-3.7-ea.1"'
+        ' && message == "keep  ==  spaces"'
+    )
+    desired = {"konflux_cluster": "stone-prod-p02"}
+    result = ensure_cel_selectors(expression, desired)
+    assert result == (
+        'konflux_cluster == "stone-prod-p02"\n'
+        '&& event == "push"\n'
+        '&& target_branch == "rhoai-3.7-ea.1"\n'
+        '&& message == "keep  ==  spaces"'
+    )
+    assert ensure_cel_selectors(result, desired) == result
+    env = celpy.Environment()
+    for branch in ["rhoai-3.7-ea.1", "wrong-branch"]:
+        for cluster in ["stone-prod-p02", "other"]:
+            actual = env.program(env.compile(result)).evaluate(celpy.json_to_cel({
+                "event": "push", "target_branch": branch,
+                "konflux_cluster": cluster, "message": "keep  ==  spaces",
+            }))
+            assert bool(actual) == (branch == "rhoai-3.7-ea.1" and cluster == "stone-prod-p02")
+
+
 def test_adds_guard_around_entire_or():
     expression = ensure_cel_selectors('source || sync', {"route": "new"})
     env = celpy.Environment()
@@ -46,7 +71,7 @@ def test_adds_guard_around_entire_or():
 def test_absence_and_multiple_desired_selectors():
     expression = 'event == "push" && target_branch == "release" && route == "old" && event_extra == "keep"'
     result = reconcile_filter(expression, {"event": "pull_request", "target_branch": ABSENT, "route": "new"})
-    assert "target_branch" not in result and 'event_extra ==  "keep"' in result
+    assert "target_branch" not in result and 'event_extra == "keep"' in result
     assert 'event == "pull_request"' in result and 'route == "new"' in result
     assert ensure_cel_selectors('route == "old"', {"route": None}) == "true"
     assert ensure_cel_selectors('route == "old"', {}) == 'route == "old"'
