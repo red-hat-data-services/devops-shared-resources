@@ -58,6 +58,7 @@ class PipelineConfig:
     selection_template: str | None = None
     context_paths: tuple[str, ...] = ()
     publication_branches: tuple[str, ...] | None = None
+    template_overlays: tuple[dict, ...] = ()
 
     def get_template(self, name: str) -> TemplateConfig | None:
         for t in self.templates:
@@ -217,6 +218,27 @@ def load_config(config_dir: str, config_file: str | None = None) -> PipelineConf
         parent_ref=parent_ref,
         tekton_layout=tekton_layout,
     )
+    overlays = raw.get("template_overlays", [])
+    if not isinstance(overlays, list):
+        raise ValueError("template_overlays must be a list")
+    scopes = []
+    for entry in overlays:
+        if not isinstance(entry, Mapping) or set(entry) != {"pipeline_dir", "template_dir"}:
+            raise ValueError("template_overlays entries require pipeline_dir and template_dir")
+        for value in entry.values():
+            if (not isinstance(value, str) or not value or value == "."
+                    or Path(value).is_absolute() or ".." in Path(value).parts
+                    or Path(value).as_posix() != value or "\\" in value
+                    or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+                raise ValueError("template_overlays paths must be normalized relative paths")
+        scope = Path(entry["pipeline_dir"])
+        if any(scope.is_relative_to(other) or other.is_relative_to(scope) for other in scopes):
+            raise ValueError("template_overlays source scopes overlap")
+        scopes.append(scope)
+        target = Path(config_dir).resolve() / entry["template_dir"]
+        if not target.is_dir() or target.resolve() != target:
+            raise ValueError("template_overlays template_dir must be a non-symlink directory")
+    config.template_overlays = tuple(dict(entry) for entry in overlays)
     selection = raw.get("selection_template")
     if selection is not None:
         if (not isinstance(selection, str) or not selection or Path(selection).is_absolute()

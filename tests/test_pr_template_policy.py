@@ -5,7 +5,7 @@ import celpy
 import pytest
 from ruamel.yaml import YAML
 
-from lib.tekton import pipeline_repository, render_and_merge, resolve_overlay
+from lib.tekton import render_and_merge, resolve_overlay
 from lib.tekton_filters import ValidationError, strip_release_push_selectors
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -41,17 +41,18 @@ def test_repository_overlay_precedence_and_scope(tmp_path):
         folder = tmp_path / selector
         folder.mkdir()
         (folder / "pr.yaml.j2").write_text("metadata: {}\n")
-    assert resolve_overlay(tmp_path, "pr.yaml.j2", None, None, "notebooks") == str(tmp_path / "notebooks/pr.yaml.j2")
-    assert resolve_overlay(tmp_path, "pr.yaml.j2", "component", None, "notebooks") == str(tmp_path / "component/pr.yaml.j2")
-    assert resolve_overlay(tmp_path, "pr.yaml.j2", "component", "component-v3-7", "notebooks") == str(tmp_path / "component-v3-7/pr.yaml.j2")
-    assert pipeline_repository("pipelineruns/notebooks/.tekton/pr.yaml", "nested") == "notebooks"
-    assert pipeline_repository("pipelineruns/notebooks/.tekton/pr.yaml", "flat") is None
-    assert pipeline_repository("unrelated/notebooks/.tekton/pr.yaml", "nested") is None
-    with pytest.raises(ValueError, match="unsafe overlay repository"):
-        resolve_overlay(tmp_path, "pr.yaml.j2", "component", None, "../escape")
-    (tmp_path / "escape").symlink_to(tmp_path.parent, target_is_directory=True)
-    with pytest.raises(ValueError, match="escapes trusted"):
-        resolve_overlay(tmp_path, "pr.yaml.j2", "component", None, "escape")
+    options = dict(repository_root=tmp_path, pipeline_path=tmp_path / "sources/project/pr.yaml",
+                   mappings=[dict(pipeline_dir="sources/project", template_dir="notebooks")])
+    assert resolve_overlay(tmp_path, "pr.yaml.j2", None, None, **options) == str(tmp_path / "notebooks/pr.yaml.j2")
+    assert resolve_overlay(tmp_path, "pr.yaml.j2", "component", None, **options) == str(tmp_path / "component/pr.yaml.j2")
+    assert resolve_overlay(tmp_path, "pr.yaml.j2", "component", "component-v3-7", **options) == str(tmp_path / "component-v3-7/pr.yaml.j2")
+    assert resolve_overlay(tmp_path, "pr.yaml.j2", None, None) is None
+    options["pipeline_path"] = tmp_path / "sources/project-other/pr.yaml"
+    assert resolve_overlay(tmp_path, "pr.yaml.j2", None, None, **options) is None
+    options["pipeline_path"] = tmp_path.parent / "escape.yaml"
+    with pytest.raises(ValueError, match="escapes repository"):
+        resolve_overlay(tmp_path, "pr.yaml.j2", "component", None, **options)
+
 
 
 @pytest.mark.parametrize("source,target,event,changed,expected", [
@@ -74,7 +75,7 @@ def test_notebooks_rendered_trigger(source, target, event, changed, expected):
         ' && ("src/**".pathChanged() || ".tekton/push.yaml".pathChanged())'
     )
     config = ROOT / "tekton-templates/kc-migration"
-    overlay = resolve_overlay(config, "pull-request.yaml.j2", None, None, "notebooks")
+    overlay = resolve_overlay(config, "pull-request.yaml.j2", None, None, repository_root=ROOT, pipeline_path=ROOT / "pipelineruns/notebooks/.tekton/pr.yaml", mappings=[dict(pipeline_dir="pipelineruns/notebooks", template_dir="notebooks")])
     result = render_and_merge(str(config), "pull-request.yaml.j2", child, "pr.yaml", "main",
                               parent_data=parent, mode="fix", errors=[], overlay_path=overlay)
     expression = str(result["metadata"]["annotations"][key])

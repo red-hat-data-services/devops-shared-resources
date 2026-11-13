@@ -231,7 +231,7 @@ Defined in `lib/tekton_matchers.py` with `@parent_matcher`. Each receives `(pare
 
 ## Template Overlays
 
-Overlays override individual template fields while inheriting the base template. Selection precedence is component label, component prefix, then repository directory. In nested layout, `pipelineruns/notebooks/.tekton/*.yaml` can use `{config-dir}/notebooks/{template-file}`. Repository selection is shared by child generation and validation; flat layout has no repository fallback. The selected overlay is deep-merged onto the base template before rendering, and all selectors are checked for traversal and symlink escapes.
+Overlays override individual template fields while inheriting the base template. Selection precedence is component label, component prefix, then explicitly configured directory mapping. Generation, validation and fix share this selection for flat and nested layouts. The selected overlay is deep-merged onto the base template before rendering, and all selectors are checked for traversal and symlink escapes.
 
 ## Filters
 
@@ -349,3 +349,21 @@ docs/
   validate-tekton/
     validate-tekton.md         # This file
 ```
+
+### Explicit directory overlays
+
+Configure source scopes explicitly; repository names do not select overlays:
+
+```yaml
+template_overlays:
+  - pipeline_dir: pipelineruns/notebooks
+    template_dir: notebooks
+```
+
+`pipeline_dir` is a normalized repository-root-relative directory scope (matched
+on directory boundaries); `template_dir` is relative to the configuration root
+and may have an unrelated name. Source scopes must not overlap. Template roots
+must exist and must not traverse symlinks. Absolute paths and traversal are
+rejected. Selection precedence is component label, component prefix, directory
+mapping, then base template. Without mappings only component overlays apply.
+The same mapping is used for generation, validation and fix.

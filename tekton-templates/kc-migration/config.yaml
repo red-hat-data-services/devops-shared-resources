@@ -1,3 +1,7 @@
+template_overlays:
+  - pipeline_dir: pipelineruns/notebooks
+    template_dir: notebooks
+
 parent_ref: origin/rhoai-3.6
 tekton_layout: nested
 

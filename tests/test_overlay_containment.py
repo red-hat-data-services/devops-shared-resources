@@ -128,3 +128,29 @@ def test_validator_rejects_before_any_template_read_or_render(tmp_path, monkeypa
         else:
             validator.fix_tekton_dir(target, "rhoai-3.6", None, dry_run=False, config=config)
     assert original_read(path) == original
+
+
+@pytest.mark.parametrize("source", ["inputs/project/pr.yaml", "inputs/project/.tekton/pr.yaml"])
+def test_explicit_mapping_arbitrary_names_and_normalized_root(tmp_path, source):
+    (tmp_path / "policy").mkdir()
+    (tmp_path / "policy/custom-name").mkdir()
+    template = tmp_path / "policy/custom-name/pr.yaml.j2"
+    template.write_text("trusted")
+    options = dict(repository_root=tmp_path / "unused/..",
+                   pipeline_path=tmp_path / source,
+                   mappings=[dict(pipeline_dir="inputs/project", template_dir="custom-name")])
+    assert resolve_overlay(tmp_path / "policy", "pr.yaml.j2", None, None, **options) == str(template)
+    options["pipeline_path"] = tmp_path / "inputs/project-other/pr.yaml"
+    assert resolve_overlay(tmp_path / "policy", "pr.yaml.j2", None, None, **options) is None
+
+
+def test_mapped_source_symlink_escape_checked_before_component(tmp_path):
+    root = tmp_path / "repo"
+    root.mkdir()
+    (root / "sources").symlink_to(tmp_path, target_is_directory=True)
+    (root / "component").mkdir()
+    (root / "component/pr.yaml.j2").write_text("trusted")
+    with pytest.raises(ValueError, match="escapes repository"):
+        resolve_overlay(root, "pr.yaml.j2", "component", None,
+                        repository_root=root, pipeline_path=root / "sources/pr.yaml",
+                        mappings=[dict(pipeline_dir="sources", template_dir="component")])
