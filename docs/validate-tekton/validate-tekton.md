@@ -255,8 +255,8 @@ Filters are defined in `lib/tekton_filters.py`. Mark a function with `@jinja_fil
 | `validate_cel(branch, filename)` | CEL must reference branch and filename; auto-fixes wrong branch |
 | `validate_cel_tekton_ignore` | Replaces bad `!".tekton/**".pathChanged()` with `files.all.exists(...)` |
 | `to_pr_cel` | Replaces `event == "push"` with `event == "pull_request"` |
-| `cel_selectors(desired)` | Reconciles explicitly named string-equality selectors to template-supplied values; `ABSENT` removes a selector. Preserves compliant text, unrelated guards, and paths. Template comparison reports drift in validation and writes the desired expression in fix mode. |
-| `cel_tekton_filename(filename)` | Declares the desired filename for literal `.tekton/*.yaml` or `.yml` receivers of zero-argument `pathChanged()` calls. Template comparison validates or autofixes drift. Compliant references and unrelated text stay byte-identical. |
+| `ensure_cel_selectors(desired)` | Reconciles explicitly named string-equality selectors to template-supplied values; `ABSENT` removes a selector. Preserves compliant text, unrelated guards, and paths. Template comparison reports drift in validation and writes the desired expression in fix mode. |
+| `ensure_cel_tekton_filename(filename)` | Declares the desired filename for literal `.tekton/*.yaml` or `.yml` receivers of zero-argument `pathChanged()` calls. Template comparison validates or autofixes drift. Compliant references and unrelated text stay byte-identical. |
 | `release_push_to_main_pr_cel(filename, labels_str)` | Legacy compatibility filter (also available as `to_stable_pr_cel`). Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
 
 ### Validation Filters
@@ -309,8 +309,8 @@ validate-tekton [OPTIONS]
 
 ## CEL Expression Parsing
 
-`cel_selectors(desired)` declares selector state, for example
-`_parent | cel_selectors({'event': 'pull_request', 'target_branch': ABSENT})`.
+`ensure_cel_selectors(desired)` declares selector state, for example
+`_parent | ensure_cel_selectors({'event': 'pull_request', 'target_branch': ABSENT})`.
 String values add or replace selectors; `ABSENT` requests removal, not CEL null.
 Unrelated guards and paths are retained. A compliant expression is returned
 unchanged. Equality operands may be reversed or parenthesized; identical
@@ -324,7 +324,7 @@ The helper contains no cluster names or repository-specific policy.
 
 
 Templates explicitly supply desired event, branch, or routing values, then use
-`cel_tekton_filename(filename)` separately. Both filters construct expected
+`ensure_cel_tekton_filename(filename)` separately. Both filters construct expected
 child values; normal template comparison supplies validation and autofix.
 Filename reconciliation never changes selector policy. Repository-specific bypass arms must be composed
 before applying their mandatory outer routing selector.

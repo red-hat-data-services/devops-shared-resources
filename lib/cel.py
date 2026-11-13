@@ -29,7 +29,7 @@ def flatten_and(node):
     return [node]
 
 
-def cel_selectors(expression, desired):
+def ensure_cel_selectors(expression, desired):
     """Reconcile named string selectors; None requests their absence.
 
     Only standalone equality conjuncts can be changed. A valid, compliant
@@ -99,7 +99,7 @@ def cel_selectors(expression, desired):
     return "\n&& ".join(selectors + kept) or "true"
 
 
-def cel_tekton_filename(expression, filename):
+def ensure_cel_tekton_filename(expression, filename):
     """Reconcile pathChanged YAML receivers to the desired filename.
 
     Compliant references and all unrelated expression text stay byte-identical.

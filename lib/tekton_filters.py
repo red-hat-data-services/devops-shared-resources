@@ -403,9 +403,9 @@ def validate_cel_tekton_ignore(value):
 
 
 @jinja_filter
-def cel_selectors(value, desired):
+def ensure_cel_selectors(value, desired):
     """Build desired CEL; template comparison supplies validation and autofix."""
-    from lib.cel import cel_selectors as reconcile
+    from lib.cel import ensure_cel_selectors as reconcile
     from lib.tekton import ABSENT
 
     if not isinstance(desired, dict):
@@ -418,9 +418,9 @@ def cel_selectors(value, desired):
 
 
 @jinja_filter
-def cel_tekton_filename(value, filename):
+def ensure_cel_tekton_filename(value, filename):
     """Build desired filename references; template comparison validates/fixes."""
-    from lib.cel import cel_tekton_filename as rewrite_filename
+    from lib.cel import ensure_cel_tekton_filename as rewrite_filename
 
     try:
         return rewrite_filename(str(value), filename)
