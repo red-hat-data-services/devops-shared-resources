@@ -411,7 +411,7 @@ def _is_notebooks_sync_guard(guard):
 
 
 @jinja_filter
-def to_stable_pr_cel(value, filename="", labels_str=""):
+def release_push_to_main_pr_cel(value, filename="", labels_str=""):
     """Convert a push trigger into a PR trigger with optional bypass arms.
 
     Ordinary PRs retain the push trigger's negative guards and path conditions,
@@ -473,6 +473,10 @@ def to_stable_pr_cel(value, filename="", labels_str=""):
         f"  (\n    {arms_text}\n  )\n"
         ")"
     )
+
+
+# Compatibility alias for templates and Python callers migrating to the new name.
+to_stable_pr_cel = release_push_to_main_pr_cel
 
 
 @jinja_filter

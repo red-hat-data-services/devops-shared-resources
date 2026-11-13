@@ -780,8 +780,8 @@ def test_scheduled_pipeline_cannot_replace_push_parent(tmp_path, monkeypatch, so
     assert set(parents["push"]) == {"odh-operator"}
     parent = parents["push"]["odh-operator"]
     assert parent["metadata"]["name"] == "odh-operator-v3-6-on-push"
-    from lib.tekton_filters import to_stable_pr_cel
-    assert to_stable_pr_cel(
+    from lib.tekton_filters import release_push_to_main_pr_cel
+    assert release_push_to_main_pr_cel(
         parent["metadata"]["annotations"]["pipelinesascode.tekton.dev/on-cel-expression"],
         "odh-operator-pull-request.yaml",
     ) == 'event == "pull_request"\n&& "src/**".pathChanged()'

@@ -255,7 +255,7 @@ Filters are defined in `lib/tekton_filters.py`. Mark a function with `@jinja_fil
 | `validate_cel(branch, filename)` | CEL must reference branch and filename; auto-fixes wrong branch |
 | `validate_cel_tekton_ignore` | Replaces bad `!".tekton/**".pathChanged()` with `files.all.exists(...)` |
 | `to_pr_cel` | Replaces `event == "push"` with `event == "pull_request"` |
-| `to_stable_pr_cel(filename, labels_str)` | Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
+| `release_push_to_main_pr_cel(filename, labels_str)` | Converts push CEL to PR CEL with optional label arm and pathChanged conditions. Uses cel-python AST parsing to decompose the push expression, replace `.tekton/` filenames, and carry over negative guards. For the exact notebooks `!("manifests/rhoai/base/params-latest.env".pathChanged())` exclusion, adds a `source_branch == "main" && target_branch == "stable"` OR arm outside the entire guarded path conjunction, allowing bump-only sync PRs to build. Other triggers are unchanged. |
 
 ### Validation Filters
 
@@ -307,9 +307,9 @@ validate-tekton [OPTIONS]
 
 ## CEL Expression Parsing
 
-The `to_stable_pr_cel` filter in `lib/tekton_filters.py` owns the push-to-PR trigger policy. It uses `extract_push_conditions` from `lib/cel.py` to parse the push expression and remove push event/branch selectors, then rewrites the pipeline filename and assembles guarded path, optional label, and notebooks sync arms. The exact notebooks exception stays beside the filter in `_is_notebooks_sync_guard`.
+The `release_push_to_main_pr_cel` filter in `lib/tekton_filters.py` owns the push-to-PR trigger policy. It uses `extract_push_conditions` from `lib/cel.py` to parse the push expression and remove push event/branch selectors, then rewrites the pipeline filename and assembles guarded path, optional label, and notebooks sync arms. The exact notebooks exception stays beside the filter in `_is_notebooks_sync_guard`.
 
-Despite the historical name, ordinary PR triggers are not restricted to the stable branch; only the notebooks main-to-stable sync exception checks that branch. Label and sync arms bypass the entire guarded path conjunction, but every arm still requires the `pull_request` event.
+`to_stable_pr_cel` remains a compatibility alias for existing templates and Python callers. The rename does not change trigger behavior: ordinary PR triggers are not restricted to a target branch; only the notebooks main-to-stable sync exception checks that branch. Label and sync arms bypass the entire guarded path conjunction, but every arm still requires the `pull_request` event.
 
 `lib/cel.py` owns structural parsing with [cel-python](https://github.com/cloud-custodian/cel-python): `extract_push_conditions` returns negative guards and the path subtree without choosing PR trigger arms. It also provides `flatten_and`, `replace_tekton_filename`, and `path_conditions_to_text`. Trigger policy tests live in `tests/test_tekton_filters.py`; parsing and AST utility tests live in `tests/test_cel.py`.
 
