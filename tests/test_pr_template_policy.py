@@ -6,19 +6,21 @@ import pytest
 from ruamel.yaml import YAML
 
 from lib.tekton import render_and_merge, resolve_overlay
-from lib.tekton_filters import ValidationError, strip_release_push_selectors
+from lib.tekton import ABSENT
+from lib.tekton_filters import ValidationError, cel_selectors, cel_tekton_filename
 
 ROOT = Path(__file__).resolve().parents[1]
 PARAMS = "manifests/rhoai/base/params-latest.env"
 
 
 def test_strip_preserves_all_conditions_and_rewrites_filename():
-    result = strip_release_push_selectors(
+    result = cel_selectors(
         'event == "push" && target_branch == "rhoai-3.7" && !skip_build'
         ' && files.all.exists(p, p != "ignored")'
         ' && ("src/**".pathChanged() || ".tekton/push.yaml".pathChanged())',
-        "pr.yaml",
+        {"event": ABSENT, "target_branch": ABSENT},
     )
+    result = cel_tekton_filename(result, "pr.yaml")
     assert "event" not in result and "target_branch" not in result
     assert "! skip_build" in result and "files.all.exists" in result
     assert '"src/**".pathChanged()' in result
@@ -27,13 +29,13 @@ def test_strip_preserves_all_conditions_and_rewrites_filename():
 
 
 def test_strip_pathless():
-    assert strip_release_push_selectors('event == "push"') == "true"
+    assert cel_selectors('event == "push"', {"event": ABSENT, "target_branch": ABSENT}) == "true"
 
 
-@pytest.mark.parametrize("expression", ["", "&&&", 'target_branch == "release"', 'event == "push" || x'])
+@pytest.mark.parametrize("expression", ["", "&&&", 'event == "push" || x'])
 def test_strip_rejects_invalid_input(expression):
     with pytest.raises(ValidationError):
-        strip_release_push_selectors(expression)
+        cel_selectors(expression, {"event": ABSENT, "target_branch": ABSENT})
 
 
 def test_repository_overlay_precedence_and_scope(tmp_path):

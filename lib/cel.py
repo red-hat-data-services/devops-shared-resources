@@ -1,5 +1,8 @@
 """CEL parsing, condition extraction, and AST utilities for Tekton filters."""
 
+import ast as python_ast
+import re
+
 import celpy
 from celpy.celparser import tree_dump
 from lark import Token, Tree
@@ -24,6 +27,112 @@ def flatten_and(node):
             results.extend(flatten_and(child))
         return results
     return [node]
+
+
+def cel_selectors(expression, desired):
+    """Reconcile named string selectors; None requests their absence.
+
+    Only standalone equality conjuncts can be changed. A valid, compliant
+    expression is returned verbatim. Unknown predicate shapes are never
+    weakened. Callers supply policy; this function knows no event or cluster.
+    """
+    import json
+
+    if not isinstance(desired, dict) or any(
+        not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z_0-9]*", name)
+        or (value is not None and not isinstance(value, str))
+        for name, value in desired.items()
+    ):
+        raise ValueError("selectors must map simple CEL identifiers to strings or absence")
+    try:
+        tree = celpy.Environment().compile(expression)
+    except Exception as exc:
+        raise ValueError(f"failed to parse CEL expression: {exc}") from exc
+
+    def unwrap(node):
+        while isinstance(node, Tree) and len(node.children) == 1 and isinstance(node.children[0], Tree):
+            node = node.children[0]
+        return node
+
+    def conjuncts(node):
+        original = node
+        node = unwrap(node)
+        if isinstance(node, Tree) and node.data == "conditionaland":
+            return [part for child in node.children for part in conjuncts(child)]
+        return [original]
+
+    def grouped(node):
+        while isinstance(node, Tree) and len(node.children) == 1 and isinstance(node.children[0], Tree):
+            if node.data == "paren_expr":
+                return True
+            node = node.children[0]
+        return False
+
+    kept, found = [], {}
+    for clause in conjuncts(tree):
+        references = [ident for ident in clause.find_data("ident") if str(ident.children[0]) in desired]
+        if not references:
+            node = unwrap(clause)
+            text = path_conditions_to_text(clause)
+            if node.data == "conditionalor" and len(node.children) > 1 and not grouped(clause):
+                text = f"({text})"
+            kept.append(text)
+            continue
+        node = unwrap(clause)
+        if node.data == "relation" and len(node.children) == 2 and node.children[0].data == "relation_eq":
+            left, right = unwrap(node.children[0]), unwrap(node.children[1])
+            if right.data == "ident":
+                left, right = right, left
+            if (left.data == "ident" and str(left.children[0]) in desired
+                    and right.data == "literal" and len(references) == 1):
+                literal = str(right.children[0])
+                if literal.startswith(('"', "'")):
+                    found.setdefault(str(left.children[0]), []).append(python_ast.literal_eval(literal))
+                    continue
+        raise ValueError("selected identifiers must be standalone string equalities")
+    for name, values in found.items():
+        if len(set(values)) != 1:
+            raise ValueError(f"conflicting values for selector {name!r}")
+    if all(found.get(name, []) == ([] if value is None else [value]) for name, value in desired.items()):
+        return expression
+    selectors = [f"{name} == {json.dumps(value)}" for name, value in desired.items() if value is not None]
+    return "\n&& ".join(selectors + kept) or "true"
+
+
+def cel_tekton_filename(expression, filename):
+    """Reconcile pathChanged YAML receivers to the desired filename.
+
+    Compliant references and all unrelated expression text stay byte-identical.
+    Template comparison supplies validation/autofix against the child value.
+    """
+    import json
+
+    if not isinstance(filename, str) or not re.fullmatch(r"[^/\\\\]+\.ya?ml", filename):
+        raise ValueError("filename must be a YAML basename")
+    try:
+        tree = celpy.Environment().compile(expression)
+    except Exception as exc:
+        raise ValueError(f"failed to parse CEL expression: {exc}") from exc
+    replacements = []
+    for call in tree.find_data("member_dot_arg"):
+        if len(call.children) != 2 or str(call.children[1]) != "pathChanged":
+            continue
+        receiver = call.children[0]
+        while isinstance(receiver, Tree) and len(receiver.children) == 1 and isinstance(receiver.children[0], Tree):
+            receiver = receiver.children[0]
+        if not isinstance(receiver, Tree) or receiver.data != "literal":
+            continue
+        token = receiver.children[0]
+        literal = str(token)
+        if not literal.startswith(('"', "'")):
+            continue
+        path = python_ast.literal_eval(literal)
+        if (isinstance(path, str) and path.startswith(".tekton/")
+                and path.endswith((".yaml", ".yml")) and path != f".tekton/{filename}"):
+            replacements.append((token.start_pos, token.end_pos, json.dumps(f".tekton/{filename}")))
+    for start, end, replacement in sorted(replacements, reverse=True):
+        expression = expression[:start] + replacement + expression[end:]
+    return expression
 
 
 def extract_push_conditions(expression):
