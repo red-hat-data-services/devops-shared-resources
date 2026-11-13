@@ -46,8 +46,11 @@ def ensure_cel_selectors(expression, desired):
     """Reconcile named string selectors; None requests their absence.
 
     Only standalone equality conjuncts can be changed. A valid, compliant
-    expression is returned verbatim. Unknown predicate shapes are never
-    weakened. Callers supply policy; this function knows no event or cluster.
+    expression is returned verbatim. On rebuild, retained predicates reuse
+    source layout; selector order and inter-conjunct separators are normalized.
+    Standalone negations retain the legacy `! ` spelling for template callers.
+    Unknown predicate shapes are never weakened. Callers supply policy; this
+    function knows no event or cluster.
     """
     import json
 
@@ -71,6 +74,10 @@ def ensure_cel_selectors(expression, desired):
         original = node
         node = unwrap(node)
         if isinstance(node, Tree) and node.data == "conditionaland":
+            if grouped(original) and not any(
+                str(ident.children[0]) in desired for ident in original.find_data("ident")
+            ):
+                return [original]
             return [part for child in node.children for part in conjuncts(child)]
         return [original]
 
@@ -86,7 +93,20 @@ def ensure_cel_selectors(expression, desired):
         references = [ident for ident in clause.find_data("ident") if str(ident.children[0]) in desired]
         if not references:
             node = unwrap(clause)
-            text = path_conditions_to_text(clause)
+            # Parser spans include grouping punctuation, unlike token bounds.
+            # Reuse source text so retained predicates keep their layout,
+            # literal quoting, and spacing instead of being pretty-printed.
+            text = expression[clause.meta.start_pos:clause.meta.end_pos]
+            if node.data == "unary" and node.children[0].data == "unary_not":
+                # Existing notebook templates match standalone `! (...)` guards.
+                # Keep that operator spelling without reprinting its operand.
+                operator_end = node.meta.start_pos + 1
+                operand_start = node.children[1].meta.start_pos
+                gap = expression[operator_end:operand_start]
+                if not gap.strip():
+                    start = operator_end - clause.meta.start_pos
+                    end = operand_start - clause.meta.start_pos
+                    text = text[:start] + " " + text[end:]
             if node.data == "conditionalor" and len(node.children) > 1 and not grouped(clause):
                 text = f"({text})"
             kept.append(text)
@@ -109,7 +129,9 @@ def ensure_cel_selectors(expression, desired):
     if all(found.get(name, []) == ([] if value is None else [value]) for name, value in desired.items()):
         return expression
     selectors = [f"{name} == {json.dumps(value)}" for name, value in desired.items() if value is not None]
-    return "\n&& ".join(selectors + kept) or "true"
+    result = "\n&& ".join(selectors + kept) or "true"
+    # Preserve the scalar's final newline(s), including YAML chomping behavior.
+    return result + expression[tree.meta.end_pos:]
 
 
 def ensure_cel_tekton_filename(expression, filename):

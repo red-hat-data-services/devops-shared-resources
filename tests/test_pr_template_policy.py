@@ -124,7 +124,7 @@ def test_pathless_template_matches_legacy_semantics(event):
     '(files.all.exists(p, !p.matches(\'^\\\\\\\\.tekton/\')) || ".tekton/push.yaml".pathChanged())',
     '!skip_build && ("src/**".pathChanged() || ".tekton/push.yaml".pathChanged())',
 ])
-def test_default_template_preserves_legacy_cel_bytes(conditions):
+def test_default_template_preserves_legacy_cel_semantics(conditions):
     from lib.tekton_filters import release_push_to_main_pr_cel
 
     yaml = YAML()
@@ -136,4 +136,9 @@ def test_default_template_preserves_legacy_cel_bytes(conditions):
     result = render_and_merge(str(ROOT / "tekton-templates/kc-migration"),
                               "pull-request.yaml.j2", child, "pr.yaml", "main",
                               parent_data=parent, mode="fix", errors=[])
-    assert str(result["metadata"]["annotations"][key]) == release_push_to_main_pr_cel(expression, "pr.yaml")
+    actual = str(result["metadata"]["annotations"][key])
+    previous = release_push_to_main_pr_cel(expression, "pr.yaml")
+    env = celpy.Environment()
+    assert env.compile(actual) == env.compile(previous)
+    if "!p.matches" in conditions:
+        assert "!p.matches" in actual
