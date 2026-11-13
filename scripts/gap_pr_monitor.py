@@ -26,6 +26,7 @@ Leader selection, rollover guards and accepted-decision checks remain here.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -145,7 +146,18 @@ WAITING_FOR_EARLY_GATE_DESCRIPTION = (
     "GAP: waiting for Early Gate (auto-merge held)"
 )
 EARLY_GATE_COMMENT_BODY = "/early-gate"
-EARLY_GATE_COMMENT_RE = re.compile(r"^/early-gate(-build)?\s*$")
+EARLY_GATE_BATCH_MARKER_RE = re.compile(r"<!-- gap-early-gate-batch:v1 ([0-9a-f]{64}) -->")
+EARLY_GATE_COMMENT_RE = re.compile(
+    r"^/early-gate(-build)?(?:\n<!-- gap-early-gate-batch:v1 [0-9a-f]{64} -->)?\s*$"
+)
+EARLY_GATE_BUILD_IN_PROGRESS_LABEL = "early-gate-build-in-progress"
+EARLY_GATE_BUILD_LINK_MARKER = "<!-- gap-early-gate-build-link -->"
+EARLY_GATE_TRIGGERED_BATCH_KEY = "early-gate-triggered-batch"
+EARLY_GATE_TRIGGERED_COMMIT_KEY = "early-gate-triggered-commit"
+EARLY_GATE_TRIGGER_PENDING_BATCH_KEY = "early-gate-trigger-pending-batch"
+EARLY_GATE_RETRY_COUNT_KEY = "early-gate-retry-count"
+EARLY_GATE_RETRY_BATCH_KEY = "early-gate-retry-batch"
+MAX_EARLY_GATE_RETRIES = 1
 # overall-status values that allow Leader green (final).
 FINAL_OVERALL_STATUSES = frozenset(
     {OVERALL_STATUS_SUCCESS, OVERALL_STATUS_FAILURE}
@@ -467,6 +479,19 @@ def record_child_head_shas(
     return changed
 
 
+def child_batch_identity(payload: dict[str, Any]) -> str:
+    """Return a stable identity for the current non-ignored child revisions."""
+    rows = []
+    for entry in payload.get("pull-requests") or []:
+        if not isinstance(entry, dict) or child_entry_ignored(entry):
+            continue
+        url = str(entry.get("pr-url") or "").strip()
+        sha = str(entry.get("head-sha") or "").strip()
+        if url and sha:
+            rows.append(f"{url}\x00{sha}")
+    return hashlib.sha256("\n".join(sorted(rows)).encode()).hexdigest()
+
+
 def apply_success_statuses(payload: dict[str, Any], urls: Sequence[str]) -> None:
     """Back-compat helper used by older tests."""
     apply_pr_statuses(payload, {u: SUCCESS_PR_STATUS for u in urls})
@@ -783,6 +808,7 @@ def early_gate_comment_already_present(
     leader_pr_url: str,
     *,
     leader_commit: str | None = None,
+    batch_id: str | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
     """True when the current Leader commit already has an Early Gate run."""
@@ -851,8 +877,185 @@ def early_gate_comment_already_present(
         match = EARLY_GATE_COMMENT_RE.match(body)
         if not match:
             continue
+        if batch_id is not None:
+            marker = EARLY_GATE_BATCH_MARKER_RE.search(body)
+            if marker is None or marker.group(1) != batch_id:
+                continue
         return True
     return False
+
+
+def early_gate_check_state(
+    leader_pr_url: str,
+    leader_commit: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> tuple[bool, bool]:
+    """Return ``(active, failed)`` for Early Gate checks on one Leader commit.
+
+    A failed Early Gate result is retryable only when no check for the current
+    Leader commit is still queued or running. Missing checks are treated as
+    inactive; the persisted failed gate remains the reason to retry.
+    """
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    endpoint = (
+        f"repos/{ref.owner}/{ref.repo}/commits/{leader_commit}/check-runs"
+        "?per_page=100"
+    )
+    payload = github_api_json(run, endpoint)
+    active = False
+    failed = False
+    for check in payload.get("check_runs", []) if isinstance(payload, dict) else []:
+        if not isinstance(check, dict):
+            continue
+        app = check.get("app") or {}
+        name = str(check.get("name") or "")
+        if app.get("slug") != "konflux-internal-p02" or name.split(" / ")[-1] != "early-gate-ci-build":
+            continue
+        status = str(check.get("status") or "")
+        conclusion = str(check.get("conclusion") or "")
+        if status != "completed":
+            active = True
+        elif conclusion in {"failure", "timed_out", "cancelled", "action_required"}:
+            failed = True
+    return active, failed
+
+
+def early_gate_retry_identity(batch_id: str, retry_count: int) -> str:
+    """Return a stable marker for one bounded Early Gate retry."""
+    return hashlib.sha256(f"{batch_id}:early-gate-retry:{retry_count}".encode()).hexdigest()
+
+
+def recover_early_gate_trigger_commit(
+    repo_root: Path,
+    state_path: Path,
+    batch_id: str,
+    *,
+    git_runner: Callable[..., str] | None = None,
+) -> str | None:
+    """Find the first published commit that recorded a pending trigger batch.
+
+    This recovers the original trigger commit after the comment was posted but
+    receipt publication failed, leaving only the pending marker on the Leader.
+    """
+    run = git_runner or (lambda args, cwd: _run_git(args, cwd=cwd))
+    relative = state_path_for_output(state_path, repo_root=repo_root)
+    try:
+        commits = run(
+            ["rev-list", "--reverse", "HEAD", "--", relative],
+            cwd=repo_root,
+        ).splitlines()
+    except (GapPrMonitorError, ValueError, RuntimeError):
+        return None
+    for raw_commit in commits:
+        commit = str(raw_commit).strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", commit):
+            continue
+        try:
+            raw_state = run(["show", f"{commit}:{relative}"], cwd=repo_root)
+            candidate = json.loads(raw_state)
+        except (GapPrMonitorError, ValueError, RuntimeError, json.JSONDecodeError):
+            continue
+        if (
+            isinstance(candidate, dict)
+            and candidate.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+            and candidate.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+        ):
+            return commit
+    return None
+
+
+def set_early_gate_build_in_progress_label(
+    leader_pr_url: str,
+    *,
+    active: bool,
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> bool:
+    """Add or remove the visible Early Gate build-in-progress label."""
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    option = "--add-label" if active else "--remove-label"
+    if dry_run:
+        print(f"[dry-run] would {option} {EARLY_GATE_BUILD_IN_PROGRESS_LABEL}")
+        return True
+    run([
+        "pr", "edit", str(ref.number), "-R", ref.slug,
+        option, EARLY_GATE_BUILD_IN_PROGRESS_LABEL,
+    ])
+    return True
+
+
+def _early_gate_build_check_link(
+    leader_pr_url: str,
+    *,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> str | None:
+    """Find the latest Konflux Early Gate build link across recent Leader commits."""
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    commits_raw = run([
+        "api", f"repos/{ref.slug}/pulls/{ref.number}/commits?per_page=30",
+    ])
+    commits = json.loads(commits_raw or "[]")
+    if not isinstance(commits, list):
+        return None
+    for commit in reversed(commits):
+        if not isinstance(commit, dict):
+            continue
+        sha = str(commit.get("sha") or "")
+        if not re.fullmatch(r"[0-9a-f]{40}", sha):
+            continue
+        payload = github_api_json(run, f"repos/{ref.slug}/commits/{sha}/check-runs")
+        for check in payload.get("check_runs", []) if isinstance(payload, dict) else []:
+            if not isinstance(check, dict):
+                continue
+            app = check.get("app") or {}
+            name = str(check.get("name") or "")
+            if app.get("slug") != "konflux-internal-p02":
+                continue
+            if name.split(" / ")[-1] != "early-gate-ci-build":
+                continue
+            link = check.get("details_url") or check.get("html_url")
+            if link:
+                return str(link)
+    return None
+
+
+def upsert_early_gate_build_link_comment(
+    leader_pr_url: str,
+    *,
+    dry_run: bool = False,
+    gh_runner: Callable[[Sequence[str]], str] | None = None,
+) -> bool:
+    """Record the Konflux Early Gate build link once it becomes available."""
+    run = gh_runner or _run_gh
+    ref = parse_pr_url(leader_pr_url)
+    endpoint = f"repos/{ref.slug}/issues/{ref.number}/comments"
+    raw = run(["api", endpoint, "--paginate", "--slurp"])
+    pages = json.loads(raw or "[]")
+    comments = [item for page in pages for item in page] if pages and all(
+        isinstance(page, list) for page in pages
+    ) else pages
+    if any(
+        isinstance(comment, dict)
+        and EARLY_GATE_BUILD_LINK_MARKER in str(comment.get("body") or "")
+        for comment in comments
+    ):
+        return False
+    link = _early_gate_build_check_link(leader_pr_url, gh_runner=run)
+    if not link:
+        return False
+    body = f"{EARLY_GATE_BUILD_LINK_MARKER}\nEarly Gate build: {link}"
+    if dry_run:
+        print(f"[dry-run] would comment Early Gate build link {link}")
+        return True
+    run([
+        "pr", "comment", str(ref.number), "-R", ref.slug,
+        "--body", body,
+    ])
+    return True
 
 
 def post_early_gate_trigger_comment(
@@ -861,6 +1064,7 @@ def post_early_gate_trigger_comment(
     dry_run: bool = False,
     allow_repeat: bool = False,
     leader_commit: str | None = None,
+    batch_id: str | None = None,
     gh_runner: Callable[[Sequence[str]], str] | None = None,
 ) -> bool:
     """Comment ``/early-gate`` on the Leader once (RHAI-10942).
@@ -870,10 +1074,13 @@ def post_early_gate_trigger_comment(
     """
     run = gh_runner or _run_gh
     body = EARLY_GATE_COMMENT_BODY
-    if not allow_repeat and early_gate_comment_already_present(
-        leader_pr_url, leader_commit=leader_commit, gh_runner=run
-    ):
-        return False
+    if batch_id is not None:
+        body += f"\n<!-- gap-early-gate-batch:v1 {batch_id} -->"
+    if batch_id is not None or not allow_repeat:
+        if early_gate_comment_already_present(
+            leader_pr_url, leader_commit=leader_commit, batch_id=batch_id, gh_runner=run
+        ):
+            return False
     if dry_run:
         print(
             f"[dry-run] would comment {body!r} on {leader_pr_url}"
@@ -1701,9 +1908,6 @@ def run_monitor_publish_and_signal(
     previous_payload = load_state(Path(state_path))
     ensure_promotion_gates(previous_payload)
     migrate_legacy_overall_status(previous_payload)
-    previous_component_build_status = get_gate_status(
-        previous_payload, GATE_COMPONENT_BUILDS
-    )
     result = run_monitor(
         state_path,
         check_name=check_name,
@@ -1713,6 +1917,85 @@ def run_monitor_publish_and_signal(
         updater_factory=updater_factory,
         gh_runner=gh_runner,
     )
+
+    trigger_batch = False
+    retry_early_gate = False
+    retry_batch_id = None
+    trigger_payload = load_state(result.state_path)
+    ensure_promotion_gates(trigger_payload)
+    migrate_legacy_overall_status(trigger_payload)
+    batch_id = child_batch_identity(trigger_payload)
+    if should_trigger_early_gate(trigger_payload):
+        retry_count = int(trigger_payload.get(EARLY_GATE_RETRY_COUNT_KEY) or 0)
+        pending_retry_batch = str(
+            trigger_payload.get(EARLY_GATE_RETRY_BATCH_KEY) or ""
+        ).strip()
+        pending_retry = (
+            trigger_payload.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+            and trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+            and retry_count > 0
+            and pending_retry_batch == early_gate_retry_identity(batch_id, retry_count)
+        )
+        eg_failed = get_gate_status(trigger_payload, GATE_EARLY_GATE_BUILD) == "failure"
+        retry_candidate = (
+            not pending_retry
+            and eg_failed
+            and retry_count < MAX_EARLY_GATE_RETRIES
+        )
+        retry_ready = retry_candidate or pending_retry
+        if retry_ready and leader_pr_url:
+            try:
+                # Early Gate may have started on a Leader commit that was later
+                # superseded by a bookkeeping commit. Check the commit recorded
+                # when the trigger was delivered, not the current checkout.
+                leader_commit = str(
+                    trigger_payload.get(EARLY_GATE_TRIGGERED_COMMIT_KEY) or ""
+                ).strip()
+                if not re.fullmatch(r"[0-9a-f]{40}", leader_commit):
+                    leader_commit = (git_runner or (lambda args, cwd: _run_git(args, cwd=cwd)))(
+                        ["rev-parse", "HEAD"], cwd=repo_root
+                    ).strip()
+                active, _failed_check = early_gate_check_state(
+                    leader_pr_url, leader_commit, gh_runner=gh_runner
+                )
+                retry_ready = not active
+            except (GhCommandError, GapPrMonitorError, ValueError, RuntimeError, CheckQueryError):
+                # If the triggering commit's status cannot be verified, leave
+                # the batch held rather than starting a duplicate Early Gate.
+                retry_ready = False
+        if pending_retry:
+            if retry_ready:
+                # Resume the already-accounted retry without incrementing the
+                # bounded retry budget a second time.
+                retry_batch_id = pending_retry_batch
+                retry_early_gate = True
+                trigger_batch = True
+            else:
+                trigger_batch = (
+                    trigger_payload.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+                    or trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+                )
+        elif retry_candidate and retry_ready:
+            proposed_retry_count = retry_count + 1
+            retry_batch_id = early_gate_retry_identity(batch_id, proposed_retry_count)
+            retry_early_gate = True
+            trigger_batch = True
+            # Monitor-only runs must not consume the one-shot retry budget. A
+            # publishing run persists the proposed values before its commit.
+            if publish and not dry_run:
+                trigger_payload[EARLY_GATE_RETRY_COUNT_KEY] = proposed_retry_count
+                trigger_payload[EARLY_GATE_RETRY_BATCH_KEY] = retry_batch_id
+        else:
+            trigger_batch = (
+                trigger_payload.get(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY) == batch_id
+                or trigger_payload.get(EARLY_GATE_TRIGGERED_BATCH_KEY) != batch_id
+            )
+        if trigger_batch and publish and not dry_run:
+            # Keep delivery authorization durable until the /early-gate
+            # comment is confirmed. The triggered key is written only after
+            # the comment succeeds below.
+            trigger_payload[EARLY_GATE_TRIGGER_PENDING_BATCH_KEY] = batch_id
+            save_state(result.state_path, trigger_payload)
 
     if not publish:
         return result
@@ -1761,9 +2044,9 @@ def run_monitor_publish_and_signal(
             ) from exc
 
     # /early-gate only while builds passed and EG has not finished yet.
-    early_gate = should_trigger_early_gate(
-        state_payload
-    ) and not early_gate_concluded(state_payload)
+    early_gate = should_trigger_early_gate(state_payload) and (
+        retry_early_gate or not early_gate_concluded(state_payload)
+    )
     # Keep MonitorResult.overall_status aligned with gates for callers/tests.
     result_overall = derive_legacy_overall_status(state_payload)
 
@@ -1776,12 +2059,63 @@ def run_monitor_publish_and_signal(
             early_gate_comment_posted = post_early_gate_trigger_comment(
                 leader_url,
                 dry_run=dry_run,
-                allow_repeat=(
-                    result.child_head_changed
-                    or previous_component_build_status != GATE_STATUS_SUCCESS
-                ),
+                # A prior component-build pending state may come from a stale
+                # pull_request event checkout. It must not bypass comment
+                # idempotency; only a real child head change authorizes a new
+                # Early Gate trigger for the same Leader.
+                allow_repeat=trigger_batch,
+                batch_id=retry_batch_id or batch_id,
                 gh_runner=gh_runner,
             )
+            try:
+                set_early_gate_build_in_progress_label(
+                    leader_url, active=True, dry_run=dry_run, gh_runner=gh_runner
+                )
+                upsert_early_gate_build_link_comment(
+                    leader_url, dry_run=dry_run, gh_runner=gh_runner
+                )
+            except (GhCommandError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+                print(f"WARNING: failed to update Early Gate label/link: {exc}", file=sys.stderr)
+
+            if trigger_batch and not dry_run:
+                # The trigger comment is the delivery acknowledgement. Record
+                # its batch and the exact Leader commit it was sent to only
+                # after the post/check succeeded, then publish that receipt so
+                # a later poll cannot lose or repeat the authorization.
+                delivered = load_state(result.state_path)
+                delivered[EARLY_GATE_TRIGGERED_BATCH_KEY] = batch_id
+                if early_gate_comment_posted:
+                    delivery_commit = published.sha
+                else:
+                    delivery_commit = str(
+                        delivered.get(EARLY_GATE_TRIGGERED_COMMIT_KEY) or ""
+                    ).strip()
+                    if not re.fullmatch(r"[0-9a-f]{40}", delivery_commit):
+                        delivery_commit = recover_early_gate_trigger_commit(
+                            repo_root,
+                            result.state_path,
+                            batch_id,
+                            git_runner=git_runner,
+                        ) or published.sha
+                delivered[EARLY_GATE_TRIGGERED_COMMIT_KEY] = delivery_commit
+                delivered.pop(EARLY_GATE_TRIGGER_PENDING_BATCH_KEY, None)
+                save_state(result.state_path, delivered)
+                published = publish_state(
+                    repo_root,
+                    result.state_path,
+                    branch,
+                    remote=remote,
+                    dry_run=False,
+                    commit_message="Record Early Gate trigger delivery",
+                    rebase_on_conflict=False,
+                    git_runner=git_runner,
+                    archive=finalizing,
+                )
+                result = replace(
+                    result,
+                    state_path=published.state_path or result.state_path,
+                    published_sha=published.sha,
+                )
         except (GhCommandError, ValueError, RuntimeError) as exc:
             raise GapPrMonitorError(
                 f"Failed to post Early Gate trigger comment on {leader_url}: {exc}"

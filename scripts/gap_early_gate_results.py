@@ -801,6 +801,22 @@ def run_early_gate_results(
     previous = derive_legacy_overall_status(payload)
     eg_already = early_gate_concluded(payload)
     leader_commit = fetch_leader_head_sha(leader_url, gh_runner=gh_runner)
+    trigger_commit = str(
+        payload.get(gpm.EARLY_GATE_TRIGGERED_COMMIT_KEY) or ""
+    ).strip()
+    trigger_batch = payload.get(gpm.EARLY_GATE_TRIGGERED_BATCH_KEY)
+    current_batch = gpm.child_batch_identity(payload)
+    # The receipt commit may be newer than the commit that received /early-gate,
+    # but it is evidence only for the exact child batch that was delivered.
+    # A stale pending receipt must fall back to the current Leader commit.
+    evidence_commit = (
+        trigger_commit
+        if (
+            trigger_batch == current_batch
+            and re.fullmatch(r"[0-9a-f]{40}", trigger_commit)
+        )
+        else leader_commit
+    )
     if publish and not dry_run and (root / ".git").exists():
         run_git = git_runner or (lambda args, cwd=root: gpm._run_git(args, cwd=cwd))
         checked_out = run_git(["rev-parse", "HEAD"], cwd=root).strip()
@@ -821,7 +837,7 @@ def run_early_gate_results(
         labels=leader_labels,
         payload=payload,
         eg_already_concluded=eg_already,
-        leader_commit=leader_commit,
+        leader_commit=evidence_commit,
     )
     strip_legacy_overall_status(payload)
     derived = derive_legacy_overall_status(payload)
@@ -870,6 +886,26 @@ def run_early_gate_results(
 
     child_targets = child_pass_pr_urls(payload)
     child_check_state, child_desc = child_check_for_overall(new_overall)
+    # The label belongs to the trigger batch only when the authoritative
+    # Leader state records both the same semantic child batch and the commit
+    # that received the trigger. Monitor-only/stale checkouts must not clear a
+    # label that a newer Early Gate run may have set.
+    trigger_commit = payload.get(gpm.EARLY_GATE_TRIGGERED_COMMIT_KEY)
+    label_owned = (
+        publish
+        and not dry_run
+        and isinstance(trigger_batch, str)
+        and trigger_batch == current_batch
+        and isinstance(trigger_commit, str)
+        and trigger_commit == evidence_commit
+    )
+    if label_owned:
+        try:
+            gpm.set_early_gate_build_in_progress_label(
+                leader_url, active=False, dry_run=False, gh_runner=gh_runner
+            )
+        except (GhCommandError, ValueError, RuntimeError) as exc:
+            print(f"WARNING: failed to remove Early Gate in-progress label: {exc}", file=sys.stderr)
 
     if dry_run:
         print(

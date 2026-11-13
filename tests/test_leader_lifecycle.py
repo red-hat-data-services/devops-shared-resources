@@ -1099,8 +1099,12 @@ def test_active_monitor_still_refreshes_receipts_and_retriggers_eg(git_leader, m
     def gh(args):
         """Record status and trigger writes without any real GitHub changes."""
         if args[:2] == ["pr", "comment"]:
-            comments.append(args[args.index("--body") + 1])
-            triggered_commits.add(git(["rev-parse", "HEAD"], root))
+            body = args[args.index("--body") + 1]
+            if body.startswith("/early-gate"):
+                comments.append(body)
+                triggered_commits.add(git(["rev-parse", "HEAD"], root))
+            return ""
+        if args[:2] in (["pr", "view"], ["pr", "edit"]):
             return ""
         if args[0] != "api":
             raise AssertionError(args)
@@ -1108,6 +1112,8 @@ def test_active_monitor_still_refreshes_receipts_and_retriggers_eg(git_leader, m
         if "/check-runs" in endpoint:
             leader_commit = endpoint.split("/commits/", 1)[1].split("/", 1)[0]
             return json.dumps(["run"] if leader_commit in triggered_commits else [])
+        if "/pulls/9/commits" in endpoint:
+            return json.dumps([{"sha": git(["rev-parse", "HEAD"], root)}])
         if endpoint.endswith("/pulls/3"):
             return json.dumps({"sha": stage["sha"], "owner": "acme", "repo": "component", "state": "open"})
         if "/statuses/" in endpoint:

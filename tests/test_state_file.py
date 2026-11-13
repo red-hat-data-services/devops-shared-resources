@@ -325,3 +325,65 @@ def test_find_existing_state_path(tmp_path: Path) -> None:
         == "GAP Leaders/2026-09-20_gap-abc123/state.json"
     )
     assert find_existing_state_path(tmp_path, "gap-other") is None
+
+
+def test_build_state_preserves_early_gate_trigger_metadata() -> None:
+    batch = "a" * 64
+    commit = "b" * 40
+    pending = "c" * 64
+    state = build_state(
+        pull_requests=[
+            {
+                "repo": "kserve",
+                "pr-url": "https://github.com/rhoai-rhtap/kserve/pull/2",
+            }
+        ],
+        early_gate_triggered_batch=batch,
+        early_gate_triggered_commit=commit,
+        early_gate_trigger_pending_batch=pending,
+    )
+    payload = state.to_dict()
+    assert payload["early-gate-triggered-batch"] == batch
+    assert payload["early-gate-triggered-commit"] == commit
+    assert payload["early-gate-trigger-pending-batch"] == pending
+    normalized = validate_state(payload)
+    assert normalized["early-gate-triggered-commit"] == commit
+    assert normalized["early-gate-trigger-pending-batch"] == pending
+
+
+
+def test_build_state_preserves_early_gate_retry_metadata() -> None:
+    retry_batch = "b" * 64
+    state = build_state(
+        pull_requests=[],
+        early_gate_retry_count=1,
+        early_gate_retry_batch=retry_batch,
+    )
+    payload = state.to_dict()
+    assert payload["early-gate-retry-count"] == 1
+    assert payload["early-gate-retry-batch"] == retry_batch
+    assert validate_state(payload)["early-gate-retry-batch"] == retry_batch
+
+
+def test_validate_state_rejects_invalid_early_gate_retry_metadata() -> None:
+    with pytest.raises(Exception, match="early-gate-retry-count"):
+        validate_state({"pull-requests": [], "early-gate-retry-count": -1})
+    with pytest.raises(Exception, match="early-gate-retry-batch"):
+        validate_state({"pull-requests": [], "early-gate-retry-batch": "bad"})
+
+
+def test_validate_state_rejects_invalid_early_gate_trigger_metadata() -> None:
+    with pytest.raises(Exception, match="early-gate-triggered-commit"):
+        validate_state({"pull-requests": [], "early-gate-triggered-commit": "bad"})
+    with pytest.raises(Exception, match="early-gate-trigger-pending-batch"):
+        validate_state({"pull-requests": [], "early-gate-trigger-pending-batch": "bad"})
+
+
+def test_validate_state_rejects_invalid_early_gate_batch_identity() -> None:
+    with pytest.raises(Exception, match="early-gate-triggered-batch"):
+        validate_state(
+            {
+                "early-gate-triggered-batch": "not-a-sha256",
+                "pull-requests": [],
+            }
+        )

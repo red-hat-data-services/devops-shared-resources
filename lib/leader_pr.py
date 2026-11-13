@@ -392,6 +392,21 @@ class LeaderPRManager:
                 state.creator_outcomes = merge_outcomes(
                     previous_state.get("creator-outcomes", []), state.creator_outcomes
                 )
+                state.early_gate_triggered_batch = previous_state.get(
+                    "early-gate-triggered-batch", state.early_gate_triggered_batch
+                )
+                state.early_gate_triggered_commit = previous_state.get(
+                    "early-gate-triggered-commit", state.early_gate_triggered_commit
+                )
+                state.early_gate_trigger_pending_batch = previous_state.get(
+                    "early-gate-trigger-pending-batch", state.early_gate_trigger_pending_batch
+                )
+                state.early_gate_retry_count = int(previous_state.get(
+                    "early-gate-retry-count", state.early_gate_retry_count
+                ))
+                state.early_gate_retry_batch = previous_state.get(
+                    "early-gate-retry-batch", state.early_gate_retry_batch
+                )
 
             pr_body = body or self._default_body(
                 state, trigger_id=trigger_id, state_path=state_rel
