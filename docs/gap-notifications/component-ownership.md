@@ -37,10 +37,10 @@ Slack uses `components.<name>.slack_team_handle`, falling back to
 `components.default.slack_team_handle` for absent/unknown components or missing
 handles, including explicit `unknown` handles. `slack_team_channel` is ignored: explicit notification channel routing
 is unchanged. Root failures use a single-column layout: failure summary/component,
-then **Owning team: @mapped-handle** on its own full-width line, followed by
+then **Owning team:** `@mapped-handle` on its own full-width line, followed by
 repository and failure details. Explicit line endings keep these sections
-separate when copied. Only the ownership line uses `verbatim: false` to parse
-the handle; the summary and failure details keep `verbatim: true`.
+separate when copied. The handle is display-only inline code, and all sections
+use `verbatim: true`; no ownership mention parsing is enabled.
 A compact context footer links directly to the Slack-team and Jira-component
 mapping YAML files on GitLab, so readers can find where ownership is maintained.
 Replies and recovery do not add this ownership/footer layout or re-ping teams.
@@ -51,8 +51,8 @@ Top-level text is unchanged fallback text; global `link_names` parsing is not en
 Reserved broadcast handles (`here`, `channel`, `everyone`) and malformed handles
 are rejected before delivery. No usergroup lookup API or `usergroups:read` scope
 is required; the bot retains its existing message-posting permissions. Slack-side
-handle existence and notification behavior are rollout assumptions, not verified
-by offline tests. Replies and recovery have no parsing-enabled mention block.
+handle existence is not verified by offline tests. Ownership is currently
+informational only, not a team ping, for roots as well as replies and recovery.
 Existing replay suppression is unchanged. Runner Python HTTPS trust/access to
 internal GitLab is assumed; no CA provisioning or trust-store changes are made.
 TLS verification and the optional CA override remain in place. Tests inject

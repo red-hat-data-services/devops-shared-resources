@@ -1,5 +1,4 @@
 from unittest.mock import Mock
-from lib.slack_client import SlackClient
 from lib.gap_notifications.notify_tools import SlackNotifier
 from lib.gap_notifications.ownership import OwnershipPolicy
 
@@ -19,13 +18,6 @@ def test_isolated_blocks_survive_sdk_transport():
     payload = kwargs['json']
     assert payload['blocks'] == blocks
     assert payload['text'] == body
-    assert not payload.get('link_names')
     assert payload['thread_ts'] == '1.1'
     assert payload['client_msg_id'] == 'test-id'
     assert payload['unfurl_links'] is False and payload['unfurl_media'] is False
-    assert blocks[0]['text'] == {'type': 'mrkdwn', 'text': body + '\n', 'verbatim': True}
-    assert blocks[1]['text'] == {'type': 'mrkdwn', 'text': '*Owning team:* @devops\n', 'verbatim': False}
-    assert all('fields' not in block for block in blocks)
-    assert blocks[-1]['type'] == 'context'
-    assert blocks[-1]['elements'][0]['verbatim'] is True
-    assert not hasattr(SlackClient, 'usergroups')

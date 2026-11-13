@@ -1,26 +1,44 @@
-{{ '🟢' if status == 'success' else '🔴' }} *GAP · {{ heading }} — {{ 'staging test' if jira_environment == 'stage' else 'production Jira' }}*
+{% if status == 'success' %}
+🟢 *GAP · Recovery observed*
+{% else %}
+🔴 *GAP · Promotion gate failure*
+{% endif %}
 {% if category == 'build' %}
 *Component:* `{{ component }}`
+{% endif %}
+{% if owning_team %}
+*Owning team:* `@{{ owning_team }}`
 {% endif %}
 {% if not reply %}
 *Repository:* `{{ repository }}`
 {% endif %}
+*Jira:* {{ 'staging test' if jira_environment == 'stage' else 'production Jira' }}
 {% if category == 'build' %}
 {{ build_time }}
 {% endif %}
 {% if reason %}
 *Reported reason:* `{{ reason }}`
 {% endif %}
-{% if category == 'feasibility' and not reply %}
+{% if category == 'feasibility' and not reply and status == 'failure' %}
 
-*Main-to-release feasibility:* {{ 'The main to release feasibility job has failed. ' if status == 'failure' else '' }}This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes).{{ ' Please inspect the feasibility job for merge conflicts or configuration/workflow errors.' if status == 'failure' else '' }}
+*Main-to-release feasibility:* The main to release feasibility job has failed. This job dry-runs the normal sync from the current configured source branch to configured active release branches (It does not test the proposed stable PR contents or actually push changes). Please inspect the feasibility job for merge conflicts or configuration/workflow errors.
 {% endif %}
 
-{{ links | join(' · ') }}
+{# Jira is always present in delivered messages, so optional links can use it as the separator anchor. #}
+{% if links.build %}<{{ links.build.url }}|Build logs> · {% endif %}
+{% if links.commit %}<{{ links.commit.url }}|Commit {{ links.commit.detail }}> · {% endif %}
+{% if links.feasibility %}<{{ links.feasibility.url }}|Feasibility Workflow> · {% endif %}
+{% if links.pr %}<{{ links.pr.url }}|Child PR> · {% endif %}
+{% if links.jira %}<{{ links.jira.url }}|Jira{{ ' ' ~ links.jira.detail if links.jira.detail else '' }}>{% endif %}
+{% if links.leader %} · <{{ links.leader.url }}|GAP Leader>{% endif %}
+
 {% if synthetic %}
 
 Synthetic evidence
 {% endif %}
-{% if status == 'success' %}
-{{ 'Staging result only; does not establish production recovery.' if jira_environment == 'stage' else 'Reported component outcome only; not a claim that the whole promotion is healthy.' }}
+{% if owning_team %}
+Ownership mappings: <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/rhoai-component-data.yaml|Slack teams> · <https://gitlab.cee.redhat.com/wznoinsk/rhoai-monitoring/-/blob/main/data/konflux-to-jira-component-map.yaml|Jira components>
+{% if category in ['conflict', 'feasibility'] %}
+<https://github.com/red-hat-data-services/rhoai-ops/blob/main/config/automerge_team_mapping.yaml|Repository ownership>
+{% endif %}
 {% endif %}

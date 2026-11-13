@@ -2,9 +2,10 @@
 
 **Explicit normalized observations; staging by default.** There is no automatic
 Leader selection, monitor mutation from the standalone CLI, reopening of closed
-issues, or claim of exactly-once delivery. Staging issues retain the
-`[GAP STAGING TEST]` marker. Explicit production selection uses `[GAP PRODUCTION]`;
-this identifies the Jira destination, not proof of live production build health.
+issues, or claim of exactly-once delivery. New staging issues use the
+`[JIRA STAGE]` title prefix and a staging notice; production titles have no
+environment prefix. Routing is selected explicitly, never inferred from a title
+or treated as proof of live production build health.
 Jira descriptions omit the historical/synthetic provenance boilerplate in both environments;
 the evidence fields remain available to callers without being displayed as raw flags.
 Slack keeps destination and synthetic-test labels without snapshot/check boilerplate.
@@ -86,6 +87,48 @@ is never evaluated as template source. Python retains evidence selection, URL
 validation, truncation and escaping. Template changes do not change delivery,
 threading or replay identity. Both templates are included by the existing
 `templates/*.md.j2` package-data rule.
+
+The Slack template is ordinary message text with a few conditions, ordered as
+it appears: heading/component, owning team, details and evidence links, then
+ownership mappings. There are two literal headings: `Promotion gate failure` and
+`Recovery observed`, shared by roots and replies across categories. Jira
+destination remains visible. Python supplies formatted build time and validated
+URL/identifier data. The template spells out each evidence link, its label, and
+its condition explicitly. Rendered links share a row separated by `·`, without
+a preformatted links list or join in the template.
+There are no macros, named blocks, or alternate template-rendering modes.
+
+Only failure roots with an ownership policy receive `owning_team` (a validated
+handle); other messages leave it empty. Its conditional adds one owning-team line
+and the trailing mapping links. Python derives those additions by comparing
+ordinary renders with and without ownership, using static inputs rather than
+observation/evidence text. It then assembles Block Kit with `verbatim: true`
+throughout. The owning-team handle is inline code, for display only: Slack must
+not interpret it as a mention. Keep that line to static wording followed by the
+code-formatted handle; do not use ownership conditions to replace message
+content. Invalid ownership layout changes fail closed. Replies and recovery
+omit the ownership layout. Python still handles section-size limits, and fallback message text
+continues to omit ownership. Supplying `owning_team` when rendering the template
+directly produces a complete text preview.
+
+The first rendered H1 in the Jira template is also the issue summary. Its literal
+text must be nonempty and at most 250 characters, without inline links or code.
+The template interpolates already-escaped repository and component fields and
+applies `literal` only to the staging banner. Its Jinja `context` variable is
+`merge feasibility` for conflict/feasibility incidents, or the component for builds
+(`Unavailable` when absent). Overlong titles fail validation rather than truncate.
+Titles are presentation only:
+changing template wording or manually editing an existing Jira summary does not
+change incident identity or prevent updates, recovery, or replay suppression.
+Existing summaries are preserved; the template supplies titles for new issues.
+Jira descriptions link to the same ownership sources as Slack,
+including repository ownership for conflict and feasibility incidents.
+
+Validate template edits offline with:
+
+```sh
+uv run pytest tests/gap_notifications tests/test_gap_notify.py
+```
 
 Feasibility failure roots reuse the Jira feasibility paragraph, explaining that
 the job dry-runs the normal sync from the current configured source branch to
@@ -268,7 +311,8 @@ property `gap.notification.v1` containing bounded non-secret metadata:
 
 The adapter writes initial property metadata atomically in the Jira create request and
 verifies readback. All registry records are validated against project/type/status,
-incident label, episode label, expected summary and exact property scope/identity.
+incident label, episode label and exact property scope/identity. The editable
+summary is not an identity check.
 Metadata is capped **below 24 KiB** (Jira limit 32 KiB). Capacity exhaustion holds;
 no silent hash eviction or receipt truncation. Full observations remain in supplied local inputs; descriptions contain bounded
 human-readable evidence, not full JSON or this compact property.
