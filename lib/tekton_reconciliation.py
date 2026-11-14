@@ -216,7 +216,8 @@ def plan(args, report):
         raise ValueError("existing-file reconciliation does not support generation/external parents")
     layout = config.tekton_layout
     scope = ".tekton" if layout == "flat" else "pipelineruns"
-    policy = load_policy(args.policy_python, source, require_decision=not config.selection_template)
+    policy = load_policy(args.policy_python, source,
+                         require_decision=not config.selection_template and not config.guard_only)
     strict_profile = policy is not None or config.selection_template is not None
     context = None
     if not strict_profile and layout != "flat":

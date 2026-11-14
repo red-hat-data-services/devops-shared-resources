@@ -46,6 +46,17 @@ class TemplateConfig:
     match_fns: list[str]
     parent: ParentConfig | None = None
     generate: dict | None = None
+    exclude_branches: tuple[str, ...] = ()
+
+    def excluded_on(self, branch):
+        """Branch scope is terminal: never fall through to another template."""
+        if not self.exclude_branches:
+            return False
+        if not isinstance(branch, str) or not branch:
+            raise ValueError("branch-scoped templates require an explicit branch")
+        return any((branch.startswith(pattern[:-1]) and len(branch) > len(pattern) - 1)
+                   if pattern.endswith("*") else branch == pattern
+                   for pattern in self.exclude_branches)
 
 
 @dataclass
@@ -56,6 +67,7 @@ class PipelineConfig:
     parent_ref: str | None = None
     tekton_layout: str = "flat"
     selection_template: str | None = None
+    guard_only: bool = False
     context_paths: tuple[str, ...] = ()
     publication_branches: tuple[str, ...] | None = None
     template_overlays: tuple[dict, ...] = ()
@@ -124,6 +136,8 @@ def _validate_config(config: PipelineConfig):
     template_names = {t.name for t in config.templates}
 
     for tmpl in config.templates:
+        if tmpl.exclude_branches and (tmpl.parent or tmpl.generate or tmpl.name in config.parent_template_names()):
+            raise ValueError("exclude_branches is only supported for existing non-parent templates")
         for fn_name in tmpl.match_fns:
             if fn_name not in pipeline_matchers:
                 raise ValueError(
@@ -198,12 +212,20 @@ def load_config(config_dir: str, config_file: str | None = None) -> PipelineConf
             _validate_generate(entry["generate"], str(entry["name"]))
             generate = dict(entry["generate"])
 
+        import re
+        exclusions = entry.get("exclude_branches", [])
+        if (not isinstance(exclusions, list)
+                or any(not isinstance(p, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]*\*?", p)
+                       or ".." in p or "//" in p or p.rstrip("*").endswith(".") for p in exclusions)
+                or len(set(exclusions)) != len(exclusions)):
+            raise ValueError("exclude_branches must be unique exact names or literal prefixes with one trailing '*'")
         templates.append(TemplateConfig(
             name=str(entry["name"]),
             file=str(entry["file"]),
             match_fns=_normalize_match_fn(entry["match_fn"]),
             parent=parent,
             generate=generate,
+            exclude_branches=tuple(exclusions),
         ))
 
     aliases = dict(raw.get("component_aliases", {})) if raw.get("component_aliases") else None
@@ -266,6 +288,10 @@ def load_config(config_dir: str, config_file: str | None = None) -> PipelineConf
             if subprocess.run(["git", "check-ref-format", f"refs/heads/{example}"], capture_output=True).returncode:
                 raise ValueError("publication_branches contains an invalid branch name or prefix")
         config.publication_branches = tuple(patterns)
+    guard_only = raw.get("guard_only", False)
+    if not isinstance(guard_only, bool) or (guard_only and selection is not None):
+        raise ValueError("guard_only must be a boolean and cannot accompany selection_template")
+    config.guard_only = guard_only
     config.selection_template = selection
     config.context_paths = tuple(paths)
     _validate_config(config)
