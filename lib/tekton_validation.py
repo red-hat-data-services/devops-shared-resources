@@ -90,7 +90,13 @@ class StrictProfile:
         from lib.tekton_reconciliation import detached_data
         candidate_data = detached_data(candidate)
         guard = getattr(self.policy, "check", None)
-        if guard and guard(deepcopy(original), candidate_data, deepcopy(self.context)) is not True:
+        guard_context = deepcopy(self.context)
+        guard_context["pipeline_path"] = name
+        overlay = kwargs.get("overlay_path")
+        guard_context["template_overlay"] = (
+            Path(overlay).resolve().relative_to(Path(self.config.config_dir).resolve()).as_posix()
+            if overlay else None)
+        if guard and guard(deepcopy(original), candidate_data, guard_context) is not True:
             raise ValueError(f"policy rejected candidate {name}")
         self.rows[name]["status"] = "conformant" if candidate == original else "planned"
         return candidate
