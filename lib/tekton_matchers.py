@@ -41,21 +41,25 @@ def parent_matcher(fn):
     return fn
 
 
-def pipeline_reference_matches(data, expected):
-    """Match literal resolver parameters supplied by trusted configuration."""
+def _is_build_family(name, data, pipeline_path):
+    """Classify a referenced build family; trusted selection owns eligibility."""
+    if not isinstance(data, dict) or data.get("kind") != "PipelineRun":
+        return False
     spec = data.get("spec", {})
     if "pipelineSpec" in spec:
         return False
     ref = spec.get("pipelineRef", {})
-    if ref.get("resolver") != expected["resolver"]:
+    if ref.get("resolver") != "git":
         return False
     params = {}
     for item in ref.get("params", []):
-        name = item.get("name")
-        if name in params:
-            raise ValueError(f"duplicate pipeline reference parameter: {name}")
-        params[name] = item.get("value")
-    return all(params.get(k) == v for k, v in expected["params"].items())
+        key = item.get("name")
+        if key in params:
+            raise ValueError(f"duplicate pipeline reference parameter: {key}")
+        params[key] = item.get("value")
+    return (params.get("pathInRepo") == pipeline_path
+            and not is_pr_pipeline(name, data)
+            and (is_push_pipeline_by_cel(name, data) or is_scheduled_pipeline(name, data)))
 
 
 # --- Pipeline matchers ---
@@ -111,6 +115,18 @@ def is_pr_pipeline(name, data):
 def is_scheduled_pipeline(name, data):
     """Match scheduled pipelines by name containing '-on-schedule'."""
     return "-on-schedule" in name
+
+
+@pipeline_matcher
+def is_chart(name, data):
+    """Match Helm-chart push/scheduled runs; URL/revision checks stay in policy."""
+    return _is_build_family(name, data, "pipelines/helm-chart-build.yaml")
+
+
+@pipeline_matcher
+def is_fbc(name, data):
+    """Match FBC-fragment push/scheduled runs; URL/revision checks stay in policy."""
+    return _is_build_family(name, data, "pipelines/fbc-fragment-build.yaml")
 
 
 # --- Parent matchers ---

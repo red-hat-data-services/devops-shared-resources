@@ -30,22 +30,14 @@ def get_pipeline_ref_param(data: dict, name: str) -> str | None:
 
 def classify_pipeline(filename: str, data: dict, config=None) -> str:
     if config is not None:
-        from lib.tekton_matchers import make_pipeline_matchers, pipeline_reference_matches
+        from lib.tekton_matchers import make_pipeline_matchers
         all_matchers = make_pipeline_matchers()
         name = data.get("metadata", {}).get("name", "")
-        qualified = [tmpl.name for tmpl in config.templates
-                     if tmpl.pipeline_ref is not None
-                     and pipeline_reference_matches(data, tmpl.pipeline_ref)
-                     and any(all_matchers[fn](name, data) for fn in tmpl.match_fns)]
-        if len(qualified) > 1:
-            raise ValueError("multiple reference-qualified templates match")
-        if qualified:
-            return qualified[0]
-        # Configurations without reference qualifiers retain legacy first-match
-        # behavior, including lazy evaluation of later event matchers.
         for tmpl in config.templates:
-            if tmpl.pipeline_ref is None and any(all_matchers[fn](name, data) for fn in tmpl.match_fns):
-                return tmpl.name
+            for fn_name in tmpl.match_fns:
+                fn = all_matchers.get(fn_name)
+                if fn and fn(name, data):
+                    return tmpl.name
         return "unknown"
 
     on_event = get_annotation(data, "pipelinesascode.tekton.dev/on-event")
