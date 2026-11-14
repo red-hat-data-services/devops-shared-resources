@@ -55,8 +55,9 @@ class StrictProfile:
         pipelines = {}
         for name, original in self.documents.items():
             decision = selection(self.config, original, Path(name).name, self.branch, self.context)
-            if not self.config.selection_template and self.policy:
-                decision = self.policy.decision(deepcopy(original), deepcopy(self.context))
+            legacy_decision = getattr(self.policy, "decision", None)
+            if not self.config.selection_template and not self.config.guard_only and self.policy:
+                decision = legacy_decision(deepcopy(original), deepcopy(self.context))
             if (not isinstance(decision, dict) or decision.get("status") not in STATUSES
                     or not isinstance(decision.get("reason", ""), str)
                     or not isinstance(decision.get("variables", {}), dict)):
@@ -67,8 +68,14 @@ class StrictProfile:
             path = self.root / name
             data = self.yaml.load(path.read_bytes())
             template = self.config.get_template(classify_pipeline(path.name, data, self.config))
+            if template is None and self.config.guard_only:
+                self.rows[name].update(status="skipped", reason="No matching template")
+                continue
             if template is None or template.parent:
                 raise ValueError("policy requires an existing non-parent template")
+            if template.excluded_on(self.branch):
+                self.rows[name].update(status="skipped", reason=f"Template {template.name} excluded on branch {self.branch}")
+                continue
             pipelines[path] = data
             self.rows[name]["_variables"] = decision.get("variables", {})
         return pipelines, {}, {}, 0

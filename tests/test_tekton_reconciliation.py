@@ -94,6 +94,36 @@ def operation_args(setup, report):
     return ["--path", target, "--config-dir", source / "templates", "--branch", "rhoai-3.6", "--report-dir", report]
 
 
+@pytest.mark.parametrize('guard_only,exclude,accept', [(True, False, True), (True, True, True),
+                                                       (True, False, False), (False, False, True)])
+def test_guard_only_cli_is_explicit_and_preserves_scope(tooling, setup, tmp_path, guard_only, exclude, accept):
+    source, target = setup
+    config = source/'templates/config.yaml'
+    config.write_text(f'guard_only: {str(guard_only).lower()}\n' + config.read_text()
+                      + ('    exclude_branches: ["rhoai-*"]\n' if exclude else ''))
+    module = source/'guard.py'
+    module.write_text('def check(original, candidate, context):\n'
+                      '    assert context["pipeline_path"] == ".tekton/example.yml"\n'
+                      f'    return {accept!r}\n')
+    commit(source)
+    original = (target/'.tekton/example.yml').read_bytes()
+    report, completed = plan(tooling, setup, tmp_path, '--policy-python', module)
+    if not guard_only or not accept:
+        assert completed.returncode != 0
+        assert ('policy lacks decision' if not guard_only else 'policy rejected candidate') in completed.stderr
+    else:
+        assert completed.returncode == 0, completed.stderr
+        result = json.loads(completed.stdout)
+        assert result['status'] == ('no-changes' if exclude else 'ready')
+        assert len(result['changes']) == (0 if exclude else 1)
+        if exclude:
+            assert result['diagnostics']['counts'] == {'skipped': 1}
+        for phase in ('validation', 'idempotence'):
+            assert not json.loads((report/'phases'/f'{phase}.json').read_text()).get('errors')
+    assert (target/'.tekton/example.yml').read_bytes() == original
+    assert not git(target, 'status', '--porcelain')
+
+
 def test_actual_cli_preview_repeat_without_target_writes_or_durable_plan(tooling, setup, tmp_path):
     target = setup[1]
     original = (target / ".tekton/example.yml").read_bytes()

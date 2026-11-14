@@ -117,6 +117,70 @@ def is_scheduled_pipeline(name, data):
     return "-on-schedule" in name
 
 
+def _is_container_build(data):
+    """Recognize standard container references or an inline scan-bearing Pipeline.
+
+    Reference paths identify a family, as with chart/FBC matchers. The caller's
+    safety guard remains responsible for trusted repository/compatibility policy.
+    """
+    if not isinstance(data, dict) or data.get("kind") != "PipelineRun":
+        return False
+    spec = data.get("spec", {})
+    if not isinstance(spec, dict):
+        raise ValueError("PipelineRun spec must be a mapping")
+    if "pipelineSpec" in spec:
+        pipeline = spec["pipelineSpec"]
+        if not isinstance(pipeline, dict):
+            raise ValueError("inline Pipeline source must be a mapping")
+        tasks = []
+        for location in ("tasks", "finally"):
+            collection = pipeline.get(location, [])
+            if not isinstance(collection, list) or any(not isinstance(task, dict) for task in collection):
+                raise ValueError("Pipeline tasks must be a list of mappings")
+            tasks.extend(collection)
+        matches = [task for task in tasks if task.get("name") == "rpms-signature-scan"]
+        if len(matches) > 1:
+            raise ValueError("duplicate Pipeline scan task")
+        return bool(matches)
+    ref = spec.get("pipelineRef", {})
+    if not isinstance(ref, dict) or ref.get("resolver") != "git":
+        return False
+    params = {}
+    items = ref.get("params", [])
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("pipeline reference params must be a list of mappings")
+    for item in items:
+        key = item.get("name")
+        if not isinstance(key, str) or not key:
+            raise ValueError("pipeline reference parameter requires a name")
+        if key in params:
+            raise ValueError(f"duplicate pipeline reference parameter: {key}")
+        params[key] = item.get("value")
+    return params.get("pathInRepo") in (
+        "pipelines/container-build.yaml", "pipelines/multi-arch-container-build.yaml")
+
+
+@pipeline_matcher
+def is_container_build_push(name, data):
+    """Match container builds, not arbitrary push-event PipelineRuns."""
+    return (not is_pr_pipeline(name, data) and not is_scheduled_pipeline(name, data)
+            and (is_push_pipeline_by_cel(name, data) or is_push_pipeline(name, data))
+            and _is_container_build(data))
+
+
+@pipeline_matcher
+def is_container_build_pull(name, data):
+    """Match container PRs, including legacy annotation-based PR identity."""
+    return is_pr_pipeline(name, data) and _is_container_build(data)
+
+
+@pipeline_matcher
+def is_container_build_scheduled(name, data):
+    """Match scheduled container builds without changing their trigger policy."""
+    return (not is_pr_pipeline(name, data) and is_scheduled_pipeline(name, data)
+            and _is_container_build(data))
+
+
 @pipeline_matcher
 def is_chart(name, data):
     """Match Helm-chart push/scheduled runs; URL/revision checks stay in policy."""

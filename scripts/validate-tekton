@@ -237,6 +237,13 @@ def _resolve_pipeline_overlay(config, tmpl_config, filepath, data, layout, repos
                            pipeline_path=filepath, repository_root=repository_root, mappings=config.template_overlays)
 
 
+def _branch_exclusion(config, filepath, data, branch):
+    template = config.get_template(classify_pipeline(filepath.name, data, config=config))
+    if template and template.excluded_on(branch):
+        return f"Template {template.name} excluded on branch {branch}"
+    return None
+
+
 def _selection_context(tekton_dir, layout, config, branch):
     if not config.selection_template:
         return None
@@ -327,6 +334,10 @@ def validate_tekton_dir(
         results[result_key(filepath)] = {"errors": [msg], "warnings": []}
 
     for filepath, data in sorted(pipelines.items()):
+        exclusion = _branch_exclusion(config, filepath, data, branch)
+        if exclusion:
+            results[result_key(filepath)] = {"errors": [], "warnings": [], "status": "skipped", "reason": exclusion}
+            continue
         if context is not None:
             decision = selection(config, data, filepath.name, branch, context)
             if decision["status"] != "applicable":
@@ -458,6 +469,9 @@ def fix_tekton_dir(
     pipelines, parent_indexes, yaml_errors, _ = profile.load() if profile else _load_pipelines(
         tekton_dir, namespace_filter, config, layout=layout, pipeline_dir=pipeline_dir,
     )
+    if not profile:
+        pipelines = {path: data for path, data in pipelines.items()
+                     if not _branch_exclusion(config, path, data, branch)}
     context = None if profile else _selection_context(tekton_dir, layout, config, branch)
     render = profile.render if profile else _configured_renderer(render_and_merge, context)
     if context is not None:
