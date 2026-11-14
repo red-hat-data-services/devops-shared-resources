@@ -346,8 +346,16 @@ validate-tekton [OPTIONS]
 `ensure_cel_selectors(desired)` declares selector state, for example
 `_parent | ensure_cel_selectors({'event': 'pull_request', 'target_branch': ABSENT})`.
 String values add or replace selectors; `ABSENT` requests removal, not CEL null.
-Unrelated guards and paths are retained. A compliant expression is returned
-unchanged. Equality operands may be reversed or parenthesized; identical
+Mapping insertion order also declares the relative order of the named selectors;
+keys requested absent do not participate. Correct values in the wrong order are
+reconciled even without a value change. Rebuilding emits named selectors first
+in mapping order, preserving unrelated predicates and their relative order/text.
+Already-compliant values and relative ordering return the original expression
+verbatim, including separators and trailing newlines. A partial mapping orders
+only the selectors it names; it does not order or modify other selectors. Callers
+that need a common order must name the same active selectors in the same order.
+No additional ordering argument or CEL semantic-comparison mode is required.
+Equality operands may be reversed or parenthesized; identical
 duplicates are normalized. Conflicting values, non-equality predicates, and
 selected identifiers embedded in ORs are rejected rather than weakened.
 Added selectors guard the whole expression, including any unrelated OR.
