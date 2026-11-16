@@ -206,3 +206,10 @@ def test_explicit_konflux_cluster_overrides_api_url(monkeypatch):
         "https://api.stone-prod-p02.hjvn.p1.openshiftapps.com:6443",
     )
     assert context(konflux_cluster="custom-cluster").cel_variables()["konflux_cluster"] == "custom-cluster"
+
+
+def test_real_cluster_fact_reaches_pac_cel_helper(pac_cel_binary):
+    assert cel_matches(
+        'konflux_cluster == "stone-prod-p02"',
+        context(konflux_cluster="stone-prod-p02"),
+    ) is True
