@@ -190,3 +190,19 @@ def test_file_limit_is_not_a_no_build_signal():
     with patch("lib.gap_check_selection.collect_github_pages", return_value=files):
         with pytest.raises(CheckQueryError, match="truncated"):
             fetch_file_collections("o", "r", 1, lambda _: "")
+
+
+def test_cel_variables_include_configured_konflux_cluster(monkeypatch):
+    monkeypatch.setenv(
+        "KONFLUX_API_URL",
+        "https://api.stone-prod-p02.hjvn.p1.openshiftapps.com:6443",
+    )
+    assert context().cel_variables()["konflux_cluster"] == "stone-prod-p02"
+
+
+def test_explicit_konflux_cluster_overrides_api_url(monkeypatch):
+    monkeypatch.setenv(
+        "KONFLUX_API_URL",
+        "https://api.stone-prod-p02.hjvn.p1.openshiftapps.com:6443",
+    )
+    assert context(konflux_cluster="custom-cluster").cel_variables()["konflux_cluster"] == "custom-cluster"

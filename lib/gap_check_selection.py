@@ -13,6 +13,7 @@ import os
 import re
 from dataclasses import dataclass
 from typing import Any, Sequence
+from urllib.parse import urlparse
 
 import yaml
 
@@ -61,6 +62,7 @@ class PullRequestContext:
     source_url: str | None = None
     target_url: str | None = None
     file_collections: dict[str, tuple[str, ...]] | None = None
+    konflux_cluster: str | None = None
 
     def cel_variables(self) -> dict[str, Any]:
         # This is a PR-state snapshot, not a reconstructed webhook. In
@@ -78,7 +80,29 @@ class PullRequestContext:
                 values[name] = value
         if self.file_collections is not None:
             values["files"].update({k: list(v) for k, v in self.file_collections.items()})
+        cluster = self.konflux_cluster or configured_konflux_cluster()
+        if cluster:
+            values["konflux_cluster"] = cluster
         return values
+
+
+def configured_konflux_cluster() -> str | None:
+    """Return the configured Konflux cluster name for PaC CEL expressions.
+
+    ``KONFLUX_API_URL`` is ordinary endpoint configuration, not a secret. The
+    API host convention is ``api.<cluster>.<domain>``; callers can override
+    the derived value with ``KONFLUX_CLUSTER`` when a deployment uses another
+    host layout.
+    """
+    explicit = os.environ.get("KONFLUX_CLUSTER", "").strip()
+    if explicit:
+        return explicit
+    raw_url = os.environ.get("KONFLUX_API_URL", "").strip()
+    if not raw_url:
+        return None
+    host = urlparse(raw_url).hostname or ""
+    match = re.match(r"^api\.([^.]+)(?:\.|$)", host)
+    return match.group(1) if match else None
 
 
 @dataclass(frozen=True)
