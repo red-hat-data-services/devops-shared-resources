@@ -45,9 +45,11 @@ def flatten_and(node):
 def ensure_cel_selectors(expression, desired):
     """Reconcile named string selectors; None requests their absence.
 
-    Only standalone equality conjuncts can be changed. A valid, compliant
-    expression is returned verbatim. On rebuild, retained predicates reuse
-    source layout; selector order and inter-conjunct separators are normalized.
+    Only standalone equality conjuncts can be changed. Named selectors follow
+    desired's insertion order, ignoring names requested absent. An expression
+    with compliant values and relative selector order is returned verbatim.
+    On rebuild, retained predicates reuse source layout; named selectors lead
+    in mapping order and inter-conjunct separators are normalized.
     Standalone negations retain the legacy `! ` spelling for template callers.
     Unknown predicate shapes are never weakened. Callers supply policy; this
     function knows no event or cluster.
@@ -126,7 +128,10 @@ def ensure_cel_selectors(expression, desired):
     for name, values in found.items():
         if len(set(values)) != 1:
             raise ValueError(f"conflicting values for selector {name!r}")
-    if all(found.get(name, []) == ([] if value is None else [value]) for name, value in desired.items()):
+    desired_order = [name for name, value in desired.items() if value is not None]
+    values_match = all(found.get(name, []) == ([] if value is None else [value])
+                       for name, value in desired.items())
+    if values_match and list(found) == desired_order:
         return expression
     selectors = [f"{name} == {json.dumps(value)}" for name, value in desired.items() if value is not None]
     result = "\n&& ".join(selectors + kept) or "true"
