@@ -28,7 +28,7 @@ type result struct {
 func evaluate(req request) []result {
 	opts := []cel.EnvOption{}
 	standard := map[string]bool{}
-	for _, name := range []string{"event", "event_type", "event_title", "target_branch", "source_branch", "target_url", "source_url"} {
+	for _, name := range []string{"event", "event_type", "event_title", "target_branch", "source_branch", "target_url", "source_url", "konflux_cluster"} {
 		standard[name] = true
 		opts = append(opts, cel.Variable(name, cel.StringType))
 	}
