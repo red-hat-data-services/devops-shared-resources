@@ -26,7 +26,6 @@ PAC = "pipelinesascode.tekton.dev/"
 COMPONENT = "appstudio.openshift.io/component"
 DEFAULT_API = "https://api.stone-prod-p02.hjvn.p1.openshiftapps.com:6443"
 DEFAULT_UI = "https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
-# PLACEHOLDER: confirm P01 hosts / app slug with Deepak before merge.
 DEFAULT_P01_API = "https://api.stone-prod-p01.wcfb.p1.openshiftapps.com:6443"
 DEFAULT_P01_UI = "https://konflux-ui.apps.stone-prod-p01.wcfb.p1.openshiftapps.com"
 DEFAULT_P01_ARCHIVE = (
@@ -40,8 +39,6 @@ DEFAULT_P02_ARCHIVE = (
 CLUSTER_P01 = "p01"
 CLUSTER_P02 = "p02"
 DEFAULT_CLUSTER = CLUSTER_P02
-# PLACEHOLDER P01 GitHub App slug — meeting: "Konflux Internal" (no -p02).
-# Confirm exact slug via: gh api .../check-runs --jq '.check_runs[].app.slug'
 DEFAULT_P01_APP_SLUG = "konflux-internal"
 DEFAULT_P02_APP_SLUG = "konflux-internal-p02"
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")

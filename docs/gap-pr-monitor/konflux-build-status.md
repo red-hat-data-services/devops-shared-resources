@@ -49,8 +49,7 @@ attempt could have started afterward. A later monitor reconciles new runs.
   This is an explicit rollback/rollout setting, never an error fallback.
 - Dual-cluster (P01 PR pipelines + P02 push/legacy): the monitor maps each
   child's Konflux GitHub App **slug** to a cluster id, then uses that
-  cluster's token/API/archive. Confirm placeholder P01 slug/hosts before
-  enabling in production.
+  cluster's token/API/archive.
 - `KONFLUX_DEFAULT_CLUSTER`: used when no Konflux check slug is present yet
   (default `p02`).
 - `KONFLUX_APP_SLUG_CLUSTER_MAP`: optional `slug:cluster,...` override
