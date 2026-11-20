@@ -865,6 +865,20 @@ def setup(tmp_path):
 
 # Managed link sections must be idempotent and preserve unrelated content, rejecting edited
 # metadata.
+def test_legacy_slack_origin_is_accepted_but_new_links_use_enterprise_origin():
+    from lib.gap_notifications.notify_tools import SLACK_ORIGIN, visible_link_status
+    assert SLACK_ORIGIN == 'https://redhat.enterprise.slack.com'
+    legacy = 'https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001'
+    current = discussion_url({'channel': 'C0883L8FARE', 'ts': '123.000001'})
+    assert current == 'https://redhat.enterprise.slack.com/archives/C0883L8FARE/p123000001'
+    body = {'type': 'doc', 'version': 1, 'content': [
+        {'type': 'heading', 'attrs': {'level': 2}, 'content': [{'type': 'text', 'text': 'Slack discussion'}]},
+        {'type': 'paragraph', 'content': [{'type': 'text', 'text': 'Open Slack discussion',
+                                             'marks': [{'type': 'link', 'attrs': {'href': legacy}}]}]},
+    ]}
+    assert visible_link_status(body, current) == 'mismatch'
+
+
 def test_both_sections_preserve_body_idempotent_and_reject_edited_metadata():
     body = {'type': 'doc', 'version': 1, 'content': [{'type': 'paragraph', 'content': [{'type': 'text', 'text': 'human text'}]}]}
     slack = discussion_url({'channel': 'C0883L8FARE', 'ts': '123.000001'})

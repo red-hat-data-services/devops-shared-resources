@@ -440,7 +440,7 @@ def test_successful_spoofed_root_ignored(setup):
     runner, jira, _ = setup
     runner().run([observation(evidence={'root': {'channel': 'EVIL', 'ts': '1.2'}, 'discussion_url': 'https://evil.test', 'metadata_url': 'https://evil.test'})])
     report = inspect_issue(jira, 'RHAI-1')
-    assert report['discussion_url'] == 'https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001'
+    assert report['discussion_url'] == 'https://redhat.enterprise.slack.com/archives/C0883L8FARE/p123000001'
     assert 'evil.test' not in json.dumps(jira.issues['RHAI-1']['fields']['description'])
 
 

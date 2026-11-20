@@ -939,7 +939,9 @@ def description(observation, *, discussion_url=None, metadata_url=None, jira_env
                                          **jira_target(jira_environment).options))
 
 
-SLACK_ORIGIN = "https://redhat-internal.slack.com"
+SLACK_ORIGIN = "https://redhat.enterprise.slack.com"
+SLACK_ORIGIN_LEGACY = "https://redhat-internal.slack.com"
+SLACK_ALLOWED_ORIGINS = (SLACK_ORIGIN, SLACK_ORIGIN_LEGACY)
 HEADING = {"type": "heading", "attrs": {"level": 2}, "content": [{"type": "text", "text": "Slack discussion"}]}
 
 
@@ -981,7 +983,8 @@ def _managed_indices(body, *, metadata=False, jira_environment="stage", channel=
         try:
             url = paragraph["content"][0]["marks"][0]["attrs"]["href"]
             pattern = (re.escape(jira_target(jira_environment).url) + r"/rest/api/3/issue/RHAI-[1-9][0-9]*/properties/gap\.notification\.v1"
-                       if metadata else re.escape(SLACK_ORIGIN) + r"/archives/" + re.escape(configured_channel(channel)) + r"/p[0-9]+")
+                       if metadata else "(?:" + "|".join(re.escape(origin) for origin in SLACK_ALLOWED_ORIGINS)
+                       + ")/archives/" + re.escape(configured_channel(channel)) + r"/p[0-9]+")
             if not re.fullmatch(pattern, url) or not _matches_section(paragraph, url, metadata=metadata):
                 raise ValueError("edited discussion section")
         except (KeyError, IndexError, TypeError):

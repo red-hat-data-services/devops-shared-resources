@@ -299,7 +299,7 @@ def test_tracking_column_standalone_and_creator_only_refresh(monkeypatch, tmp_pa
     tracking = {"status": "checked", "channel": "C0883L8FARE", "rows": {row.pr_url: [
         {"component": "cpu", "status": "slack_pending", "jira_key": "RHAI-1"},
         {"component": "gpu", "status": "confirmed", "jira_key": "RHAI-2",
-         "slack_url": "https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001"}]}}
+         "slack_url": "https://redhat.enterprise.slack.com/archives/C0883L8FARE/p123000001"}]}}
     leader = "https://github.com/acme/gap/pull/9"
     body = fr.render_summary_markdown([row], leader_pr_url=leader, tracking=tracking)
     assert "| Jira / Slack |" in body and "cpu: [RHAI-1]" in body

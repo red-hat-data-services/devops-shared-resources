@@ -189,7 +189,7 @@ new wording without changing notification delivery or incident identity.
 The managed **Slack discussion** section is a cosmetic projection of the confirmed
 root stored in the validated Jira `gap.notification.v1` property, not a routing
 source. Caller evidence and visible descriptions cannot supply a root. Links use
-the verified fixed workspace `https://redhat-internal.slack.com`, validated channel
+the verified fixed workspace `https://redhat.enterprise.slack.com`, validated channel
 and receipt timestamp; no Slack lookup/API scope is needed.
 
 The separate managed **Notification metadata** section links directly to the
@@ -250,7 +250,7 @@ same-observation run permitted only the issue's description update and blocked
 creation, closure, property writes, and Slack sends. It performed exactly one
 description update and zero Slack attempts; the property remained byte-equivalent.
 Subsequent inspection reported `visible_link=match` and `open=true`, pointing to
-[the stored discussion](https://redhat-internal.slack.com/archives/C0883L8FARE/p1793984743525239).
+[the stored discussion](https://redhat.enterprise.slack.com/archives/C0883L8FARE/p1793984743525239).
 This verifies staging projection/inspection, not production behavior or recovery.
 Manager evidence is retained locally at
 `/Users/ckodama/projects/gap-jiras/artifacts/discussion-review/`:

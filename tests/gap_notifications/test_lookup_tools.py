@@ -198,7 +198,7 @@ def test_render_names_not_found_entries():
          'status': 'held', 'closed': False},
         {'component': 'gpu', 'jira_key': 'RHAI-2', 'status': 'closed', 'closed': True},
         {'component': 'arm', 'jira_key': 'RHAI-3', 'status': 'confirmed', 'closed': False,
-         'slack_url': 'https://redhat-internal.slack.com/archives/C0883L8FARE/p123000001'},
+         'slack_url': 'https://redhat.enterprise.slack.com/archives/C0883L8FARE/p123000001'},
     ]
     projection = {'status': 'checked', 'channel': 'C0883L8FARE', 'rows': {PR: empty + links}}
     cell = tracking_cell(projection, PR)

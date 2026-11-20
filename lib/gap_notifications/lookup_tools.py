@@ -19,6 +19,11 @@ import html
 import re
 import json
 
+_SLACK_ALLOWED_ORIGINS = (
+    "https://redhat.enterprise.slack.com",
+    "https://redhat-internal.slack.com",
+)
+
 
 def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_environment="stage", channel=None):
     """Search/GET only; hints require the same fresh identity/property validation.
@@ -138,7 +143,8 @@ def tracking_cell(tracking, pr_url):
                 if url:
                     if not re.fullmatch(r"[CG][A-Z0-9]+", tracking["channel"]):
                         raise ValueError("invalid configured channel")
-                    if not re.fullmatch(r"https://redhat-internal\.slack\.com/archives/" + re.escape(tracking["channel"]) + r"/p[0-9]+", url):
+                    if not any(re.fullmatch(re.escape(origin) + r"/archives/" + re.escape(tracking["channel"]) + r"/p[0-9]+", url)
+                               for origin in _SLACK_ALLOWED_ORIGINS):
                         raise ValueError("invalid discussion")
                     value += f" · [Slack thread]({url})"
                 else:
