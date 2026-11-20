@@ -1847,7 +1847,7 @@ def test_main_schedule_uses_scheduled_path(
 
 
 # ---------------------------------------------------------------------------
-# Publish-then-signal ordering (Chris review / RHOAIENG-97052)
+# Publish-then-signal ordering (RHOAIENG-97052)
 # ---------------------------------------------------------------------------
 
 

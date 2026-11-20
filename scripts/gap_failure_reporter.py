@@ -401,7 +401,7 @@ def humanize_merge_failure_reason(reason: str) -> str:
     When automerge is disabled, GitHub reports the skipped job name as
     ``main-release-feasibility (${{ matrix.downstream_branch }}) concluded skipped``.
     Keep ``merge-failure`` and state clearly that main-to-release feasibility
-    failed because automerge is disabled (Chris / Deepak policy: mandatory).
+    failed because automerge is disabled (mandatory).
     """
     text = (reason or "").strip()
     if not text:
