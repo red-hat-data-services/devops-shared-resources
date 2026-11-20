@@ -26,10 +26,29 @@ PAC = "pipelinesascode.tekton.dev/"
 COMPONENT = "appstudio.openshift.io/component"
 DEFAULT_API = "https://api.stone-prod-p02.hjvn.p1.openshiftapps.com:6443"
 DEFAULT_UI = "https://konflux-ui.apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
+# PLACEHOLDER: confirm P01 hosts / app slug with Deepak before merge.
+DEFAULT_P01_API = "https://api.stone-prod-p01.wcfb.p1.openshiftapps.com:6443"
+DEFAULT_P01_UI = "https://konflux-ui.apps.stone-prod-p01.wcfb.p1.openshiftapps.com"
+DEFAULT_P01_ARCHIVE = (
+    "https://kubearchive-api-server-product-kubearchive"
+    ".apps.stone-prod-p01.wcfb.p1.openshiftapps.com"
+)
+DEFAULT_P02_ARCHIVE = (
+    "https://kubearchive-api-server-product-kubearchive"
+    ".apps.stone-prod-p02.hjvn.p1.openshiftapps.com"
+)
+CLUSTER_P01 = "p01"
+CLUSTER_P02 = "p02"
+DEFAULT_CLUSTER = CLUSTER_P02
+# PLACEHOLDER P01 GitHub App slug — meeting: "Konflux Internal" (no -p02).
+# Confirm exact slug via: gh api .../check-runs --jq '.check_runs[].app.slug'
+DEFAULT_P01_APP_SLUG = "konflux-internal"
+DEFAULT_P02_APP_SLUG = "konflux-internal-p02"
 NAME = re.compile(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?")
 REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHA = re.compile(r"[0-9a-f]{40}")
 RELEASE_SUFFIX = re.compile(r"-v[0-9]+-[0-9]+(?:-ea-[0-9]+)?$")
+CLUSTER_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 
 # PaC labels that authorize a PR-associated build attempt.
 # Keep this tight: same repo/PR/SHA/type=build checks still apply below.
@@ -59,6 +78,101 @@ def build_status_source() -> str:
     if source not in {"github", "konflux"}:
         raise KonfluxQueryError("GAP_BUILD_STATUS_SOURCE must be github or konflux")
     return source
+
+
+def default_konflux_cluster() -> str:
+    """Cluster used when no GitHub App slug is available yet."""
+    raw = os.environ.get("KONFLUX_DEFAULT_CLUSTER", DEFAULT_CLUSTER).strip().lower()
+    return raw or DEFAULT_CLUSTER
+
+
+def _slug_cluster_overrides() -> dict[str, str]:
+    """Optional ``slug:cluster,slug:cluster`` map from ``KONFLUX_APP_SLUG_CLUSTER_MAP``."""
+    raw = os.environ.get("KONFLUX_APP_SLUG_CLUSTER_MAP", "").strip()
+    if not raw:
+        return {
+            DEFAULT_P02_APP_SLUG: CLUSTER_P02,
+            DEFAULT_P01_APP_SLUG: CLUSTER_P01,
+        }
+    mapping: dict[str, str] = {}
+    for part in raw.split(","):
+        piece = part.strip()
+        if not piece:
+            continue
+        if ":" not in piece:
+            raise KonfluxQueryError(
+                "KONFLUX_APP_SLUG_CLUSTER_MAP entries must be slug:cluster"
+            )
+        slug, cluster = piece.split(":", 1)
+        slug, cluster = slug.strip().lower(), cluster.strip().lower()
+        if not slug or not CLUSTER_ID.fullmatch(cluster):
+            raise KonfluxQueryError(
+                f"Invalid KONFLUX_APP_SLUG_CLUSTER_MAP entry {piece!r}"
+            )
+        mapping[slug] = cluster
+    return mapping
+
+
+def cluster_id_for_app_slug(app_slug: str | None) -> str:
+    """Map a Konflux GitHub App slug to a configured cluster id.
+
+    Meeting rule of thumb: slug containing ``p02`` → p02; otherwise known
+    Konflux Internal apps → p01. Explicit ``KONFLUX_APP_SLUG_CLUSTER_MAP``
+    wins when set.
+    """
+    slug = (app_slug or "").strip().lower()
+    if not slug:
+        return default_konflux_cluster()
+    overrides = _slug_cluster_overrides()
+    if slug in overrides:
+        return overrides[slug]
+    if "p02" in slug:
+        return CLUSTER_P02
+    if "konflux" in slug or "p01" in slug:
+        return CLUSTER_P01
+    return default_konflux_cluster()
+
+
+def cluster_id_from_check_runs(check_runs) -> str:
+    """Pick a cluster from GitHub check-run app slugs already fetched for a PR.
+
+    Prefer an explicit p02 producer when both appear (mixed cutover). Otherwise
+    use the first recognizable Konflux app slug. No Konflux checks → default.
+    """
+    slugs: list[str] = []
+    for run in check_runs or ():
+        slug = getattr(run, "app_slug", None)
+        if slug is None and isinstance(run, dict):
+            app = run.get("app") if isinstance(run.get("app"), dict) else {}
+            slug = app.get("slug")
+        text = str(slug or "").strip().lower()
+        if text:
+            slugs.append(text)
+    if not slugs:
+        return default_konflux_cluster()
+    for slug in slugs:
+        if "p02" in slug or _slug_cluster_overrides().get(slug) == CLUSTER_P02:
+            return CLUSTER_P02
+    for slug in slugs:
+        cluster = cluster_id_for_app_slug(slug)
+        if cluster != default_konflux_cluster() or "konflux" in slug:
+            return cluster
+    return default_konflux_cluster()
+
+
+def _env_for_cluster(cluster_id: str, suffix: str, *legacy_keys: str, default: str = "") -> str:
+    """Read ``KONFLUX_<CLUSTER>_<SUFFIX>``, then legacy unprefixed keys, then default."""
+    cluster = cluster_id.strip().lower()
+    if not CLUSTER_ID.fullmatch(cluster):
+        raise KonfluxQueryError(f"Invalid Konflux cluster id {cluster_id!r}")
+    primary = os.environ.get(f"KONFLUX_{cluster.upper()}_{suffix}", "").strip()
+    if primary:
+        return primary
+    for key in legacy_keys:
+        value = os.environ.get(key, "").strip()
+        if value:
+            return value
+    return default
 
 
 def _timestamp(value):
@@ -304,20 +418,65 @@ class KonfluxClient:
         self._request_json = request_json or self._get
 
     @classmethod
-    def from_environment(cls, *, deadline=None):
-        """Build a read-only client from deployment environment settings."""
-        token = os.environ.get("KONFLUX_TOKEN", "").strip()
-        token_file = os.environ.get("KONFLUX_TOKEN_FILE")
+    def from_environment(cls, *, deadline=None, cluster=None):
+        """Build a read-only client from deployment environment settings.
+
+        ``cluster`` selects prefixed env vars (``KONFLUX_P01_*`` / ``KONFLUX_P02_*``).
+        Unprefixed ``KONFLUX_TOKEN`` / ``KONFLUX_API_URL`` / … remain the P02
+        backward-compatible fallback. Defaults without env still target P02.
+        """
+        cluster_id = (cluster or default_konflux_cluster()).strip().lower()
+        if not CLUSTER_ID.fullmatch(cluster_id):
+            raise KonfluxQueryError(f"Invalid Konflux cluster id {cluster!r}")
+        if cluster_id == CLUSTER_P01:
+            default_api, default_ui, default_archive = (
+                DEFAULT_P01_API, DEFAULT_P01_UI, DEFAULT_P01_ARCHIVE,
+            )
+            legacy_token_keys: tuple[str, ...] = ()
+            legacy_api_keys: tuple[str, ...] = ()
+            legacy_archive_keys: tuple[str, ...] = ()
+            legacy_ui_keys: tuple[str, ...] = ()
+            legacy_ns_keys: tuple[str, ...] = ()
+            legacy_ca_keys: tuple[str, ...] = ()
+        else:
+            # p02 and any future id: prefer prefixed, else legacy unprefixed.
+            default_api, default_ui, default_archive = (
+                DEFAULT_API, DEFAULT_UI, DEFAULT_P02_ARCHIVE,
+            )
+            legacy_token_keys = ("KONFLUX_TOKEN",)
+            legacy_api_keys = ("KONFLUX_API_URL",)
+            legacy_archive_keys = ("KONFLUX_KUBEARCHIVE_URL",)
+            legacy_ui_keys = ("KONFLUX_UI_URL",)
+            legacy_ns_keys = ("KONFLUX_NAMESPACE",)
+            legacy_ca_keys = ("KONFLUX_CA_FILE",)
+        token = _env_for_cluster(cluster_id, "TOKEN", *legacy_token_keys)
+        token_file_legacy = ("KONFLUX_TOKEN_FILE",) if cluster_id == CLUSTER_P02 else ()
+        token_file = _env_for_cluster(cluster_id, "TOKEN_FILE", *token_file_legacy)
         try:
             if token_file:
                 token = Path(token_file).read_text().strip()
-            return cls(os.environ.get("KONFLUX_API_URL", DEFAULT_API),
-                       os.environ.get("KONFLUX_KUBEARCHIVE_URL", ""), token,
-                       namespace=os.environ.get("KONFLUX_NAMESPACE", "rhoai-tenant"),
-                       ui_url=os.environ.get("KONFLUX_UI_URL", DEFAULT_UI),
-                       ca_file=os.environ.get("KONFLUX_CA_FILE") or None, deadline=deadline)
+            return cls(
+                _env_for_cluster(cluster_id, "API_URL", *legacy_api_keys, default=default_api),
+                _env_for_cluster(
+                    cluster_id, "KUBEARCHIVE_URL", *legacy_archive_keys, default=default_archive,
+                ),
+                token,
+                namespace=_env_for_cluster(
+                    cluster_id, "NAMESPACE", *legacy_ns_keys, default="rhoai-tenant",
+                ),
+                ui_url=_env_for_cluster(
+                    cluster_id, "UI_URL", *legacy_ui_keys, default=default_ui,
+                ),
+                ca_file=_env_for_cluster(cluster_id, "CA_FILE", *legacy_ca_keys) or None,
+                deadline=deadline,
+            )
         except (OSError, ValueError, ssl.SSLError):
             raise KonfluxQueryError("Konflux read credential or TLS configuration is unavailable") from None
+
+    @classmethod
+    def for_cluster(cls, cluster_id, *, deadline=None):
+        """Explicit multi-cluster entrypoint used by the PR monitor."""
+        return cls.from_environment(deadline=deadline, cluster=cluster_id)
 
     def _get(self, url):
         """Read authenticated JSON within the deadline without leaking error bodies."""

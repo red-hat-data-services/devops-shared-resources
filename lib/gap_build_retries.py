@@ -402,7 +402,13 @@ class BuildRetryManager:
             try:
                 # Each component has its own lookup deadline. One slow archive
                 # query must not exhaust every subsequent component's budget.
-                client = self.client_factory()
+                # Reuse the cluster recorded on the gate receipt (P01 vs P02).
+                cluster = evidence.get("konflux-cluster")
+                client = (
+                    self.client_factory(cluster=cluster)
+                    if cluster
+                    else self.client_factory()
+                )
                 info, waiting = self._retry(pr, observation, history, client)
             except RetryObservationChanged as exc:
                 info, waiting = {"status": "retry-observation-changed", "reason": str(exc)}, True

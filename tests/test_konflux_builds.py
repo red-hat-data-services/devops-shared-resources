@@ -378,8 +378,66 @@ def test_explicit_rollout_source_has_no_silent_fallback(monkeypatch):
 def test_missing_credentials_are_an_error(monkeypatch):
     monkeypatch.delenv("KONFLUX_TOKEN", raising=False)
     monkeypatch.delenv("KONFLUX_TOKEN_FILE", raising=False)
+    monkeypatch.delenv("KONFLUX_P02_TOKEN", raising=False)
+    monkeypatch.delenv("KONFLUX_P01_TOKEN", raising=False)
     with pytest.raises(KonfluxQueryError):
         KonfluxClient.from_environment()
+    with pytest.raises(KonfluxQueryError):
+        KonfluxClient.for_cluster("p01")
+
+
+def test_cluster_id_for_app_slug_p02_and_placeholder_p01(monkeypatch):
+    from lib.konflux_builds import cluster_id_for_app_slug, cluster_id_from_check_runs
+    monkeypatch.delenv("KONFLUX_APP_SLUG_CLUSTER_MAP", raising=False)
+    monkeypatch.delenv("KONFLUX_DEFAULT_CLUSTER", raising=False)
+    assert cluster_id_for_app_slug("konflux-internal-p02") == "p02"
+    assert cluster_id_for_app_slug("konflux-internal") == "p01"
+    assert cluster_id_for_app_slug(None) == "p02"
+    runs = [type("R", (), {"app_slug": "konflux-internal"})()]
+    assert cluster_id_from_check_runs(runs) == "p01"
+    mixed = [
+        type("R", (), {"app_slug": "konflux-internal"})(),
+        type("R", (), {"app_slug": "konflux-internal-p02"})(),
+    ]
+    assert cluster_id_from_check_runs(mixed) == "p02"
+
+
+def test_for_cluster_uses_prefixed_p01_endpoints(monkeypatch):
+    monkeypatch.setenv("KONFLUX_P01_TOKEN", "p01-token")
+    monkeypatch.setenv("KONFLUX_P01_API_URL", "https://api.p01.example:6443")
+    monkeypatch.setenv("KONFLUX_P01_KUBEARCHIVE_URL", "https://archive.p01.example")
+    monkeypatch.setenv("KONFLUX_P01_UI_URL", "https://ui.p01.example")
+    monkeypatch.setenv("KONFLUX_P01_NAMESPACE", "rhoai-tenant")
+    client = KonfluxClient.for_cluster("p01")
+    assert client.api_url.startswith("https://api.p01.example")
+    assert client.ui_url.startswith("https://ui.p01.example")
+    assert client.archive_url.startswith("https://archive.p01.example")
+
+
+def test_evaluate_konflux_gate_records_cluster_from_check_runs(monkeypatch):
+    monkeypatch.setenv("KONFLUX_P01_TOKEN", "p01-token")
+    monkeypatch.setenv("KONFLUX_P01_API_URL", "https://api.p01.example:6443")
+    monkeypatch.setenv("KONFLUX_P01_KUBEARCHIVE_URL", "https://archive.p01.example")
+    monkeypatch.setenv("KONFLUX_P01_UI_URL", "https://ui.p01.example")
+
+    class _Client:
+        def observe(self, **kwargs):
+            raise KonfluxQueryError("stop after client construction")
+
+    def fake_for_cluster(cluster_id, **kwargs):
+        assert cluster_id == "p01"
+        return _Client()
+
+    monkeypatch.setattr(KonfluxClient, "for_cluster", fake_for_cluster)
+    from lib.github_check_runs import ExpectedCheck
+    expected = [ExpectedCheck(key="odh-eval-hub-v3-6", name_suffix="odh-eval-hub-on-pull-request",
+                              app_slug="konflux-internal")]
+    runs = [type("R", (), {"app_slug": "konflux-internal"})()]
+    gate, evidence = evaluate_konflux_gate(
+        repo=REPO, number=123, sha=SHA, expected=expected, check_runs=runs,
+    )
+    assert evidence["konflux-cluster"] == "p01"
+    assert gate.outcome == "pending"
 
 
 def test_creator_roundtrip_preserves_build_evidence():

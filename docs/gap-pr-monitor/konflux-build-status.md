@@ -47,13 +47,23 @@ attempt could have started afterward. A later monitor reconciles new runs.
 - `GAP_BUILD_STATUS_SOURCE=konflux` selects direct Konflux reads. The default
   `github` retains existing consumers until deployment credentials are ready.
   This is an explicit rollback/rollout setting, never an error fallback.
-- `KONFLUX_TOKEN` or `KONFLUX_TOKEN_FILE`: dedicated read-only bearer token.
-- `KONFLUX_API_URL`: target Kubernetes API; defaults to stone-prod-p02.
-- `KONFLUX_KUBEARCHIVE_URL`: archive endpoint. Set explicitly in CI; otherwise
-  read the product-kubearchive/kubearchive-api-url ConfigMap using the same
-  API credential. No endpoint is guessed from a hostname.
-- `KONFLUX_NAMESPACE`: defaults to rhoai-tenant.
-- `KONFLUX_UI_URL` and `KONFLUX_CA_FILE`: optional UI URL and trusted CA.
+- Dual-cluster (P01 PR pipelines + P02 push/legacy): the monitor maps each
+  child's Konflux GitHub App **slug** to a cluster id, then uses that
+  cluster's token/API/archive. Confirm placeholder P01 slug/hosts before
+  enabling in production.
+- `KONFLUX_DEFAULT_CLUSTER`: used when no Konflux check slug is present yet
+  (default `p02`).
+- `KONFLUX_APP_SLUG_CLUSTER_MAP`: optional `slug:cluster,...` override
+  (defaults include `konflux-internal-p02:p02` and `konflux-internal:p01`).
+- Per cluster (preferred): `KONFLUX_P01_TOKEN`, `KONFLUX_P01_API_URL`,
+  `KONFLUX_P01_KUBEARCHIVE_URL`, `KONFLUX_P01_UI_URL`, `KONFLUX_P01_NAMESPACE`
+  and the same `KONFLUX_P02_*` keys.
+- Legacy unprefixed (P02 fallback): `KONFLUX_TOKEN` or `KONFLUX_TOKEN_FILE`,
+  `KONFLUX_API_URL` (defaults to stone-prod-p02), `KONFLUX_KUBEARCHIVE_URL`,
+  `KONFLUX_NAMESPACE` (rhoai-tenant), `KONFLUX_UI_URL`, `KONFLUX_CA_FILE`.
+  Archive URL should be set explicitly in CI; otherwise the client reads the
+  product-kubearchive/kubearchive-api-url ConfigMap. No endpoint is guessed
+  from a hostname.
 
 TLS verification is enabled; authenticated redirects are rejected. Token
 values and raw HTTP error bodies are not reported. The client performs only

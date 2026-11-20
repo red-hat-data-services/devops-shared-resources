@@ -2690,6 +2690,7 @@ def _decide_url(
             number=pull_request.number, sha=pull_request.head_sha, expected=expected,
             query_error=configuration_error, cel_evaluated=cel_evaluated,
             cel_error=configuration_error,
+            check_runs=check_runs,
         )
 
     decision = decide_repository_pr(

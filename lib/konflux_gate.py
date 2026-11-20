@@ -3,11 +3,32 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from lib.github_check_runs import CheckFinding, GateResult, OUTCOME_FAIL, OUTCOME_PASS, OUTCOME_PENDING
-from lib.konflux_builds import KonfluxClient, KonfluxQueryError
+from lib.konflux_builds import (
+    KonfluxClient,
+    KonfluxQueryError,
+    cluster_id_from_check_runs,
+    default_konflux_cluster,
+)
 
 
-def evaluate_konflux_gate(*, repo, number, sha, expected, client=None, query_error=None, cel_evaluated=True, cel_error=None):
-    """Translate expected Konflux builds into a gate verdict and evidence receipt."""
+def evaluate_konflux_gate(
+    *,
+    repo,
+    number,
+    sha,
+    expected,
+    client=None,
+    query_error=None,
+    cel_evaluated=True,
+    cel_error=None,
+    cluster=None,
+    check_runs=None,
+):
+    """Translate expected Konflux builds into a gate verdict and evidence receipt.
+
+    When ``client`` is omitted, pick credentials/endpoints for ``cluster``, or
+    derive the cluster from GitHub check-run app slugs (P01 vs P02 cutover).
+    """
     evidence = {"source": "konflux", "head-sha": sha, "repository": repo, "pr": number,
                 "observed-at": datetime.now(timezone.utc).isoformat(),
                 "expected-components": sorted({item.key for item in expected}),
@@ -25,7 +46,16 @@ def evaluate_konflux_gate(*, repo, number, sha, expected, client=None, query_err
         if query_error:
             raise KonfluxQueryError(query_error)
         if expected:
-            client = client or KonfluxClient.from_environment()
+            if client is None:
+                cluster_id = cluster or (
+                    cluster_id_from_check_runs(check_runs)
+                    if check_runs is not None
+                    else default_konflux_cluster()
+                )
+                evidence["konflux-cluster"] = cluster_id
+                client = KonfluxClient.for_cluster(cluster_id)
+            elif cluster:
+                evidence["konflux-cluster"] = cluster
         for item in expected:
             component = item.key
             observation = client.observe(repo=repo, number=number, sha=sha, components={component},
