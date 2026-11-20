@@ -699,7 +699,8 @@ class Dispatcher:
                 if not _closed(issue):
                     self.jira.transition_to_done(key, self.transition_id, fields=self.transition_fields)
             else:
-                self.jira.update_issue(key, description=body, add_labels=labels)
+                self.jira.update_issue(key, summary=_summary(obs, **self.target.options),
+                                       description=body, add_labels=labels)
             state["seen_event_ids"][event] = obs["status"]
             state.update(last_event=event, last_outcome=obs["status"], jira_intent=None)
             self._put(key, state)

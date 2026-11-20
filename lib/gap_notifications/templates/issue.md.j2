@@ -1,11 +1,31 @@
-{# The first H1 supplies the Jira summary. Keep this format compatible with existing issues. -#}
-{% set banner = 'JIRA STAGE - ' if jira_environment == 'stage' else '' -%}
-{% set context = 'merge feasibility' if category in ['feasibility', 'conflict'] else component -%}
-# {{ banner }}Promotion Gate Failure in {{ repository }} ({{ context }})
+{# The first H1 supplies the Jira summary. Keep it stable for deduplication. -#}
+# promotion for {{ title_subject }} from {{ title_source_branch }} to {{ title_destination_branch }} has failed
 
 {% if jira_environment == 'stage' %}
 STAGE JIRA ENVIRONMENT
 {% endif %}
+
+## Summary
+
+promotion for {{ title_subject }} from {{ title_source_branch }} to {{ title_destination_branch }} has failed due to {{ reason }}.
+
+## Triage guidance
+
+{% if category == 'build' %}
+{% if has_build_link %}- Open the linked PipelineRun and confirm the failure reason.
+{% elif has_pr_link %}- Open the component PR checks and confirm why the expected build did not pass.
+{% else %}- Open the component PR and inspect its checks for the build failure.
+{% endif %}- For a transient infrastructure failure, comment /retest on the component PR and wait for a new current-head build.
+- For a code or configuration failure, fix the component PR and allow GAP to observe the replacement build.
+{% elif category == 'conflict' %}
+- Open the component promotion PR and resolve the merge conflict between {{ source_branch }} and {{ destination_branch }}.
+- Push the resolution and wait for the mergeability check to refresh.
+{% else %}
+{% if has_workflow_link %}- Open the linked feasibility workflow and inspect its sync result.
+{% else %}- Locate the configured feasibility run in workflow history and inspect its sync result.
+{% endif %}- Fix the reported sync or workflow problem, then wait for the next feasibility result.
+{% endif %}
+- Keep the ticket open while the current promotion is blocked; GAP will update it after a new current-head result.
 
 {% if category == 'feasibility' %}
 ## Main-to-release feasibility

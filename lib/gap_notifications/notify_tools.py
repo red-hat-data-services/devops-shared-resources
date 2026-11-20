@@ -525,9 +525,9 @@ class JiraNotifier:
         elif type_id != STAGING_JIRA_ISSUE_TYPE_ID:
             raise JiraAmbiguousError("Jira creation readback did not match", key=issue["key"])
 
-    def update_issue(self, key: str, *, description: dict | None = None, labels: list[str] | None = None,
-                     add_labels: list[str] | None = None) -> dict[str, Any]:
-        """Replace labels when requested, or atomically add without snapshot replacement."""
+    def update_issue(self, key: str, *, summary: str | None = None, description: dict | None = None,
+                     labels: list[str] | None = None, add_labels: list[str] | None = None) -> dict[str, Any]:
+        """Update the supplied presentation fields, verifying every requested change."""
         if labels is not None and add_labels is not None:
             raise ValueError("labels and add_labels are mutually exclusive")
         additions = [] if add_labels is None else self._validate_labels(add_labels)
@@ -537,6 +537,8 @@ class JiraNotifier:
         if current_category == "done":
             raise JiraTerminalIssueError("Jira issue is already done and must not be mutated", key=key)
         payload_fields: dict[str, Any] = {}
+        if summary is not None:
+            payload_fields["summary"] = self._summary(summary)
         if description is not None:
             self._validate_adf(description)
             payload_fields["description"] = copy.deepcopy(description)
@@ -613,6 +615,8 @@ class JiraNotifier:
         if self._project_key(updated) != self.project:
             raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
         if self._status_category_or_error(updated, key=updated["key"]) == "done":
+            raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
+        if "summary" in payload_fields and updated["fields"].get("summary") != payload_fields["summary"]:
             raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
         if "description" in payload_fields and self._adf_signature(updated["fields"].get("description")) != self._adf_signature(payload_fields["description"]):
             raise JiraAmbiguousError("Jira update readback did not match", key=updated["key"])
@@ -896,9 +900,22 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
     creator = e.get("creator-outcome") or {}
     context = {key: literal(observation.get(key)) for key in (
         "repository", "category", "source_branch", "destination_branch", "component", "pipeline", "observation_id")}
+    # Keep the Jira H1 bounded even when a component or branch name is unusually long.
+    # These values are truncated before literal escaping so an escape sequence cannot be split.
+    subject = observation.get("component") if observation.get("category") == "build" else str(observation.get("repository") or "").rsplit("/", 1)[-1]
+    if not isinstance(subject, str) or not subject.strip():
+        subject = "component"
+    source_branch = str(observation.get("source_branch") or "main").strip() or "main"
+    destination_branch = str(observation.get("destination_branch") or "stable").strip() or "stable"
     context.update(jira_environment=target.name,
+                   title_subject=literal(subject[:80]),
+                   title_source_branch=literal(source_branch[:60]),
+                   title_destination_branch=literal(destination_branch[:60]),
                    title_category=observation['category'], title_repository=observation['repository'],
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
+                   has_build_link=bool(e.get("build_url")),
+                   has_pr_link=bool(e.get("pr_url")),
+                   has_workflow_link=bool(e.get("workflow_url") or creator.get("workflow-url")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
                    revision=literal(e.get("head_sha") or e.get("head-sha")), links=[],

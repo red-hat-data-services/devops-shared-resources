@@ -111,16 +111,16 @@ omit the ownership layout. Python still handles section-size limits, and fallbac
 continues to omit ownership. Supplying `owning_team` when rendering the template
 directly produces a complete text preview.
 
-The first rendered H1 in the Jira template is also the issue summary. Its literal
-text must be nonempty and at most 250 characters, without inline links or code.
-The template interpolates already-escaped repository and component fields and
-applies `literal` only to the staging banner. Its Jinja `context` variable is
-`merge feasibility` for conflict/feasibility incidents, or the component for builds
-(`Unavailable` when absent). Overlong titles fail validation rather than truncate.
-Titles are presentation only:
-changing template wording or manually editing an existing Jira summary does not
-change incident identity or prevent updates, recovery, or replay suppression.
-Existing summaries are preserved; the template supplies titles for new issues.
+The first rendered H1 in the Jira template is also the issue summary. It uses
+`promotion for <subject> from <source> to <destination> has failed`; subject and
+branch values are bounded before escaping so the decoded title always stays within
+Jira's 250-character limit. Build guidance uses the PipelineRun link when present,
+then the component PR checks, and otherwise directs the operator to inspect the PR.
+Conflict and feasibility guidance uses the actual configured branch stream and only
+claims a direct workflow link when one was supplied.
+Titles do not identify incidents: the registry property and labels do. A new failure
+observation refreshes the editable summary from the current template and verifies the
+summary in the Jira readback; a mismatch is held as ambiguous rather than accepted.
 Jira descriptions link to the same ownership sources as Slack,
 including repository ownership for conflict and feasibility incidents.
 
@@ -140,7 +140,11 @@ failure-specific guidance. Threaded updates omit this explanation to avoid repea
 root context.
 
 Jira descriptions use the packaged `lib/gap_notifications/templates/issue.md.j2`
-with Jinja2 StrictUndefined, independent of the current directory. Feasibility
+with Jinja2 StrictUndefined, independent of the current directory. New Jira titles
+use the stable form `promotion for <component> from <source> to <destination> has failed`;
+for non-build observations, the repository name is used as the subject. The description
+starts with a plain-language failure sentence and includes category-specific triage guidance.
+Feasibility
 issues include a main-to-release dry-run explanation, distinguish it from testing
 the proposed stable PR contents, and direct failures to the feasibility job rather
 than assuming a merge conflict. They refer to the configured source branch without
@@ -177,6 +181,12 @@ existing replacement `labels` API and verifies required additions on readback.
 Description rendering and adapter ADF/label validation finish before create/update
 intent is persisted, so deterministic presentation errors do not strand write intent. Identical events remain no-ops; closed tickets are not
 backfilled. Summary/registry identity and Slack lifecycle are unchanged.
+
+## FAQ
+
+### What should I do when a GAP Jira ticket is created?
+
+Open the evidence link in the ticket and follow the triage guidance. For a component build failure, check the PipelineRun first; retry a transient infrastructure failure with `/retest` on the component PR, and fix code or configuration failures through the normal PR process. For a merge conflict, resolve the main-to-stable PR conflict. For a feasibility failure, inspect the main-to-release workflow and fix the reported sync or configuration problem. Keep the ticket open while the promotion is blocked; GAP updates the same incident after it observes a new current-head result.
 
 ## Discussion projection and read-only inspection
 
