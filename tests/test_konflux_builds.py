@@ -386,6 +386,129 @@ def test_missing_credentials_are_an_error(monkeypatch):
         KonfluxClient.for_cluster("p01")
 
 
+def test_retry_succeeds_after_transient_503():
+    """First attempt returns 503, second succeeds → returns data."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    attempts = []
+    sleeps = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise HTTPError(url, 503, "Service Unavailable", {}, BytesIO())
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: sleeps.append(s)
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+        assert sleeps[0] == 1.0
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_retry_exhausted_raises_after_all_attempts():
+    """All 3 attempts fail with 503 → KonfluxQueryError."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    attempts = []
+    sleeps = []
+    def fetch(url):
+        attempts.append(url)
+        raise HTTPError(url, 503, "Service Unavailable", {}, BytesIO())
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: sleeps.append(s)
+    try:
+        with pytest.raises(KonfluxQueryError, match="HTTP 503"):
+            client(fetch).observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        # Each page fetch retries 3 times; the first page exhausts retries
+        assert len(attempts) == 3
+        assert sleeps == [1.0, 3.0]
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_non_retryable_error_raises_immediately():
+    """HTTP 404 raises immediately without retry."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        raise HTTPError(url, 404, "Not Found", {}, BytesIO())
+    with pytest.raises(KonfluxQueryError, match="HTTP 404"):
+        client(fetch).observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+    assert len(attempts) == 1
+
+
+def test_429_rate_limit_is_retried():
+    """HTTP 429 triggers retry."""
+    from urllib.error import HTTPError
+    from io import BytesIO
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise HTTPError(url, 429, "Too Many Requests", {}, BytesIO())
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: None
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_connection_error_is_retried():
+    """URLError (connection refused) triggers retry."""
+    from urllib.error import URLError
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise URLError("Connection refused")
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: None
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+    finally:
+        kb.time.sleep = real_sleep
+
+
+def test_socket_timeout_is_retried():
+    """socket.timeout triggers retry."""
+    import socket
+    attempts = []
+    def fetch(url):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise socket.timeout("timed out")
+        return {"metadata": {"resourceVersion": "1"}, "items": [run()]}
+    import lib.konflux_builds as kb
+    real_sleep = kb.time.sleep
+    kb.time.sleep = lambda s: None
+    try:
+        api = client(fetch)
+        result = api.observe(repo=REPO, number=123, sha=SHA, components={COMPONENT})
+        assert result.status == "success"
+        assert len(attempts) >= 2
+    finally:
+        kb.time.sleep = real_sleep
+
+
 def test_cluster_id_for_app_slug_p02_and_placeholder_p01(monkeypatch):
     from lib.konflux_builds import cluster_id_for_app_slug, cluster_id_from_check_runs
     monkeypatch.delenv("KONFLUX_APP_SLUG_CLUSTER_MAP", raising=False)

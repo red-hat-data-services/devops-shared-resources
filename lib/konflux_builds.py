@@ -11,12 +11,14 @@ from dataclasses import asdict, dataclass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 import json
+import logging
 import os
 from pathlib import Path
 import re
+import socket
 import ssl
 import time
-from urllib.error import HTTPError
+from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import HTTPRedirectHandler, HTTPSHandler, Request, build_opener
 
@@ -46,6 +48,12 @@ REPO = re.compile(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+")
 SHA = re.compile(r"[0-9a-f]{40}")
 RELEASE_SUFFIX = re.compile(r"-v[0-9]+-[0-9]+(?:-ea-[0-9]+)?$")
 CLUSTER_ID = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
+
+# Retry parameters for transient Konflux API errors, matching the GitHub
+# GH_READ_RETRY_ATTEMPTS / GH_READ_RETRY_DELAYS pattern.
+_RETRY_MAX_ATTEMPTS = 3
+_RETRY_DELAYS = (1.0, 3.0)
+_RETRYABLE_HTTP_CODES = frozenset({429, 500, 502, 503, 504})
 
 # PaC labels that authorize a PR-associated build attempt.
 # Keep this tight: same repo/PR/SHA/type=build checks still apply below.
@@ -493,6 +501,51 @@ class KonfluxClient:
         except Exception:
             raise KonfluxQueryError("Konflux lookup or response failed; build state is unknown") from None
 
+    def _fetch_json(self, url):
+        """Call ``_request_json`` with retry for transient errors.
+
+        Retryable: HTTP 429/500/502/503/504 and connection/timeout errors.
+        Non-retryable client errors (4xx other than 429) raise immediately.
+        After all retries exhausted the last KonfluxQueryError is raised.
+        Log messages include the attempt number and error type but never the
+        token or full URL.
+        """
+        log = logging.getLogger(__name__)
+        last_error: KonfluxQueryError | None = None
+        for attempt in range(1, _RETRY_MAX_ATTEMPTS + 1):
+            try:
+                return self._request_json(url)
+            except HTTPError as exc:
+                # Raw HTTPError from the transport or a test stub.
+                if exc.code not in _RETRYABLE_HTTP_CODES:
+                    raise KonfluxQueryError(
+                        f"Konflux lookup failed (HTTP {exc.code}); build state is unknown"
+                    ) from None
+                last_error = KonfluxQueryError(
+                    f"Konflux lookup failed (HTTP {exc.code}); build state is unknown"
+                )
+            except KonfluxQueryError as exc:
+                msg = str(exc)
+                if "HTTP " in msg:
+                    code_str = msg.split("HTTP ", 1)[1].split(")")[0]
+                    try:
+                        code = int(code_str)
+                    except ValueError:
+                        code = 0
+                    if code and code not in _RETRYABLE_HTTP_CODES:
+                        raise
+                last_error = exc
+            except (URLError, socket.timeout, OSError):
+                last_error = KonfluxQueryError(
+                    "Konflux lookup or response failed; build state is unknown"
+                )
+            if attempt < _RETRY_MAX_ATTEMPTS:
+                delay = _RETRY_DELAYS[attempt - 1] if attempt - 1 < len(_RETRY_DELAYS) else _RETRY_DELAYS[-1]
+                log.warning("Konflux API attempt %d/%d failed, retrying in %.1fs",
+                            attempt, _RETRY_MAX_ATTEMPTS, delay)
+                time.sleep(delay)
+        raise last_error  # type: ignore[misc]
+
     def runs_for_pr(self, repo, number, sha, *, refresh=False):
         """Enumerate live and archived attempts for one current PR head."""
         if not REPO.fullmatch(repo) or not SHA.fullmatch(sha) or not re.fullmatch(r"[0-9]+", str(number)):
@@ -517,7 +570,7 @@ class KonfluxClient:
             query = {"labelSelector": selector, "limit": 100}
             if continuation:
                 query["continue"] = continuation
-            page = self._request_json(self.api_url + path + "?" + urlencode(query))
+            page = self._fetch_json(self.api_url + path + "?" + urlencode(query))
             if not isinstance(page, dict) or not isinstance(page.get("items"), list) or not isinstance(page.get("metadata"), dict):
                 raise KonfluxQueryError("Incomplete live PipelineRun listing")
             meta = page["metadata"]
@@ -537,7 +590,7 @@ class KonfluxClient:
         # Archive enumeration is mandatory: an older retained live run must not
         # hide a newer attempt which has already been archived/deleted.
         if self.archive_url is None:
-            discovery = self._request_json(
+            discovery = self._fetch_json(
                 self.api_url + "/api/v1/namespaces/product-kubearchive/configmaps/kubearchive-api-url")
             try:
                 self.archive_url = _endpoint(discovery["data"]["URL"], path=True)
@@ -551,7 +604,7 @@ class KonfluxClient:
             query = {"labelSelector": archive_selector, "limit": 20}
             if continuation:
                 query["continue"] = continuation
-            page = self._request_json(self.archive_url + path + "?" + urlencode(query))
+            page = self._fetch_json(self.archive_url + path + "?" + urlencode(query))
             if (not isinstance(page, dict) or not isinstance(page.get("items"), list)
                     or not isinstance(page.get("metadata"), dict)):
                 raise KonfluxQueryError("Incomplete archived PipelineRun listing")
@@ -588,7 +641,7 @@ class KonfluxClient:
         # Resolve the optional endpoint once, before workers start.
         if unique and self.archive_url is None:
             try:
-                discovery = self._request_json(
+                discovery = self._fetch_json(
                     self.api_url + "/api/v1/namespaces/product-kubearchive/configmaps/kubearchive-api-url")
                 self.archive_url = _endpoint(discovery["data"]["URL"], path=True)
             except (KonfluxQueryError, KeyError, TypeError) as exc:
