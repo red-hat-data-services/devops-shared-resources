@@ -148,6 +148,25 @@ def incident_key(observation: dict) -> str:
     return json.dumps(_incident_identity(normalized), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
 
 
+def _identity_equivalent(stored: Any, current: Any) -> bool:
+    """Accept legacy branch-scoped feasibility identities as repo-scoped matches."""
+    if not isinstance(stored, str) or not isinstance(current, str):
+        return False
+    try:
+        stored_value = json.loads(stored)
+        current_value = json.loads(current)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(stored_value, dict) or not isinstance(current_value, dict):
+        return False
+    if current_value.get("category") != "feasibility":
+        return stored == current
+    for value in (stored_value, current_value):
+        value.pop("source_branch", None)
+        value.pop("destination_branch", None)
+    return stored_value == current_value
+
+
 STAGE = "https://stage-redhat.atlassian.net"
 LEGACY_ENVIRONMENT = "stage-redhat.atlassian.net/RHAI/C0883L8FARE"
 PROPERTY_LIMIT = 24 * 1024
@@ -352,7 +371,7 @@ def _validate_state(value, key, trial, label, *, jira_environment="stage", chann
     target = routing_target(jira_environment, channel)
     if (value.get("schema") != 1 or value.get("scope") != target.scope
             or json.loads(key).get("environment") != target.scope
-            or value.get("trial_id") != trial or value.get("incident_key") != key
+            or value.get("trial_id") != trial or not _identity_equivalent(value.get("incident_key"), key)
             or incident_label(key, trial) != label):
         raise ValueError("registry scope/identity mismatch")
     uuid.UUID(value["episode_id"])
@@ -454,11 +473,35 @@ class Dispatcher:
             raise RegistryHold("registry readback mismatch")
         return state
 
+    def _legacy_feasibility_issues(self, obs, label):
+        """Find and tag pre-repo-scope feasibility issues for the same repository."""
+        matches = []
+        for issue in self.jira.find_by_label("gap-feasibility-failure"):
+            if _closed(issue):
+                continue
+            state = self.jira.get_notification_state(issue["key"])
+            if not isinstance(state, dict):
+                continue
+            try:
+                identity = json.loads(state.get("incident_key", ""))
+            except (TypeError, ValueError):
+                continue
+            current_repository = json.loads(incident_key(obs))["repository"]
+            if (not isinstance(identity, dict) or identity.get("category") != "feasibility"
+                    or identity.get("repository") != current_repository
+                    or state.get("scope") != self.target.scope
+                    or state.get("trial_id") != self.trial_id):
+                continue
+            matches.append(self.jira.update_issue(issue["key"], add_labels=[label]))
+        return matches
+
     def _registry(self, task):
         obs, identity = task["observation"], task["incident_key"]
         label = incident_label(identity, self.trial_id)
         summary = _summary(obs, **self.target.options)
         issues = self.jira.find_by_summary(summary)  # Title-based dedup.
+        if not issues and obs["category"] == "feasibility":
+            issues = self._legacy_feasibility_issues(obs, label)
         if not isinstance(issues, list):
             raise RegistryHold("incomplete registry")
         journal = _create_journal(self.data.get("creates", {}).get(identity))
@@ -811,7 +854,8 @@ def validated_property(issue, state, *, trial=None, identity=None, jira_environm
     # Supply non-routing placeholders so the full observation validator can run.
     obs.setdefault("source_branch", "unused")
     obs.setdefault("destination_branch", "unused")
-    if incident_key(obs) != stored_identity or (identity is not None and identity != stored_identity):
+    if (not _identity_equivalent(stored_identity, incident_key(obs))
+            or (identity is not None and not _identity_equivalent(stored_identity, identity))):
         raise ValueError("incident mismatch")
     label = incident_label(stored_identity, stored_trial)
     target = routing_target(jira_environment, channel)

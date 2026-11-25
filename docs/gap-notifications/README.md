@@ -278,7 +278,9 @@ searchable `gap-registry-<fingerprint>` label identifies staging scope + trial +
 repository + actual source/destination promotion stream + category for build and conflict
 incidents. Build additionally includes component/pipeline. Feasibility is repo-scoped:
 source/destination streams and tested downstream branches are evidence, not identity, so
-all affected branches share one open feasibility incident per repository.
+all affected branches share one open feasibility incident per repository. Existing
+branch-scoped feasibility issues are adopted by adding the repo-scoped registry label;
+their original incident labels and Slack roots remain valid.
 
 Every supplied definitive failure queries the complete registry **even if its event ID
 was seen locally**. Exactly one valid open issue is reused. Only closed matches and a

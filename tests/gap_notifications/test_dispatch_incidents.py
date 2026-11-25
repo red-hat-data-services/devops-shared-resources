@@ -754,6 +754,43 @@ def test_recovery_then_new_failure_creates_successor_and_stale_replay_noops(tmp_
     assert any(call[0] == "transition_to_done" for call in jira.calls)
 
 
+# Legacy branch-scoped feasibility issues are adopted by the repo-scoped identity.
+def test_legacy_feasibility_issue_is_reused_across_branch_streams(tmp_path, shared_clients):
+    jira, slack = shared_clients
+    dispatch = make_dispatcher(tmp_path, jira, slack)
+    first = registry_observation(
+        category="feasibility",
+        component=None,
+        destination_branch="rhoai-3.7",
+        evidence={"targets": {"rhoai-3.7": "failure"}, "historical_snapshot": True, "test_only": True},
+    )
+    dispatch.run([first])
+    key = jira.issue_keys()[0]
+    state = jira.notification_state[key]
+    legacy_identity = json.loads(state["incident_key"])
+    legacy_identity.update(source_branch="main", destination_branch="rhoai-3.7")
+    state["incident_key"] = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    legacy_label = incident_label(state["incident_key"], TRIAL_ID)
+    repo_label = incident_label(incident_key(first), TRIAL_ID)
+    labels = jira.issues[key]["fields"]["labels"]
+    labels.remove(repo_label)
+    labels.append(legacy_label)
+
+    second = registry_observation(
+        category="feasibility",
+        component=None,
+        destination_branch="rhoai-3.8",
+        oid="run-2",
+        evidence={"targets": {"rhoai-3.8": "failure"}, "historical_snapshot": True, "test_only": True},
+    )
+    dispatch.run([second])
+
+    assert len(jira.issues) == 1
+    assert repo_label in jira.issues[key]["fields"]["labels"]
+    assert len(slack.calls) == 2
+    assert slack.calls[-1][1]["thread_ts"] == jira.notification_state[key]["delivery"]["root"]["ts"]
+
+
 # Grouped target evidence must reuse one feasibility ticket and Slack root.
 def test_grouped_feasibility_branches_share_identity(tmp_path, shared_clients):
     jira, slack = shared_clients
