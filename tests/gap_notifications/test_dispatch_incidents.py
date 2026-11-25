@@ -810,6 +810,31 @@ def test_legacy_feasibility_issue_is_reused_across_branch_streams(tmp_path, shar
     assert slack.calls[-1][1]["thread_ts"] == jira.notification_state[key]["delivery"]["root"]["ts"]
 
 
+# A replayed failure already recovered by a closed legacy issue must not reopen a new Jira.
+def test_legacy_feasibility_recovered_replay_does_not_create_successor(tmp_path, shared_clients):
+    jira, slack = shared_clients
+    dispatch = make_dispatcher(tmp_path, jira, slack)
+    first = registry_observation(category="feasibility", component=None, destination_branch="rhoai-3.7")
+    dispatch.run([first])
+    dispatch.run([registry_observation(status="success", oid="recovered", category="feasibility", component=None,
+                                       destination_branch="rhoai-3.7")])
+    key = jira.issue_keys()[0]
+    state = jira.notification_state[key]
+    legacy_identity = json.loads(state["incident_key"])
+    legacy_identity.update(source_branch="main", destination_branch="rhoai-3.7")
+    state["incident_key"] = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    legacy_label = incident_label(state["incident_key"], TRIAL_ID)
+    repo_label = incident_label(incident_key(first), TRIAL_ID)
+    labels = jira.issues[key]["fields"]["labels"]
+    labels.remove(repo_label)
+    labels.append(legacy_label)
+
+    dispatch.run([first])
+
+    assert len(jira.issues) == 1
+    assert len(slack.calls) == 2
+
+
 # Multiple legacy feasibility issues for one repository must hold rather than pick one.
 def test_legacy_feasibility_duplicates_hold(tmp_path, shared_clients):
     jira, slack = shared_clients

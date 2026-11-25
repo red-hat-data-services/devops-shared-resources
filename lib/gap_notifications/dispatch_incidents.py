@@ -473,6 +473,28 @@ class Dispatcher:
             raise RegistryHold("registry readback mismatch")
         return state
 
+    def _legacy_feasibility_recovered(self, obs, event):
+        """Suppress replayed failures already recovered by a closed legacy issue."""
+        current_repository = json.loads(incident_key(obs))["repository"]
+        for issue in self.jira.find_by_label("gap-feasibility-failure"):
+            if not _closed(issue):
+                continue
+            state = self.jira.get_notification_state(issue["key"])
+            if not isinstance(state, dict):
+                continue
+            try:
+                identity = json.loads(state.get("incident_key", ""))
+            except (TypeError, ValueError):
+                continue
+            if (not isinstance(identity, dict) or identity.get("category") != "feasibility"
+                    or identity.get("repository") != current_repository
+                    or state.get("scope") != self.target.scope
+                    or state.get("trial_id") != self.trial_id):
+                continue
+            if state.get("last_outcome") == "success" and event in state.get("seen_event_ids", {}):
+                return True
+        return False
+
     def _legacy_feasibility_issues(self, obs, label):
         """Find and tag pre-repo-scope feasibility issues for the same repository."""
         matches = []
@@ -726,6 +748,8 @@ class Dispatcher:
         elif obs["status"] == "failure":
             if previous and previous[1]["last_outcome"] == "success" and event in previous[1]["seen_event_ids"]:
                 return  # Old pre-recovery failure, not a new recurrence.
+            if not previous and obs["category"] == "feasibility" and self._legacy_feasibility_recovered(obs, event):
+                return  # Legacy recovered replay before repo-scope label migration.
             prior = dict(previous[1], issue_key=previous[0]["key"]) if previous else {}
             issue, state = self._create(task, prior)
         else:
