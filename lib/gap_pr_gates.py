@@ -10,9 +10,12 @@ pending; only a completed non-success conclusion is a build failure.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Sequence
+
+logger = logging.getLogger(__name__)
 
 from lib.gap_check_selection import (
     FeasibilityRun,
@@ -240,13 +243,56 @@ def _evaluate_feasibility(
     deadline: datetime,
 ) -> GateResult:
     if check_query_error or feasibility.query_error:
-        return evaluate_checks(
-            (),
-            (),
-            now=now,
-            deadline=deadline,
-            query_error=check_query_error or feasibility.query_error,
+        # When the feasibility run itself succeeded (run-level conclusion)
+        # but the jobs query failed, trust the authoritative run conclusion
+        # and fall through to normal evaluation instead of short-circuiting.
+        feasibility_error_bypassed = (
+            not check_query_error
+            and feasibility.query_error
+            and feasibility.found
+            and feasibility.conclusion
+            and feasibility.conclusion.lower() == "success"
+        )
+        if not feasibility_error_bypassed:
+            return evaluate_checks(
+                (),
+                (),
+                now=now,
+                deadline=deadline,
+                query_error=check_query_error or feasibility.query_error,
+                revision=feasibility.head_sha,
+            )
+        logger.info(
+            "Feasibility query error bypassed: run conclusion is success "
+            "(error: %s)",
+            feasibility.query_error,
+        )
+    # When the run-level conclusion is authoritative success but the job
+    # inventory is empty (e.g. jobs query failed and query_error was cleared),
+    # return an immediate success instead of falling through to
+    # _undiscovered_feasibility which would time out after the deadline.
+    if (
+        feasibility.found
+        and not feasibility.jobs
+        and not feasibility.query_error
+        and feasibility.conclusion
+        and feasibility.conclusion.lower() == "success"
+    ):
+        logger.info(
+            "Feasibility run concluded successfully with empty job inventory; "
+            "returning immediate success (sha %s)",
+            feasibility.head_sha,
+        )
+        finding = CheckFinding(
+            key="main-to-release feasibility",
+            outcome=OUTCOME_PASS,
+            reason="run-level conclusion is success (jobs unavailable)",
             revision=feasibility.head_sha,
+            name="Main-to-release feasibility",
+        )
+        return GateResult(
+            outcome=OUTCOME_PASS, findings=(finding,),
+            timed_out=False, link=feasibility.url,
         )
     if not feasibility.found or not feasibility.jobs:
         return _undiscovered_feasibility(feasibility, now=now, deadline=deadline)

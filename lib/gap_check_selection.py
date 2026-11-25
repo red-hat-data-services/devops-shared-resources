@@ -11,6 +11,7 @@ import base64
 import logging
 import os
 import re
+import time
 from dataclasses import dataclass, replace
 from typing import Any, Sequence
 from urllib.parse import urlparse
@@ -48,6 +49,23 @@ FEASIBILITY_SETUP_JOB = "Select release sync inputs"
 FEASIBILITY_APP_SLUG = "github-actions"
 
 logger = logging.getLogger(__name__)
+
+# Retry parameters for transient GitHub Actions API errors, matching the
+# GH_READ_RETRY_ATTEMPTS / GH_READ_RETRY_DELAYS pattern in github_cli.py
+# and _RETRY_MAX_ATTEMPTS / _RETRY_DELAYS in konflux_builds.py.
+_FEASIBILITY_RETRY_MAX = 3
+_FEASIBILITY_RETRY_DELAYS = (1.0, 3.0)
+_TRANSIENT_MARKERS = (
+    "403", "429", "500", "502", "503", "504",
+    "timeout", "rate limit", "temporarily unavailable",
+    "try again later", "connection reset",
+)
+
+
+def _is_transient_error(exc: Exception) -> bool:
+    """Return whether *exc* looks like a transient GitHub API failure."""
+    text = str(exc).lower()
+    return any(marker in text for marker in _TRANSIENT_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -480,18 +498,42 @@ def _workflow_execution_key(run: dict[str, Any]) -> tuple[str, int]:
 
 
 def fetch_feasibility_run(owner: str, repo: str, sha: str, runner: GhRunner) -> FeasibilityRun:
-    """Load the latest feasibility execution for this commit, if any."""
+    """Load the latest feasibility execution for this commit, if any.
+
+    Transient API errors (403, 429, 5xx, timeouts) are retried up to
+    ``_FEASIBILITY_RETRY_MAX`` times with backoff delays matching the
+    ``GH_READ_RETRY_DELAYS`` pattern in :mod:`lib.github_cli`.
+    """
     endpoint = f"repos/{owner}/{repo}/actions/runs?head_sha={sha}"
-    try:
-        runs = collect_github_pages(runner, endpoint, "workflow_runs", 100)
-    except (GhCommandError, CheckQueryError) as exc:
+
+    # --- runs query with retry ---
+    runs: list[Any] | None = None
+    last_runs_error: Exception | None = None
+    for attempt in range(1, _FEASIBILITY_RETRY_MAX + 1):
+        try:
+            runs = collect_github_pages(runner, endpoint, "workflow_runs", 100)
+            last_runs_error = None
+            break
+        except (GhCommandError, CheckQueryError) as exc:
+            last_runs_error = exc
+            if attempt < _FEASIBILITY_RETRY_MAX and _is_transient_error(exc):
+                delay = _FEASIBILITY_RETRY_DELAYS[min(attempt - 1, len(_FEASIBILITY_RETRY_DELAYS) - 1)]
+                logger.warning(
+                    "Feasibility runs query attempt %d/%d failed (%s), retrying in %.1fs",
+                    attempt, _FEASIBILITY_RETRY_MAX, exc, delay,
+                )
+                time.sleep(delay)
+                continue
+            break
+
+    if runs is None:
         return FeasibilityRun(
             found=False,
             status=None,
             conclusion=None,
             head_sha=sha,
             jobs=(),
-            query_error=f"failed to list feasibility workflow runs: {exc}",
+            query_error=f"failed to list feasibility workflow runs: {last_runs_error}",
         )
 
     matching = []
@@ -525,17 +567,64 @@ def fetch_feasibility_run(owner: str, repo: str, sha: str, runner: GhRunner) -> 
             jobs=(),
             query_error="feasibility workflow run is missing an id",
         )
+
+    # --- jobs query with retry ---
     jobs_endpoint = f"repos/{owner}/{repo}/actions/runs/{run_id}/jobs"
-    try:
-        raw_jobs = collect_github_pages(runner, jobs_endpoint, "jobs", 100)
-    except (GhCommandError, CheckQueryError) as exc:
+    raw_jobs: list[Any] | None = None
+    last_jobs_error: Exception | None = None
+    for attempt in range(1, _FEASIBILITY_RETRY_MAX + 1):
+        try:
+            raw_jobs = collect_github_pages(runner, jobs_endpoint, "jobs", 100)
+            last_jobs_error = None
+            break
+        except (GhCommandError, CheckQueryError) as exc:
+            last_jobs_error = exc
+            if attempt < _FEASIBILITY_RETRY_MAX and _is_transient_error(exc):
+                delay = _FEASIBILITY_RETRY_DELAYS[min(attempt - 1, len(_FEASIBILITY_RETRY_DELAYS) - 1)]
+                logger.warning(
+                    "Feasibility jobs query attempt %d/%d failed (%s), retrying in %.1fs",
+                    attempt, _FEASIBILITY_RETRY_MAX, exc, delay,
+                )
+                time.sleep(delay)
+                continue
+            break
+
+    run_conclusion = _optional_str(latest.get("conclusion"))
+
+    if raw_jobs is None:
+        # When the jobs query fails but the run-level conclusion is
+        # authoritative (success), do not propagate the query error — the
+        # run itself succeeded and the caller can evaluate at the run level.
+        jobs_query_error: str | None
+        fallback_jobs: tuple[WorkflowJob, ...] = ()
+        if run_conclusion and run_conclusion.lower() == "success":
+            logger.info(
+                "Feasibility jobs query failed but run conclusion is 'success'; "
+                "clearing query_error (run %s)",
+                run_id,
+            )
+            jobs_query_error = None
+            # Synthetic job signals that the run-level conclusion is
+            # authoritative so _evaluate_feasibility does not treat the
+            # empty inventory as undiscovered.
+            fallback_jobs = (
+                WorkflowJob(
+                    name=FEASIBILITY_SETUP_JOB,
+                    status="completed",
+                    conclusion="success",
+                    html_url=None,
+                    started_at=None,
+                ),
+            )
+        else:
+            jobs_query_error = f"failed to list feasibility workflow jobs: {last_jobs_error}"
         return FeasibilityRun(
             found=True,
             status=_optional_str(latest.get("status")),
-            conclusion=_optional_str(latest.get("conclusion")),
+            conclusion=run_conclusion,
             head_sha=sha,
-            jobs=(),
-            query_error=f"failed to list feasibility workflow jobs: {exc}",
+            jobs=fallback_jobs,
+            query_error=jobs_query_error,
         )
 
     jobs: list[WorkflowJob] = []
@@ -557,7 +646,7 @@ def fetch_feasibility_run(owner: str, repo: str, sha: str, runner: GhRunner) -> 
     return FeasibilityRun(
         found=True,
         status=_optional_str(latest.get("status")),
-        conclusion=_optional_str(latest.get("conclusion")),
+        conclusion=run_conclusion,
         head_sha=sha,
         jobs=tuple(jobs),
         run_id=run_id,

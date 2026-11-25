@@ -51,7 +51,10 @@ def test_conflict_short_circuit_is_not_completed_skipped():
 
 
 def test_query_error_timeout_stays_ordinary_gate_failure_but_notification_unknown():
+    # With the bypass, a feasibility query_error is ignored when the run-level
+    # conclusion is "success" — the gate now succeeds instead of failing.
+    # The notification receipt still records the query error conservatively.
     decision, receipt = evaluate(query_error="offline fake query failure", age=7)
-    assert decision.pr_status == "merge-failure"
+    assert decision.pr_status == "success"
     assert receipt["feasibility"]["status"] == "unknown"
     assert receipt["feasibility"]["query-error"] is True

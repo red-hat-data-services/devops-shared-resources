@@ -1544,3 +1544,270 @@ def test_missing_component_label_cannot_pass_gap(tmp_path):
 def test_unselected_pipeline_does_not_require_component_label():
     document = LABEL_PIPELINE.replace("    appstudio.openshift.io/component: manual-component", "")
     assert select_build_checks([document], _context(), app_slug="konflux-internal-p02", allowed_components=frozenset()) == []
+
+
+# ---------------------------------------------------------------------------
+# Retry and query-error bypass tests
+# ---------------------------------------------------------------------------
+
+
+def test_fetch_feasibility_retries_transient_runs_error() -> None:
+    """Transient 403 on the runs query is retried; success on retry returns data."""
+    attempts: list[str] = []
+    runs_payload = json.dumps({
+        "total_count": 1,
+        "workflow_runs": [_workflow_run(
+            9, attempt=1, started="2026-10-06T10:00:00Z",
+            status="completed", conclusion="success",
+        )],
+    })
+    jobs_payload = json.dumps({
+        "total_count": 1,
+        "jobs": [_feasibility_job(FEASIBILITY_SETUP_JOB, "completed", "success")],
+    })
+
+    def runner(args: list[str]) -> str:
+        endpoint = args[1]
+        attempts.append(endpoint)
+        if "actions/runs" in endpoint and "/jobs" not in endpoint and len([a for a in attempts if "/jobs" not in a]) == 1:
+            raise GhCommandError(["gh", *args], 1, "HTTP 403: rate limit exceeded")
+        if "/jobs" in endpoint:
+            return jobs_payload
+        return runs_payload
+
+    import unittest.mock as mock
+    with mock.patch("lib.gap_check_selection.time.sleep") as sleep_mock:
+        result = fetch_feasibility_run("acme", "widget", SHA, runner)
+    assert result.found is True
+    assert result.query_error is None
+    assert result.conclusion == "success"
+    # Verify retry happened (at least 2 runs-query attempts)
+    runs_calls = [a for a in attempts if "actions/runs" in a and "/jobs" not in a]
+    assert len(runs_calls) >= 2
+    sleep_mock.assert_called()
+
+
+def test_fetch_feasibility_retries_transient_jobs_error() -> None:
+    """Transient 503 on the jobs query is retried; success on retry returns jobs."""
+    attempts: list[str] = []
+    runs_payload = json.dumps({
+        "total_count": 1,
+        "workflow_runs": [_workflow_run(
+            9, attempt=1, started="2026-10-06T10:00:00Z",
+            status="completed", conclusion="success",
+        )],
+    })
+    jobs_payload = json.dumps({
+        "total_count": 1,
+        "jobs": [_feasibility_job(FEASIBILITY_SETUP_JOB, "completed", "success")],
+    })
+
+    def runner(args: list[str]) -> str:
+        endpoint = args[1]
+        attempts.append(endpoint)
+        if "/jobs" in endpoint:
+            jobs_calls = [a for a in attempts if "/jobs" in a]
+            if len(jobs_calls) == 1:
+                raise GhCommandError(["gh", *args], 1, "HTTP 503: service unavailable")
+            return jobs_payload
+        return runs_payload
+
+    import unittest.mock as mock
+    with mock.patch("lib.gap_check_selection.time.sleep") as sleep_mock:
+        result = fetch_feasibility_run("acme", "widget", SHA, runner)
+    assert result.found is True
+    assert result.query_error is None
+    assert len(result.jobs) == 1
+    assert result.jobs[0].name == FEASIBILITY_SETUP_JOB
+    sleep_mock.assert_called()
+
+
+def test_fetch_feasibility_no_retry_on_non_transient_error() -> None:
+    """Non-transient errors (e.g. 404) are not retried."""
+    attempts: list[str] = []
+
+    def runner(args: list[str]) -> str:
+        endpoint = args[1]
+        attempts.append(endpoint)
+        raise GhCommandError(["gh", *args], 1, "HTTP 404: Not Found")
+
+    import unittest.mock as mock
+    with mock.patch("lib.gap_check_selection.time.sleep") as sleep_mock:
+        result = fetch_feasibility_run("acme", "widget", SHA, runner)
+    assert result.found is False
+    assert result.query_error is not None
+    assert "404" in result.query_error
+    # Only 1 attempt — no retry for 404
+    runs_calls = [a for a in attempts if "actions/runs" in a and "/jobs" not in a]
+    assert len(runs_calls) == 1
+    sleep_mock.assert_not_called()
+
+
+def test_fetch_feasibility_jobs_error_cleared_when_run_success() -> None:
+    """When jobs query fails after all retries but run conclusion is success,
+    query_error is set to None (run-level conclusion is authoritative)."""
+    runs_payload = json.dumps({
+        "total_count": 1,
+        "workflow_runs": [_workflow_run(
+            9, attempt=1, started="2026-10-06T10:00:00Z",
+            status="completed", conclusion="success",
+        )],
+    })
+
+    def runner(args: list[str]) -> str:
+        endpoint = args[1]
+        if "/jobs" in endpoint:
+            raise GhCommandError(["gh", *args], 1, "HTTP 500: Internal Server Error")
+        return runs_payload
+
+    import unittest.mock as mock
+    with mock.patch("lib.gap_check_selection.time.sleep"):
+        result = fetch_feasibility_run("acme", "widget", SHA, runner)
+    assert result.found is True
+    assert result.conclusion == "success"
+    assert result.query_error is None  # cleared because run conclusion is success
+    # Synthetic job created from the authoritative run-level conclusion
+    assert len(result.jobs) == 1
+    assert result.jobs[0].name == FEASIBILITY_SETUP_JOB
+    assert result.jobs[0].conclusion == "success"
+
+
+def test_fetch_feasibility_jobs_error_kept_when_run_failed() -> None:
+    """When jobs query fails and run conclusion is not success, query_error is kept."""
+    runs_payload = json.dumps({
+        "total_count": 1,
+        "workflow_runs": [_workflow_run(
+            9, attempt=1, started="2026-10-06T10:00:00Z",
+            status="completed", conclusion="failure",
+        )],
+    })
+
+    def runner(args: list[str]) -> str:
+        endpoint = args[1]
+        if "/jobs" in endpoint:
+            raise GhCommandError(["gh", *args], 1, "HTTP 500: Internal Server Error")
+        return runs_payload
+
+    import unittest.mock as mock
+    with mock.patch("lib.gap_check_selection.time.sleep"):
+        result = fetch_feasibility_run("acme", "widget", SHA, runner)
+    assert result.found is True
+    assert result.conclusion == "failure"
+    assert result.query_error is not None
+    assert "failed to list feasibility workflow jobs" in result.query_error
+
+
+def test_evaluate_feasibility_bypasses_query_error_on_success() -> None:
+    """_evaluate_feasibility skips query_error short-circuit when the run concluded successfully."""
+    from lib.gap_pr_gates import _evaluate_feasibility
+    from lib.github_check_runs import OUTCOME_PENDING, revision_deadline
+
+    feasibility = FeasibilityRun(
+        found=True,
+        status="completed",
+        conclusion="success",
+        head_sha=SHA,
+        jobs=(),
+        query_error="failed to list feasibility workflow jobs: HTTP 500",
+    )
+    deadline = revision_deadline(COMMITTER)
+    result = _evaluate_feasibility(
+        feasibility,
+        check_runs=[],
+        check_query_error=None,
+        now=NOW,
+        deadline=deadline,
+    )
+    # With found=True, conclusion=success, jobs=(), and query_error bypassed,
+    # _evaluate_feasibility falls through to _undiscovered_feasibility which
+    # returns pending (not discovered yet, no jobs — before the deadline).
+    assert result.outcome == OUTCOME_PENDING
+
+
+def test_evaluate_feasibility_does_not_bypass_check_query_error() -> None:
+    """_evaluate_feasibility still short-circuits when check_query_error is set,
+    even if the feasibility run concluded successfully."""
+    from lib.gap_pr_gates import _evaluate_feasibility
+    from lib.github_check_runs import OUTCOME_PENDING, revision_deadline
+
+    feasibility = FeasibilityRun(
+        found=True,
+        status="completed",
+        conclusion="success",
+        head_sha=SHA,
+        jobs=(
+            WorkflowJob(FEASIBILITY_SETUP_JOB, "completed", "success", None, None),
+        ),
+    )
+    deadline = revision_deadline(COMMITTER)
+    result = _evaluate_feasibility(
+        feasibility,
+        check_runs=[],
+        check_query_error="check API unavailable",
+        now=NOW,
+        deadline=deadline,
+    )
+    # check_query_error is NOT bypassed — always respected; the finding
+    # carries the error text in its reason field.
+    assert result.outcome == OUTCOME_PENDING
+    assert any("check API unavailable" in f.reason for f in result.findings)
+
+
+def test_evaluate_feasibility_does_not_bypass_on_non_success_conclusion() -> None:
+    """_evaluate_feasibility does not bypass query_error when conclusion is not success."""
+    from lib.gap_pr_gates import _evaluate_feasibility
+    from lib.github_check_runs import OUTCOME_PENDING, revision_deadline
+
+    feasibility = FeasibilityRun(
+        found=True,
+        status="completed",
+        conclusion="failure",
+        head_sha=SHA,
+        jobs=(),
+        query_error="failed to list feasibility workflow jobs: HTTP 503",
+    )
+    deadline = revision_deadline(COMMITTER)
+    result = _evaluate_feasibility(
+        feasibility,
+        check_runs=[],
+        check_query_error=None,
+        now=NOW,
+        deadline=deadline,
+    )
+    # query_error is NOT bypassed when conclusion is failure; the finding
+    # carries the error text in its reason field.
+    assert result.outcome == OUTCOME_PENDING
+    assert any("HTTP 503" in f.reason for f in result.findings)
+
+
+def test_empty_jobs_success_conclusion_post_deadline_succeeds() -> None:
+    """When conclusion is success and query_error is None but jobs is empty,
+    _evaluate_feasibility returns success even after the deadline, rather than
+    falling through to _undiscovered_feasibility which would time out."""
+    from lib.gap_pr_gates import _evaluate_feasibility
+    from lib.github_check_runs import OUTCOME_PASS, revision_deadline
+
+    feasibility = FeasibilityRun(
+        found=True,
+        status="completed",
+        conclusion="success",
+        head_sha=SHA,
+        jobs=(),
+        query_error=None,
+    )
+    deadline = revision_deadline(COMMITTER)
+    after_deadline = COMMITTER + timedelta(hours=7)
+    result = _evaluate_feasibility(
+        feasibility,
+        check_runs=[],
+        check_query_error=None,
+        now=after_deadline,
+        deadline=deadline,
+    )
+    # The safety net recognises the authoritative run-level success even
+    # though the job inventory is empty; it does not fall through to
+    # _undiscovered_feasibility which would return FAIL after the deadline.
+    assert result.outcome == OUTCOME_PASS
+    assert any(
+        "run-level conclusion is success" in f.reason for f in result.findings
+    )
