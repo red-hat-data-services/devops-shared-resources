@@ -204,7 +204,7 @@ def bind_trial(ledger, trial_id, *, jira_environment="stage", channel=None):
         raise ValueError("journal Jira environment mismatch")
     for task in ledger.get("outbox", []):
         validate_observations([task["observation"]], **target.options)
-        if task["incident_key"] != incident_key(task["observation"]):
+        if not _identity_equivalent(task["incident_key"], incident_key(task["observation"])):
             raise ValueError("journal incident identity mismatch")
     for identity in ledger.get("creates", {}):
         if json.loads(identity).get("environment") != target.scope:
@@ -230,7 +230,7 @@ def ingest(ledger, observations, *, trial_id="default", jira_environment="stage"
             task = {"id": task_id, "incident_key": key, "system": "registry"}
             if obs["status"] != "unknown":
                 for older in data.get("outbox", []):
-                    if older["incident_key"] == key and older["state"] != "confirmed":
+                    if _identity_equivalent(older["incident_key"], key) and older["state"] != "confirmed":
                         older["state"] = "superseded"
             data.setdefault("outbox", []).append(task)
         # Never local-dedup definitive observations: manual closure must be discovered.
@@ -500,8 +500,10 @@ class Dispatcher:
         label = incident_label(identity, self.trial_id)
         summary = _summary(obs, **self.target.options)
         issues = self.jira.find_by_summary(summary)  # Title-based dedup.
-        if not issues and obs["category"] == "feasibility":
-            issues = self._legacy_feasibility_issues(obs, label)
+        if obs["category"] == "feasibility":
+            # Always include legacy matches so duplicate open issues fail closed.
+            legacy = self._legacy_feasibility_issues(obs, label)
+            issues = list({issue["key"]: issue for issue in [*issues, *legacy]}.values())
         if not isinstance(issues, list):
             raise RegistryHold("incomplete registry")
         journal = _create_journal(self.data.get("creates", {}).get(identity))

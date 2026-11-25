@@ -340,6 +340,25 @@ def test_wrong_property_scope_holds_without_send(setup):
     assert result["outbox"][0]["state"] != "confirmed"
 
 
+# Legacy feasibility journal entries remain usable after repo-scoped identity migration.
+def test_legacy_feasibility_ledger_entries_remain_compatible():
+    obs = observation(category="feasibility")
+    ledger = ingest({}, [obs], trial_id="trial")
+    task = ledger["outbox"][0]
+    legacy_identity = json.loads(task["incident_key"])
+    legacy_identity.update(source_branch=obs["source_branch"], destination_branch=obs["destination_branch"])
+    task["incident_key"] = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    task["state"] = "pending"
+
+    result = ingest(ledger, [], trial_id="trial")
+    assert result["outbox"][0]["state"] == "pending"
+
+    replacement = dict(obs, destination_branch="rhoai-3.8", observation_id="new-failure")
+    result = ingest(ledger, [replacement], trial_id="trial")
+    assert result["outbox"][0]["state"] == "superseded"
+    assert result["outbox"][1]["incident_key"] == incident_key(replacement)
+
+
 # Trial namespaces stay distinct, and incompatible journals must be rejected.
 def test_trial_and_v1_ledger_isolation():
     obs = observation()
@@ -789,6 +808,41 @@ def test_legacy_feasibility_issue_is_reused_across_branch_streams(tmp_path, shar
     assert repo_label in jira.issues[key]["fields"]["labels"]
     assert len(slack.calls) == 2
     assert slack.calls[-1][1]["thread_ts"] == jira.notification_state[key]["delivery"]["root"]["ts"]
+
+
+# Multiple legacy feasibility issues for one repository must hold rather than pick one.
+def test_legacy_feasibility_duplicates_hold(tmp_path, shared_clients):
+    jira, slack = shared_clients
+    dispatch = make_dispatcher(tmp_path, jira, slack)
+    first = registry_observation(category="feasibility", component=None, destination_branch="rhoai-3.7")
+    dispatch.run([first])
+    key = jira.issue_keys()[0]
+    state = jira.notification_state[key]
+    legacy_identity = json.loads(state["incident_key"])
+    legacy_identity.update(source_branch="main", destination_branch="rhoai-3.7")
+    state["incident_key"] = json.dumps(legacy_identity, sort_keys=True, separators=(",", ":"))
+    legacy_label = incident_label(state["incident_key"], TRIAL_ID)
+    repo_label = incident_label(incident_key(first), TRIAL_ID)
+    labels = jira.issues[key]["fields"]["labels"]
+    labels.remove(repo_label)
+    labels.append(legacy_label)
+
+    duplicate_key = "RHAI-" + str(int(key.split("-")[1]) + 1)
+    jira.issues[duplicate_key] = copy.deepcopy(jira.issues[key])
+    jira.issues[duplicate_key]["key"] = duplicate_key
+    jira.notification_state[duplicate_key] = copy.deepcopy(state)
+    episode = "00000000-0000-4000-8000-000000000002"
+    jira.notification_state[duplicate_key]["episode_id"] = episode
+    duplicate_labels = jira.issues[duplicate_key]["fields"]["labels"]
+    duplicate_labels[:] = [label for label in duplicate_labels if not label.startswith("gap-episode-")]
+    duplicate_labels.append("gap-episode-" + episode.replace("-", ""))
+
+    second = registry_observation(category="feasibility", component=None, destination_branch="rhoai-3.8", oid="run-2")
+    result = dispatch.run([second])
+    assert len(jira.issues) == 2
+    assert result["outbox"][-1]["state"] == "reconciliation_required"
+    assert result["outbox"][-1]["hold"] == "registry_or_delivery_unavailable"
+    assert len(slack.calls) == 1
 
 
 # Grouped target evidence must reuse one feasibility ticket and Slack root.
