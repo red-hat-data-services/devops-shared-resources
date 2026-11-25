@@ -280,7 +280,8 @@ incidents. Build additionally includes component/pipeline. Feasibility is repo-s
 source/destination streams and tested downstream branches are evidence, not identity, so
 all affected branches share one open feasibility incident per repository. Existing
 branch-scoped feasibility issues are adopted by adding the repo-scoped registry label;
-their original incident labels and Slack roots remain valid.
+their original incident labels, properties, and Slack roots remain valid without rewriting
+remote registry state.
 
 Every supplied definitive failure queries the complete registry **even if its event ID
 was seen locally**. Exactly one valid open issue is reused. Only closed matches and a
