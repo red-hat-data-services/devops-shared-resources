@@ -48,18 +48,27 @@ def test_incident_key_is_canonical_and_environment_scoped():
     assert incident_key(base) != incident_key(other_env)
 
 
-# Distinct destination branches must remain distinct incident streams for every category.
-def test_branch_stream_separation_retains_destination_branch_for_all_categories():
+# Distinct destination branches must remain distinct build and conflict incident streams.
+def test_branch_stream_separation_retains_destination_branch_for_build_and_conflict():
     build = identity_observation(destination_branch="main", pipeline="build-a")
     build_other_branch = identity_observation(destination_branch="release-1", pipeline="build-a")
     conflict = identity_observation(category="conflict", component=None, destination_branch="main")
     conflict_other_branch = identity_observation(category="conflict", component=None, destination_branch="release-1")
-    feasibility = identity_observation(category="feasibility", component=None, destination_branch="rhoai-1")
-    feasibility_other_branch = identity_observation(category="feasibility", component=None, destination_branch="rhoai-2")
 
     assert incident_key(build) != incident_key(build_other_branch)
     assert incident_key(conflict) != incident_key(conflict_other_branch)
-    assert incident_key(feasibility) != incident_key(feasibility_other_branch)
+
+
+# Feasibility is repo-scoped: all branch streams intentionally share one incident.
+def test_feasibility_identity_is_repo_scoped_across_branch_streams():
+    first = identity_observation(category="feasibility", component=None, source_branch="main",
+                                  destination_branch="rhoai-1")
+    second = identity_observation(category="feasibility", component=None, source_branch="main",
+                                  destination_branch="rhoai-2")
+    third = identity_observation(category="feasibility", component=None, source_branch="release-next",
+                                  destination_branch="rhoai-1")
+
+    assert incident_key(first) == incident_key(second) == incident_key(third)
 
 
 # Identity calculation must be deterministic and leave the supplied observation untouched.
@@ -752,11 +761,13 @@ def test_grouped_feasibility_branches_share_identity(tmp_path, shared_clients):
     first = registry_observation(
         category="feasibility",
         component=None,
+        destination_branch="rhoai-3.7",
         evidence={"targets": {"rhoai-3.7": "failure"}, "historical_snapshot": True, "test_only": True},
     )
     second = registry_observation(
         category="feasibility",
         component=None,
+        destination_branch="rhoai-3.8",
         evidence={"targets": {"rhoai-3.7": "failure", "rhoai-3.8": "failure"}, "historical_snapshot": True, "test_only": True},
     )
     dispatch.run([first])

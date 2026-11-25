@@ -275,10 +275,10 @@ or recovery claim.
 
 Jira, **not the local ledger or Leader state**, is the cross-Leader registry. A stable
 searchable `gap-registry-<fingerprint>` label identifies staging scope + trial + canonical
-repository + actual source/destination promotion stream + category. Build additionally
-includes component/pipeline. PR, Leader, revision, run UID and tested downstream
-feasibility branches are evidence, not incident identity. All affected release branches
-share one feasibility incident per actual promotion stream.
+repository + actual source/destination promotion stream + category for build and conflict
+incidents. Build additionally includes component/pipeline. Feasibility is repo-scoped:
+source/destination streams and tested downstream branches are evidence, not identity, so
+all affected branches share one open feasibility incident per repository.
 
 Every supplied definitive failure queries the complete registry **even if its event ID
 was seen locally**. Exactly one valid open issue is reused. Only closed matches and a

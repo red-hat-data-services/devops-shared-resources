@@ -128,10 +128,13 @@ def _incident_identity(observation: dict[str, Any]) -> dict[str, Any]:
     identity: dict[str, Any] = {
         "environment": observation["environment"],
         "repository": observation["repository"],
-        "source_branch": observation["source_branch"],
-        "destination_branch": observation["destination_branch"],
         "category": observation["category"],
     }
+    # Feasibility failures are intentionally repo-scoped: all branch streams share
+    # one open incident at a time. Build and conflict failures remain stream-scoped.
+    if observation["category"] != "feasibility":
+        identity["source_branch"] = observation["source_branch"]
+        identity["destination_branch"] = observation["destination_branch"]
     if observation["category"] == "build":
         identity["component"] = observation["component"]
         if "pipeline" in observation:
@@ -804,6 +807,10 @@ def validated_property(issue, state, *, trial=None, identity=None, jira_environm
     stored_identity = state.get("incident_key")
     parsed = json.loads(stored_identity)
     obs = dict(parsed, status="failure", observation_id="diagnostic", evidence={})
+    # Repo-scoped feasibility identities intentionally omit branch fields.
+    # Supply non-routing placeholders so the full observation validator can run.
+    obs.setdefault("source_branch", "unused")
+    obs.setdefault("destination_branch", "unused")
     if incident_key(obs) != stored_identity or (identity is not None and identity != stored_identity):
         raise ValueError("incident mismatch")
     label = incident_label(stored_identity, stored_trial)
