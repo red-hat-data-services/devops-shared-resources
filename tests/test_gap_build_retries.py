@@ -1078,3 +1078,68 @@ def test_merge_conflict_pr_gets_konflux_observations(tmp_path, monkeypatch):
     # Check runs are fetched and Konflux gate is evaluated even for
     # merge-conflicted PRs.
     assert "head-sha" in obs
+
+
+# --- retrigger-stale verification ---
+
+
+def test_retrigger_stale_detected_when_same_uid_persists_after_verify_grace():
+    """Same UID + >15min elapsed + failure status → waiting=False (OUTCOME_FAIL)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    # First apply: posts /retest, records retry with run_uid = observation uid.
+    _, saved = apply(manager(gh, client), client)
+    # Second apply: same observation (same uid), 20 min later (>15min verify grace, <2h START_GRACE).
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)), client)
+    assert gate.outcome == "fail"
+    assert receipt["runs"][0]["retry"]["status"] == "retrigger-stale"
+    assert "No new PipelineRun after 20min" in receipt["runs"][0]["retry"]["reason"]
+    assert receipt["runs"][0]["retry"]["run_uid"]
+    assert len(gh.posts) == 1  # no second retry posted
+
+
+def test_retrigger_stale_not_triggered_within_verify_grace():
+    """Same UID but <15min elapsed → waiting=True (still in verify grace)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    # 10 min later: within the 15-min verify grace window.
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=10)), client)
+    assert gate.outcome == "pending"
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert len(gh.posts) == 1
+
+
+def test_retrigger_stale_not_triggered_when_new_pipelinerun_created():
+    """Different UID (new PipelineRun created) → waiting=True."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    # PaC created a new PipelineRun with a different UID (still failing).
+    client.items = [attempt(name="r2", created="2026-11-05T12:05:00Z")]
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)), client)
+    assert gate.outcome == "pending"
+    assert receipt["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert len(gh.posts) == 1
+
+
+def test_retrigger_stale_not_triggered_with_empty_uids():
+    """Empty UIDs → waiting=True (can't verify, stay pending)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    _, saved = manager(gh, client).apply(PR, gate, evidence)
+    # Missing observations have empty UIDs; stale check cannot apply.
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)).apply(PR, gate, evidence)
+    assert gate.outcome == "pass"  # missing build = green by default
+    assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"
+    assert len(gh.posts) == 1
+
+
+def test_retrigger_stale_not_triggered_for_missing_observation_status():
+    """Observation status is 'missing' → waiting=True (not in STALE_VERIFIABLE_STATUSES)."""
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    _, saved = manager(gh, client).apply(PR, gate, evidence)
+    # Even if UIDs somehow matched, 'missing' status is not stale-verifiable.
+    gate, evidence = missing_evidence(client)
+    gate, evidence = manager(gh, client, saved=saved, now=NOW + timedelta(minutes=20)).apply(PR, gate, evidence)
+    assert gate.outcome == "pass"  # missing build = green by default
+    assert evidence["runs"][0]["retry"]["status"] == "build-retrigger-pending"

@@ -21,6 +21,7 @@ from lib.konflux_builds import KonfluxQueryError, NAME
 MAX_RETRIGGERS = 5
 START_GRACE = timedelta(hours=2)
 MARKER = re.compile(r"<!-- gap-build-retry:v1 (\{[^\n]+\}) -->")
+STALE_VERIFIABLE_STATUSES = {"failure", "timed_out", "cancelled"}
 
 
 class RetryObservationChanged(KonfluxQueryError):
@@ -159,6 +160,27 @@ class BuildRetryManager:
         if records:
             last = max(records, key=lambda r: _moment(r["requested_at"]))
             waiting = now - _moment(last["requested_at"]) < START_GRACE
+            # Verify the retrigger actually produced a new PipelineRun.
+            # Compare the current observation UID with the retry record's run_uid.
+            # If they match, PaC didn't create a new PipelineRun from the /retest.
+            RETRIGGER_VERIFY_GRACE = timedelta(minutes=15)
+            elapsed = now - _moment(last["requested_at"])
+            retried_uid = last.get("run_uid", "")
+            current_uid = observation.get("uid", "")
+            if (waiting
+                    and elapsed > RETRIGGER_VERIFY_GRACE
+                    and current_uid and retried_uid
+                    and current_uid == retried_uid
+                    and observation_status in STALE_VERIFIABLE_STATUSES):
+                info.update(
+                    status="retrigger-stale",
+                    reason=f"No new PipelineRun after {int(elapsed.total_seconds() / 60)}min; original {observation_status} persists",
+                    requested_at=last["requested_at"],
+                    comment_url=last.get("comment_url"),
+                    retrigger_count=count,
+                    run_uid=current_uid,
+                )
+                return info, False  # waiting=False → OUTCOME_FAIL
             if waiting:
                 info.update(
                     status="build-retrigger-pending",
