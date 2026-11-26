@@ -273,15 +273,17 @@ or recovery claim.
 
 ## Registry and policy
 
-Jira, **not the local ledger or Leader state**, is the cross-Leader registry. A stable
-searchable `gap-registry-<fingerprint>` label identifies staging scope + trial + canonical
-repository + actual source/destination promotion stream + category for build and conflict
-incidents. Build additionally includes component/pipeline. Feasibility is repo-scoped:
-source/destination streams and tested downstream branches are evidence, not identity, so
-all affected branches share one open feasibility incident per repository. Existing
-branch-scoped feasibility issues are adopted by adding the repo-scoped registry label;
-their original incident labels, properties, and Slack roots remain valid without rewriting
-remote registry state.
+Jira, **not the local ledger or Leader state**, is the cross-Leader registry. Open issues
+are found by their exact category-aware title; the stable `gap-registry-<fingerprint>`
+label remains on each issue for audit and registry-state validation, not as the primary
+lookup. Before an existing open issue’s description is replaced, the previous description
+is archived as a Jira comment. Build and conflict incidents remain scoped by repository,
+component/pipeline where applicable, and actual source/destination promotion stream.
+Feasibility is repo-scoped: source/destination streams and tested downstream branches are
+evidence, not identity, so all affected branches share one open feasibility incident per
+repository. Existing branch-scoped feasibility issues are adopted by adding the
+repo-scoped registry label; their original incident labels, properties, and Slack roots
+remain valid without rewriting remote registry state.
 
 Every supplied definitive failure queries the complete registry **even if its event ID
 was seen locally**. Exactly one valid open issue is reused. Only closed matches and a

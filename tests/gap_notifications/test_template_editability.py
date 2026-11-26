@@ -62,15 +62,22 @@ def test_title_changes_preserve_incident_updates_recovery_and_replay(tmp_path, m
     report = inspect_issue(jira, 'RHAI-1')
     assert report['property'] == 'valid' and report['identity_match']
 
-    # Title-based dedup: changed title means old issue is not found,
-    # so a new issue is created for the new failure event
     updated = runner('update').run([observation(category=category, oid='new-failure')])
     assert updated['outbox'][0]['state'] == 'confirmed'
-    assert len(jira.issues) == 2
+    if category == 'feasibility':
+        # Repo-scoped legacy adoption intentionally finds the existing issue even
+        # after a title change, preserving the original Jira and Slack thread.
+        assert len(jira.issues) == 1
+        recovered_key = 'RHAI-1'
+    else:
+        # Title-based dedup: changed title means the old issue is not found,
+        # so a new issue is created for the new failure event.
+        assert len(jira.issues) == 2
+        recovered_key = 'RHAI-2'
 
     recovered = runner('recovery').run([observation('success', 'recovered', category=category)])
     assert recovered['outbox'][0]['state'] == 'confirmed'
-    assert jira.closed('RHAI-2')
+    assert jira.closed(recovered_key)
 
 
 @pytest.mark.parametrize('tamper', ['scope', 'incident_key', 'episode_label'])
