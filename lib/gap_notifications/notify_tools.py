@@ -406,10 +406,10 @@ class JiraNotifier:
         return [self._issue_fields(issue) for issue in self._client.search(jql, fields=SEARCH_FIELDS)]
 
     def find_by_summary(self, summary: str) -> list[dict[str, Any]]:
-        """Find issues by exact summary match (open issues only)."""
+        """Find issues by exact phrase match (open issues only)."""
         summary = self._summary(summary)
         escaped = self._escape_jql(summary)
-        jql = f'project = {self.project} AND summary = "{escaped}" AND statusCategory != "Done" ORDER BY key ASC'
+        jql = f'project = {self.project} AND summary ~ "\\"{escaped}\\"" AND statusCategory != "Done" ORDER BY key ASC'
         return [self._issue_fields(issue) for issue in self._client.search(jql, fields=SEARCH_FIELDS)]
 
     def create_bug(
