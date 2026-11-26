@@ -111,18 +111,17 @@ omit the ownership layout. Python still handles section-size limits, and fallbac
 continues to omit ownership. Supplying `owning_team` when rendering the template
 directly produces a complete text preview.
 
-The first rendered H1 in the Jira template is also the issue summary. Its literal
-text must be nonempty and at most 250 characters, without inline links or code.
-The template interpolates already-escaped repository and component fields and
-applies `literal` only to the staging banner. Its Jinja `context` variable is
-`merge feasibility` for conflict/feasibility incidents, or the component for builds
-(`Unavailable` when absent). Overlong titles fail validation rather than truncate.
-Titles are presentation only:
-changing template wording or manually editing an existing Jira summary does not
-change incident identity or prevent updates, recovery, or replay suppression.
-Existing summaries are preserved; the template supplies titles for new issues.
-Jira descriptions link to the same ownership sources as Slack,
-including repository ownership for conflict and feasibility incidents.
+The first rendered H1 in the Jira template is also the issue summary. Titles use
+the category-aware form `Promotion Gate <context> Failure in <object>`: `PR Build`
+plus the component for builds, and `merge-feasibility` or `merge-conflict` plus the
+repository for the other categories. The literal text must be nonempty and at most
+250 characters, without inline links or code. Overlong titles fail validation rather
+than truncate. Descriptions begin with a plain-language **What happened** sentence,
+a **What to do next** section naming the suggested owner, and **Key links** for the
+child PR, build logs/PipelineRun, and Slack discussion. Technical details and the
+remaining evidence links follow those sections. Jira descriptions link to the same
+ownership sources as Slack, including repository ownership for conflict and
+feasibility incidents.
 
 Validate template edits offline with:
 
@@ -140,12 +139,12 @@ failure-specific guidance. Threaded updates omit this explanation to avoid repea
 root context.
 
 Jira descriptions use the packaged `lib/gap_notifications/templates/issue.md.j2`
-with Jinja2 StrictUndefined, independent of the current directory. Feasibility
+with Jinja2 StrictUndefined, independent of the current directory. They lead with
+the actionable summary, next steps, and key links described above. Feasibility
 issues include a main-to-release dry-run explanation, distinguish it from testing
 the proposed stable PR contents, and direct failures to the feasibility job rather
-than assuming a merge conflict. They refer to the configured source branch without
-guessing its name, which is not yet carried in the notification evidence. Their
-workflow evidence link is labeled **Feasibility run**, not **Creator workflow**. The restricted
+than assuming a merge conflict. Their workflow evidence link is labeled
+**Feasibility run**, not **Creator workflow**. The restricted
 Markdown converter supports headings, one-line paragraphs, flat bullets, explicit
 HTTPS links and inline code; no HTML, emphasis, tables, nested lists or code fences.
 Unsupported markup fails clearly. Evidence is escaped literal data, never a template.

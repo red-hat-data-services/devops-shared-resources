@@ -921,6 +921,7 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
                    title_context=literal(title_context), title_object=literal(title_object),
                    title_category=observation['category'], title_repository=observation['repository'],
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
+                   pipeline_url=https_url(e.get("build_url")) if e.get("build_url") else None,
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    note=literal(e.get("note")),
                    revision=literal(e.get("head_sha") or e.get("head-sha")), links=[],

@@ -6,6 +6,47 @@
 STAGE JIRA ENVIRONMENT
 {% endif %}
 
+## What happened
+
+The promotion for {{ title_object }} from {{ source_branch }} to {{ destination_branch }} did not complete because {{ reason }}.
+
+## Key links
+
+{%- set key_link_labels = {'pr': 'Child PR', 'build': 'Build logs or PipelineRun'} -%}
+{%- set key_links = [] -%}
+{%- for link in links if link.kind in ['pr', 'build'] -%}
+{%- set _ = key_links.append(link) -%}
+{%- endfor -%}
+{%- for link in key_links -%}
+- [{{ key_link_labels[link.kind] }}]({{ link.url }})
+{%- else -%}
+- Unavailable.
+{%- endfor -%}
+
+{% if discussion_url %}
+## Slack discussion
+
+[Open Slack discussion]({{ discussion_url }})
+{% endif %}
+
+## What to do next
+
+{% if category == 'build' %}
+- Suggested owner: component team.
+- Open the linked PipelineRun and ask the component team to review the failure.
+- If the failure looks temporary, such as an infrastructure timeout, comment /retest on the component PR.
+- If the failure is caused by code or configuration, ask the component team to fix it in the component PR.
+{% elif category == 'conflict' %}
+- Suggested owner: component team.
+- Ask the component team to resolve the conflict between {{ source_branch }} and {{ destination_branch }} in the promotion PR.
+- After they push the resolution, wait for GAP to refresh the mergeability check.
+{% else %}
+- Suggested owner: workflow owner.
+- Ask the workflow owner to inspect the linked feasibility workflow.
+- Ask them to fix the reported sync or workflow problem.
+{% endif %}
+- Keep this ticket open. GAP will update it automatically after a new current-head result; do not close it manually.
+
 {% if category == 'feasibility' %}
 ## Main-to-release feasibility
 
@@ -24,6 +65,11 @@ This incident tracks a failed or timed-out component build required by the promo
 - Reason: {{ reason }}
 {% if category == 'build' %}
 - Component: {{ component }}
+{% if pipeline_url %}
+- Pipeline: [PipelineRun]({{ pipeline_url }})
+{% else %}
+- Pipeline: {{ pipeline }}
+{% endif %}
 {% endif %}
 
 ## Evidence links
@@ -44,11 +90,6 @@ This incident tracks a failed or timed-out component build required by the promo
 
 - Revision: `{{ revision }}`
 - Event: `{{ observation_id }}`
-{% if discussion_url %}
-## Slack discussion
-
-[Open Slack discussion]({{ discussion_url }})
-{% endif %}
 {% if metadata_url %}
 ## Notification metadata
 
