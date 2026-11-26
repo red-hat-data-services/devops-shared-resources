@@ -101,6 +101,7 @@ def test_bulk_description_lists_all_affected_components_and_links():
     markdown = render_markdown(bulk)
     adf = description(bulk)
     assert "2 of 3 required component builds failed" in markdown
+    assert "Suggested owner: AI Productization Team." in markdown
     assert "[PR](https://github.com/acme/repo/pull/api)" in markdown
     assert "[Build](https://build.example/run/api)" in markdown
     assert "[PR](https://github.com/acme/repo/pull/web)" in markdown
