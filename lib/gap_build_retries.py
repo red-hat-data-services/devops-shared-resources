@@ -33,6 +33,11 @@ def retries_enabled():
     return os.environ.get("GAP_AUTO_RETRY_BUILDS", "false").lower() == "true"
 
 
+def force_retry_enabled():
+    """One-shot override: skip exhaustion and ignore guards for this cycle."""
+    return os.environ.get("GAP_FORCE_RETRY", "false").lower() == "true"
+
+
 def _moment(value):
     """Read an offset-aware receipt/controller time, rejecting malformed data."""
     if not isinstance(value, str):
@@ -225,7 +230,7 @@ class BuildRetryManager:
                 # else: past grace, fall through to retry-or-exhaust
 
             # Exhaustion check (reached when retrigger was stale or new PipelineRun also failed)
-            if count >= MAX_RETRIGGERS:
+            if count >= MAX_RETRIGGERS and not force_retry_enabled():
                 info.update(
                     status="retry-exhausted",
                     reason="Five automatic retries already used for this component and SHA",
@@ -233,7 +238,7 @@ class BuildRetryManager:
                     comment_url=last.get("comment_url"),
                 )
                 return info, False
-        if count >= MAX_RETRIGGERS:
+        if count >= MAX_RETRIGGERS and not force_retry_enabled():
             info["status"] = "retry-exhausted"
             info["reason"] = "Two automatic retries already used for this component and SHA"
             return info, False
@@ -373,7 +378,7 @@ class BuildRetryManager:
         # Case-by-case ignore: operators opted this child out of gating; do not
         # keep firing automatic /retest while it remains ignored.
         # getattr: some tests construct via object.__new__ without __init__.
-        if pr.url in getattr(self, "ignored_urls", ()):
+        if pr.url in getattr(self, "ignored_urls", ()) and not force_retry_enabled():
             return gate, evidence
         evidence = deepcopy(evidence)
         if evidence.get("query-error"):
