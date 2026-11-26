@@ -273,20 +273,23 @@ or recovery claim.
 
 ## Bulk build-failure aggregation
 
-When a monitor pass contains at least three build observations and at least half of them fail,
-GAP replaces those individual failure observations with one synthetic bulk
-build incident titled `Promotion Gates Bulk PR Build Failures`. Successful and
-unknown observations remain unchanged, and conflict or feasibility observations
-are never aggregated. The bulk incident carries a list of affected components,
-their PR/build links, and their failure reasons. It reuses the normal build
-dispatcher and title-based Jira deduplication, so the existing registry,
-Slack threading, and recovery machinery remain authoritative. Batches below
-the threshold, batches with fewer than three builds, mixed environments, and
-bulk evidence that cannot satisfy the existing observation/render limits are
-left unchanged. When every build in a later batch succeeds, GAP adds a bulk
-recovery observation with the same title; it closes an existing open bulk Jira
-through the normal dispatcher path and has no external effect when no bulk Jira
-exists.
+When a monitor pass contains at least three build observations and at least half
+of them fail, GAP partitions the builds by environment and promotion stream,
+applies the threshold within each partition, and represents the eligible failed
+partitions with one synthetic global bulk incident titled `Promotion Gates Bulk
+PR Build Failures`. Successful and unknown observations remain unchanged, and
+conflict or feasibility observations are never aggregated. The bulk incident
+carries a list of affected components, their PR/build links, and their failure
+reasons. It reuses the normal build dispatcher and title-based Jira
+deduplication, so the existing registry, Slack threading, and recovery machinery
+remain authoritative. Batches below the threshold, batches with fewer than three
+builds, mixed environments, and bulk evidence that cannot satisfy the existing
+observation/render limits are left unchanged. When every build in a later batch
+succeeds, GAP adds a bulk recovery observation with the same stable identity;
+it closes an existing open bulk Jira only after the recovery evidence covers
+every component recorded by that bulk incident. Incomplete recovery evidence
+holds rather than closing the Jira, and a recovery batch with no existing bulk
+Jira has no external effect.
 
 ## Registry and policy
 

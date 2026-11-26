@@ -426,6 +426,12 @@ def _create_journal(value):
     return value
 
 
+def _bulk_component_identity(item):
+    if not isinstance(item, dict):
+        return ""
+    return f"{item.get('repository')}/{item.get('component')}"
+
+
 class Dispatcher:
     """Single writer only: Jira properties are not compare-and-swap locks."""
     def __init__(self, ledger, jira, slack, *, transition_id=None, transition_fields=None, trial_id="default", jira_environment="stage", channel=None, ownership=None):
@@ -490,13 +496,20 @@ class Dispatcher:
         return sorted(records, key=lambda pair: int(pair[0]["key"].split("-")[1]))
 
     def _new_state(self, task, previous):
-        return _bounded({
+        state = {
             "schema": 1, "scope": self.target.scope, "trial_id": self.trial_id,
             "incident_key": task["incident_key"], "episode_id": str(uuid.uuid4()),
             "seen_event_ids": copy.deepcopy(previous.get("seen_event_ids", {})),
             "last_event": None, "last_outcome": None, "jira_intent": None,
             "delivery": {"root": None, "last_event": None, "intent": None},
-        })
+        }
+        evidence = task["observation"].get("evidence") or {}
+        if evidence.get("bulk") is True:
+            state["bulk_components"] = sorted(
+                _bulk_component_identity(item)
+                for item in evidence.get("affected_components", [])
+            )
+        return _bounded(state)
 
     def _create(self, task, previous):
         identity, obs = task["incident_key"], task["observation"]
@@ -698,8 +711,25 @@ class Dispatcher:
                 validated_property(issue, state, trial=self.trial_id, identity=task["incident_key"], **self.target.options)
                 body, labels = _presentation(obs, [], discussion_url=discussion_url(root, channel=self.target.channel) if root else None,
                                              metadata_url=metadata_url(key, **self.target.options), **self.target.options)
+                evidence = obs.get("evidence") or {}
+                if evidence.get("bulk") is True:
+                    state.setdefault("bulk_components", [])
+                    state["bulk_components"] = sorted(
+                        set(state["bulk_components"])
+                        | {_bulk_component_identity(item) for item in evidence.get("affected_components", [])}
+                    )
             if obs["status"] == "success" and not _closed(issue) and not self.transition_id:
                 raise RegistryHold("explicit done transition required")
+            if obs["status"] == "success":
+                evidence = obs.get("evidence") or {}
+                if evidence.get("bulk_recovery") is True:
+                    expected = set(state.get("bulk_components", []))
+                    recovered = {
+                        _bulk_component_identity(item)
+                        for item in evidence.get("affected_components", [])
+                    }
+                    if not expected or not expected.issubset(recovered):
+                        raise RegistryHold("bulk recovery requires every affected component")
             state["jira_intent"] = {"event_id": event, "outcome": obs["status"]}
             state["seen_event_ids"][event] = obs["status"]
             _bounded(state)

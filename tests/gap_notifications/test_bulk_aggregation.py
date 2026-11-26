@@ -248,3 +248,62 @@ def test_recovered_component_builds_close_existing_bulk_jira(hook):
     assert jira.closed("RHAI-1")
     assert len(slack.calls) == 2
     assert slack.calls[-1][1]["thread_ts"] == jira.properties["RHAI-1"]["delivery"]["root"]["ts"]
+
+
+def test_mixed_promotion_streams_are_partitioned_before_threshold():
+    stream_a = [
+        build_observation("api"),
+        build_observation("web"),
+        build_observation("gpu", "success"),
+    ]
+    stream_b = [
+        build_observation("memory", "success", oid="memory-success"),
+        build_observation("storage", "success", oid="storage-success"),
+    ]
+    for obs in stream_b:
+        obs["source_branch"] = "release-next"
+        obs["destination_branch"] = "stable-next"
+
+    result = aggregate_bulk_build_failures([*stream_a, *stream_b])
+    bulk = result[-1]
+    assert bulk["source_branch"] == "global"
+    assert bulk["destination_branch"] == "global"
+    assert bulk["evidence"]["total_builds"] == 3
+    assert bulk["evidence"]["failed_builds"] == 2
+    assert [item["component"] for item in bulk["evidence"]["affected_components"]] == ["api", "web"]
+    assert all(obs in result for obs in stream_b)
+
+
+def test_incomplete_recovery_does_not_close_bulk_jira(hook):
+    invoke, jira, slack, opts, _ = hook
+    failure_observations = [
+        build_observation("api"),
+        build_observation("web"),
+        build_observation("gpu", "success"),
+    ]
+    ownership_fetch = lambda name: (
+        "repo_to_component: {}\nrepo_to_slack_handle: {}"
+        if name == "automerge_team_mapping.yaml"
+        else "_default: DevOps\nmappings: {api: [API], web: [Web], promotion-gates-bulk: [DevOps]}"
+        if name.startswith("konflux")
+        else "components:\n  default:\n    slack_team_handle: devops"
+    )
+    invoke(
+        config=opts["config"],
+        collector=lambda *args, **kwargs: failure_observations,
+        ownership_fetch=ownership_fetch,
+    )
+    assert len(jira.issues) == 1
+
+    incomplete_recovery = [
+        build_observation("api", "success"),
+        build_observation("gpu", "success"),
+        build_observation("memory", "success"),
+    ]
+    result = invoke(
+        config=opts["config"],
+        collector=lambda *args, **kwargs: incomplete_recovery,
+        ownership_fetch=ownership_fetch,
+    )
+    assert result["status"] == "held"
+    assert not jira.closed("RHAI-1")
