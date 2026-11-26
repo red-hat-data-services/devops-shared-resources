@@ -1183,3 +1183,56 @@ def test_exhaustion_after_same_uid_stale():
     gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=14)), client)
     assert len(gh.posts) == 5 and gate.outcome == "fail"
     assert receipt["runs"][0]["retry"]["status"] == "retry-exhausted"
+
+
+# --- GAP_FORCE_RETRY: bypass exhaustion and ignore guards ---
+
+
+def test_force_retry_skips_ignored_guard(monkeypatch):
+    """GAP_FORCE_RETRY=true causes apply() to process ignored PRs."""
+    monkeypatch.setenv("GAP_FORCE_RETRY", "true")
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    payload = {"pull-requests": [{"pr-url": PR.url, "ignore": True}]}
+    ignored = BuildRetryManager(gh, payload, client_factory=lambda: client, clock=lambda: NOW)
+    gate, evidence = ignored.apply(PR, gate, evidence)
+    assert len(gh.posts) == 1
+    assert "/retest" in gh.posts[0]
+
+
+def test_force_retry_skips_exhaustion(monkeypatch):
+    """GAP_FORCE_RETRY=true bypasses the retry budget for exhausted components."""
+    monkeypatch.setenv("GAP_FORCE_RETRY", "true")
+    gh, client = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh, client), client)
+    for i in range(2, 6):  # retries 2 through 5
+        client.items = [attempt(name=f"r{i}", created=f"2026-11-05T{9 + i}:00:00Z")]
+        _, saved = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=i * 2)), client)
+    assert len(gh.posts) == 5
+    # With force retry the 6th attempt goes through despite budget exhaustion.
+    client.items = [attempt(name="r6", created="2026-11-05T22:00:00Z")]
+    gate, receipt = apply(manager(gh, client, saved=saved, now=NOW + timedelta(hours=14)), client)
+    assert len(gh.posts) == 6 and gate.outcome == "pending"
+    assert receipt["runs"][0]["retry"]["retrigger_count"] == 6
+
+
+def test_force_retry_default_preserves_existing_behavior(monkeypatch):
+    """When GAP_FORCE_RETRY is unset, ignored and exhaustion guards work as before."""
+    monkeypatch.delenv("GAP_FORCE_RETRY", raising=False)
+    # Ignored guard still blocks.
+    gh, client = FakeGitHub(), FakeKonflux()
+    gate, evidence = missing_evidence(client)
+    payload = {"pull-requests": [{"pr-url": PR.url, "ignore": True}]}
+    ignored = BuildRetryManager(gh, payload, client_factory=lambda: client, clock=lambda: NOW)
+    gate, evidence = ignored.apply(PR, gate, evidence)
+    assert not gh.posts
+    # Exhaustion still blocks.
+    gh2, client2 = FakeGitHub(), FakeKonflux()
+    _, saved = apply(manager(gh2, client2), client2)
+    for i in range(2, 6):
+        client2.items = [attempt(name=f"r{i}", created=f"2026-11-05T{9 + i}:00:00Z")]
+        _, saved = apply(manager(gh2, client2, saved=saved, now=NOW + timedelta(hours=i * 2)), client2)
+    client2.items = [attempt(name="r6", created="2026-11-05T22:00:00Z")]
+    gate, receipt = apply(manager(gh2, client2, saved=saved, now=NOW + timedelta(hours=14)), client2)
+    assert len(gh2.posts) == 5 and gate.outcome == "fail"
+    assert receipt["runs"][0]["retry"]["status"] == "retry-exhausted"
