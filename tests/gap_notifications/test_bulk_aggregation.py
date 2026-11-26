@@ -308,3 +308,44 @@ def test_incomplete_recovery_does_not_close_bulk_jira(hook):
     )
     assert result["status"] == "held"
     assert not jira.closed("RHAI-1")
+
+
+def test_mixed_environment_batch_is_unchanged():
+    first = build_observation("api")
+    second = build_observation("web")
+    second["environment"] = "redhat.atlassian.net/RHAI/C0883L8FARE"
+    observations = [first, second, build_observation("gpu", "success")]
+
+    result = aggregate_bulk_build_failures(observations)
+    assert result is observations
+
+
+def test_large_majority_failure_creates_one_bulk_jira(hook):
+    invoke, jira, slack, opts, _ = hook
+    observations = [build_observation(f"component-{index}") for index in range(50)]
+    ownership_fetch = lambda name: (
+        "repo_to_component: {}\nrepo_to_slack_handle: {}"
+        if name == "automerge_team_mapping.yaml"
+        else "_default: DevOps\nmappings: {api: [API], web: [Web], promotion-gates-bulk: [DevOps]}"
+        if name.startswith("konflux")
+        else "components:\n  default:\n    slack_team_handle: devops"
+    )
+    result = invoke(
+        config=opts["config"],
+        collector=lambda *args, **kwargs: observations,
+        ownership_fetch=ownership_fetch,
+    )
+
+    assert result["status"] == "settled"
+    assert result["counts"] == {"failure": 1, "success": 0, "unknown": 0}
+    assert len(jira.issues) == 1
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+    assert len(slack.calls) == 1
+
+    invoke(
+        config=opts["config"],
+        collector=lambda *args, **kwargs: observations,
+        ownership_fetch=ownership_fetch,
+    )
+    assert len(jira.issues) == 1
+    assert len(slack.calls) == 1

@@ -110,6 +110,10 @@ def aggregate_bulk_build_failures(
     if len(builds) < minimum_builds:
         return observations
 
+    environments = {obs.get("environment") for obs in builds}
+    if len(environments) > 1:
+        return observations
+
     partitions: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for obs in builds:
         partitions.setdefault(_partition_key(obs), []).append(obs)
