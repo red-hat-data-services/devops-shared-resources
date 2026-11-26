@@ -281,7 +281,12 @@ are never aggregated. The bulk incident carries a list of affected components,
 their PR/build links, and their failure reasons. It reuses the normal build
 dispatcher and title-based Jira deduplication, so the existing registry,
 Slack threading, and recovery machinery remain authoritative. Batches below
-the threshold, single-build batches, and mixed environments are left unchanged.
+the threshold, batches with fewer than three builds, mixed environments, and
+bulk evidence that cannot satisfy the existing observation/render limits are
+left unchanged. When every build in a later batch succeeds, GAP adds a bulk
+recovery observation with the same title; it closes an existing open bulk Jira
+through the normal dispatcher path and has no external effect when no bulk Jira
+exists.
 
 ## Registry and policy
 

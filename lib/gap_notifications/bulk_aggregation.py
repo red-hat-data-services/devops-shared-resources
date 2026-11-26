@@ -53,18 +53,38 @@ def _affected_component(observation: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def _bulk_fits(
+    bulk: dict[str, Any],
+    *,
+    jira_environment: str,
+    channel: str | None,
+) -> bool:
+    """Reject a synthetic bulk observation that cannot be validated or rendered."""
+    from lib.gap_notifications.dispatch_incidents import validate_observations
+    from lib.gap_notifications.notify_tools import render_markdown
+
+    try:
+        validate_observations([bulk], jira_environment=jira_environment, channel=channel)
+        return len(render_markdown(bulk, jira_environment=jira_environment, channel=channel)) <= 24000
+    except Exception:
+        return False
+
+
 def aggregate_bulk_build_failures(
     observations: list[dict[str, Any]],
     *,
     threshold: float = BULK_THRESHOLD,
     minimum_builds: int = BULK_MINIMUM_BUILDS,
+    jira_environment: str = "stage",
+    channel: str | None = None,
 ) -> list[dict[str, Any]]:
     """Return observations unchanged unless a majority of builds failed.
 
     A majority is computed over all build observations in the supplied batch.
     When reached, failed build observations are replaced by one synthetic bulk
-    build observation.  Successful and unknown build observations are retained,
-    as are every conflict and feasibility observation.
+    build observation.  Successful and unknown observations are retained, as are
+    every conflict and feasibility observation.  A fully successful batch adds a
+    bulk recovery observation so an existing open bulk Jira can close normally.
     """
     if not isinstance(observations, list):
         raise ValueError("observations must be a list")
@@ -82,8 +102,36 @@ def aggregate_bulk_build_failures(
         return observations
 
     failed = [obs for obs in builds if obs.get("status") == "failure"]
+    successful = [obs for obs in builds if obs.get("status") == "success"]
     required = math.ceil(len(builds) * threshold)
+
     if not failed or len(failed) < required:
+        if len(successful) != len(builds):
+            return observations
+        recovery = {
+            "environment": builds[0]["environment"],
+            "repository": BULK_REPOSITORY,
+            "source_branch": successful[0]["source_branch"],
+            "destination_branch": successful[0]["destination_branch"],
+            "category": "build",
+            "component": BULK_COMPONENT,
+            "status": "success",
+            "observation_id": _bulk_observation_id(successful),
+            "evidence": {
+                "bulk": True,
+                "bulk_recovery": True,
+                "source": "bulk-aggregation",
+                "historical_snapshot": True,
+                "test_only": True,
+                "note": "all promotion-gates component builds recovered",
+                "total_builds": len(builds),
+                "failed_builds": 0,
+                "threshold": threshold,
+                "affected_components": [],
+            },
+        }
+        if _bulk_fits(recovery, jira_environment=jira_environment, channel=channel):
+            return observations + [recovery]
         return observations
 
     first = failed[0]
@@ -111,5 +159,11 @@ def aggregate_bulk_build_failures(
         "observation_id": _bulk_observation_id(failed),
         "evidence": evidence,
     }
-    retained = [obs for obs in observations if not (obs.get("category") == "build" and obs.get("status") == "failure")]
+    if not _bulk_fits(bulk, jira_environment=jira_environment, channel=channel):
+        return observations
+
+    retained = [
+        obs for obs in observations
+        if not (obs.get("category") == "build" and obs.get("status") == "failure")
+    ]
     return retained + [bulk]

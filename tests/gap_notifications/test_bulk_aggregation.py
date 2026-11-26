@@ -178,3 +178,73 @@ def test_monitor_hook_preserves_component_tickets_below_threshold(hook):
         "JIRA STAGE - Promotion Gate PR Build Failure in api",
         "JIRA STAGE - Promotion Gate PR Build Failure in web",
     }
+
+
+def test_oversized_bulk_evidence_falls_back_to_individual_observations():
+    observations = [
+        build_observation(
+            f"component-{index}",
+            evidence={
+                "pr_url": f"https://github.com/acme/repo/pull/{index}",
+                "build_url": f"https://build.example/run/{index}",
+                "reason": "x" * 1500,
+            },
+        )
+        for index in range(20)
+    ]
+    result = aggregate_bulk_build_failures(observations)
+    assert result is observations
+
+
+def test_all_success_batch_adds_bulk_recovery_observation():
+    successes = [
+        build_observation("api", "success"),
+        build_observation("web", "success"),
+        build_observation("gpu", "success"),
+    ]
+    result = aggregate_bulk_build_failures(successes)
+    assert result[:3] == successes
+    recovery = result[-1]
+    assert recovery["component"] == BULK_COMPONENT
+    assert recovery["status"] == "success"
+    assert recovery["evidence"]["bulk_recovery"] is True
+    assert issue_summary(recovery) == "Promotion Gates Bulk PR Build Failures"
+
+
+def test_recovered_component_builds_close_existing_bulk_jira(hook):
+    invoke, jira, slack, opts, _ = hook
+    failure_observations = [
+        build_observation("api"),
+        build_observation("web"),
+        build_observation("gpu", "success"),
+    ]
+    ownership_fetch = lambda name: (
+        "repo_to_component: {}\nrepo_to_slack_handle: {}"
+        if name == "automerge_team_mapping.yaml"
+        else "_default: DevOps\nmappings: {api: [API], web: [Web], promotion-gates-bulk: [DevOps]}"
+        if name.startswith("konflux")
+        else "components:\n  default:\n    slack_team_handle: devops"
+    )
+    invoke(
+        config=opts["config"],
+        collector=lambda *args, **kwargs: failure_observations,
+        ownership_fetch=ownership_fetch,
+    )
+    assert len(jira.issues) == 1
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+
+    recovery_observations = [
+        build_observation("api", "success"),
+        build_observation("web", "success"),
+        build_observation("gpu", "success"),
+    ]
+    result = invoke(
+        config=opts["config"],
+        collector=lambda *args, **kwargs: recovery_observations,
+        ownership_fetch=ownership_fetch,
+    )
+    assert result["status"] == "settled"
+    assert result["counts"] == {"failure": 0, "success": 3, "unknown": 0}
+    assert jira.closed("RHAI-1")
+    assert len(slack.calls) == 2
+    assert slack.calls[-1][1]["thread_ts"] == jira.properties["RHAI-1"]["delivery"]["root"]["ts"]
