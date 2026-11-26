@@ -135,24 +135,15 @@ def test_pending_slack_and_held_do_not_hide_confirmed_jira(populated):
 
 # Structural damage (find_by_label failures, duplicate/ambiguous results) must yield
 # unavailable tracking without unsafe links or leaked evidence.
-@pytest.mark.parametrize('damage', ['duplicate', 'two-open', 'error'])
+@pytest.mark.parametrize('damage', ['duplicate', 'error'])
 def test_structural_damage_cannot_publish_links(populated, damage, monkeypatch):
     jira, _, observations = populated
-    if damage in ('duplicate', 'two-open'):
+    if damage == 'duplicate':
         original = jira.find_by_label
         def find(label):
             found = original(label)
             if found and found[0]['key'] == 'RHAI-1':
-                if damage == 'duplicate':
-                    found.append(copy.deepcopy(found[0]))
-                else:
-                    issue = copy.deepcopy(jira.issues['RHAI-1'])
-                    issue['key'] = 'RHAI-3'
-                    state = copy.deepcopy(jira.properties['RHAI-1'])
-                    state['episode_id'] = '11111111-1111-4111-8111-111111111111'
-                    issue['fields']['labels'].append('gap-episode-11111111111141118111111111111111')
-                    jira.issues['RHAI-3'], jira.properties['RHAI-3'] = issue, state
-                    found.append(issue)
+                found.append(copy.deepcopy(found[0]))
             return found
         monkeypatch.setattr(jira, 'find_by_label', find)
     else:
@@ -163,6 +154,31 @@ def test_structural_damage_cannot_publish_links(populated, damage, monkeypatch):
     assert projected['rows'][PR][0]['status'] == 'unavailable'
     cell = tracking_cell(projected, PR)
     assert 'Unavailable' in cell and 'https://' not in cell and 'SECRET' not in cell
+
+
+# Ambiguous open incidents (multiple open issues for the same identity) must resolve
+# to the newest issue key rather than becoming unavailable.
+def test_ambiguous_open_selects_newest(populated, monkeypatch):
+    jira, _, observations = populated
+    original = jira.find_by_label
+    def find(label):
+        found = original(label)
+        if found and found[0]['key'] == 'RHAI-1':
+            issue = copy.deepcopy(jira.issues['RHAI-1'])
+            issue['key'] = 'RHAI-3'
+            state = copy.deepcopy(jira.properties['RHAI-1'])
+            state['episode_id'] = '11111111-1111-4111-8111-111111111111'
+            issue['fields']['labels'].append('gap-episode-11111111111141118111111111111111')
+            jira.issues['RHAI-3'], jira.properties['RHAI-3'] = issue, state
+            found.append(issue)
+        return found
+    monkeypatch.setattr(jira, 'find_by_label', find)
+    projected = project_tracking(observations[:1], jira, trial_id='trial')
+    entry = projected['rows'][PR][0]
+    assert entry['jira_key'] == 'RHAI-3'
+    cell = tracking_cell(projected, PR)
+    assert '[RHAI-3]' in cell
+    assert 'Unavailable' not in cell
 
 
 # Property damage (validated_property failures) must show degraded Jira key without

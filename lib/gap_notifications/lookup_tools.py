@@ -84,7 +84,13 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
                     opened = [(i, s) for i, s in records
                               if i["fields"]["status"]["statusCategory"]["key"] != "done"]
                     if len(opened) > 1:
-                        raise ValueError("ambiguous open incidents")
+                        logger.warning(
+                            "tracking: %d ambiguous open incidents for identity=%s trial=%s keys=%s; using newest",
+                            len(opened), identity, trial_id,
+                            [i["key"] for i, _ in opened],
+                        )
+                        # Pick the newest (highest key number) among the open issues.
+                        opened = [max(opened, key=lambda p: int(p[0]["key"].split("-")[1]))]
                     issue, state = (opened or sorted(records, key=lambda p: int(p[0]["key"].split("-")[1])))[-1]
                     root = state["delivery"]["root"]
                     closed = issue["fields"]["status"]["statusCategory"]["key"] == "done"
