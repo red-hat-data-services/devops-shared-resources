@@ -922,6 +922,23 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
                    title_category=observation['category'], title_repository=observation['repository'],
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
+                   bulk=e.get("bulk") is True,
+                   total_builds=e.get("total_builds") if e.get("bulk") is True else None,
+                   failed_builds=e.get("failed_builds") if e.get("bulk") is True else None,
+                   threshold_percent=round(float(e.get("threshold", 0)) * 100) if e.get("bulk") is True else None,
+                   affected_components=(
+                       [
+                           {
+                               "component": literal(item.get("component")),
+                               "repository": literal(item.get("repository")),
+                               "pr_url": https_url(item.get("pr_url")) if item.get("pr_url") else None,
+                               "build_url": https_url(item.get("build_url")) if item.get("build_url") else None,
+                               "reason": literal(item.get("reason")),
+                           }
+                           for item in e.get("affected_components", [])
+                       ]
+                       if e.get("bulk") is True else []
+                   ),
                    note=literal(e.get("note")),
                    revision=literal(e.get("head_sha") or e.get("head-sha")), links=[],
                    discussion_url=https_url(discussion_url) if discussion_url else None,
@@ -932,7 +949,8 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
                         ('creator_pr', creator.get('pr-url'))]:
         if value:
             context['links'].append({'kind': kind, 'url': https_url(value)})
-    template = files("lib.gap_notifications").joinpath("templates/issue.md.j2").read_text(encoding="utf-8")
+    template_name = "templates/issue_bulk.md.j2" if e.get("bulk") is True else "templates/issue.md.j2"
+    template = files("lib.gap_notifications").joinpath(template_name).read_text(encoding="utf-8")
     environment = Environment(undefined=StrictUndefined, autoescape=False, keep_trailing_newline=True)
     environment.filters['literal'] = literal
     rendered = environment.from_string(template).render(**context)

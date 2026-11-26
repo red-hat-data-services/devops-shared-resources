@@ -1,0 +1,37 @@
+# Promotion Gates Bulk PR Build Failures
+
+## What happened
+
+{{ failed_builds }} of {{ total_builds }} required component builds failed during this promotion-gates batch.
+
+## Key links
+
+{% for item in affected_components %}
+- {{ item.component }}: {% if item.pr_url %}[PR]({{ item.pr_url }}){% else %}PR unavailable{% endif %} · {% if item.build_url %}[Build]({{ item.build_url }}){% else %}Build unavailable{% endif %}
+{% else %}
+- Unavailable.
+{% endfor %}
+
+## What to do next
+
+- Suggested owner: promotion-gates workflow owner.
+- Inspect the linked component PRs and build logs for the common failure pattern.
+- If the failures look temporary, retry the affected component PRs.
+- If the failures are caused by code or configuration, ask the component teams to fix their PRs.
+- Keep this ticket open until the promotion batch is healthy; GAP will update it when a new bulk result is observed.
+
+## Bulk details
+
+- Repository: {{ repository }}
+- Promotion stream: {{ source_branch }} → {{ destination_branch }}
+- Failed builds: {{ failed_builds }}
+- Total builds: {{ total_builds }}
+- Bulk threshold: {{ threshold_percent }}%
+
+## Affected components
+
+{% for item in affected_components %}
+- {{ item.component }} ({{ item.repository }}): {{ item.reason }}
+{% else %}
+- Unavailable.
+{% endfor %}

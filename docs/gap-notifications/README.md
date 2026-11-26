@@ -271,6 +271,18 @@ Evidence is retained at
 `live-verification.json`. This remains staging-only verification, not a production
 or recovery claim.
 
+## Bulk build-failure aggregation
+
+When a monitor pass contains at least three build observations and at least half of them fail,
+GAP replaces those individual failure observations with one synthetic bulk
+build incident titled `Promotion Gates Bulk PR Build Failures`. Successful and
+unknown observations remain unchanged, and conflict or feasibility observations
+are never aggregated. The bulk incident carries a list of affected components,
+their PR/build links, and their failure reasons. It reuses the normal build
+dispatcher and title-based Jira deduplication, so the existing registry,
+Slack threading, and recovery machinery remain authoritative. Batches below
+the threshold, single-build batches, and mixed environments are left unchanged.
+
 ## Registry and policy
 
 Jira, **not the local ledger or Leader state**, is the cross-Leader registry. A stable

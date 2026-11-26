@@ -114,6 +114,8 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         from lib.gap_notifications.notify_tools import routing_target
         target = routing_target(config.jira_environment, config.channel)
         observations = collector(filtered, environment=target.scope, leader_url=leader_url, state_url=link)
+        from lib.gap_notifications.bulk_aggregation import aggregate_bulk_build_failures
+        observations = aggregate_bulk_build_failures(observations)
         validate_observations(observations, **target.options)
         ownership = None
         if config.team_tagging:
