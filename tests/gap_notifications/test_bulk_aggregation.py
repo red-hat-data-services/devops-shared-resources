@@ -74,7 +74,7 @@ def test_majority_build_failures_are_replaced_by_one_bulk_observation():
     assert bulk["evidence"]["total_builds"] == 3
     assert bulk["evidence"]["failed_builds"] == 2
     assert [item["component"] for item in bulk["evidence"]["affected_components"]] == ["api", "web"]
-    assert issue_summary(bulk) == "Promotion Gates Bulk PR Build Failures"
+    assert issue_summary(bulk) == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
 
 
 def test_non_majority_and_small_batches_are_unchanged():
@@ -147,7 +147,7 @@ def test_monitor_hook_aggregates_majority_build_failures(hook):
     assert result["status"] == "settled"
     assert result["counts"] == {"failure": 1, "success": 1, "unknown": 0}
     assert len(jira.issues) == 1
-    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
     assert len(slack.calls) == 1
 
 
@@ -209,7 +209,7 @@ def test_all_success_batch_adds_bulk_recovery_observation():
     assert recovery["component"] == BULK_COMPONENT
     assert recovery["status"] == "success"
     assert recovery["evidence"]["bulk_recovery"] is True
-    assert issue_summary(recovery) == "Promotion Gates Bulk PR Build Failures"
+    assert issue_summary(recovery) == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
 
 
 def test_recovered_component_builds_close_existing_bulk_jira(hook):
@@ -232,7 +232,7 @@ def test_recovered_component_builds_close_existing_bulk_jira(hook):
         ownership_fetch=ownership_fetch,
     )
     assert len(jira.issues) == 1
-    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
 
     recovery_observations = [
         build_observation("api", "success"),
@@ -339,7 +339,7 @@ def test_large_majority_failure_creates_one_bulk_jira(hook):
     assert result["status"] == "settled"
     assert result["counts"] == {"failure": 1, "success": 0, "unknown": 0}
     assert len(jira.issues) == 1
-    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
     assert len(slack.calls) == 1
 
     invoke(
