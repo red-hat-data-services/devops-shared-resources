@@ -789,7 +789,7 @@ def _slack_merge_links(observation):
     return links
 
 
-PROMOTION_GATES_IC_SLACK_HANDLE = "rhai-promotion-gates-ic"
+BUILD_GUARDIAN_SLACK_HANDLE = "openshift-ai-devops-build-guardian"
 
 
 def slack_message(observation, *, jira_url, reply=False, jira_environment="stage", channel=None, owning_team=None):
@@ -829,7 +829,7 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
         repository=_slack_text(observation.get("repository")),
         build_time=f"*{'Build failed at' if status == 'failure' else 'Build completed at'}:* {_slack_build_time(run)}",
         reason=reported_reason, owning_team=owning_team,
-        promotion_gates_ic=PROMOTION_GATES_IC_SLACK_HANDLE,
+        build_guardian=BUILD_GUARDIAN_SLACK_HANDLE,
         links=_slack_links_context(links), synthetic=evidence.get("synthetic") is True,
     )
     return slack_template().render(**context).removesuffix("\n")
@@ -860,7 +860,7 @@ def slack_ownership(handle, category):
     template = slack_template()
     context = dict(status='failure', category=category, reply=False,
                    jira_environment='stage', component='', repository='',
-                   build_time='', reason=None, promotion_gates_ic=PROMOTION_GATES_IC_SLACK_HANDLE,
+                   build_time='', reason=None, build_guardian=BUILD_GUARDIAN_SLACK_HANDLE,
                    links=_slack_links_context([]), synthetic=False)
     plain = template.render(**context, owning_team=None).splitlines()
     owned = template.render(**context, owning_team=handle).splitlines()
@@ -871,8 +871,8 @@ def slack_ownership(handle, category):
         if operation != 'insert':
             raise ValueError('ownership must only add message content')
         additions.append('\n'.join(owned[first:last]))
-    if len(additions) != 2 or '\n' in additions[0] or not additions[0].endswith('`@' + handle + '`'):
-        raise ValueError('ownership requires one inline-code handle line and a mapping footer')
+    if len(additions) != 2 or '\n' in additions[0] or not additions[0].endswith('@' + handle):
+        raise ValueError('ownership requires one mention handle line and a mapping footer')
     if len(plain[0]) > 2999 or len(additions[0]) > 2999 or len(additions[1]) > 3000:
         raise ValueError('ownership presentation exceeds Slack block limits')
     return plain[0], additions[0], additions[1]

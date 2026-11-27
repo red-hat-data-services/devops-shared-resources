@@ -296,5 +296,5 @@ def test_team_tagging_cli_loads_ownership_and_tags_guardian_and_component_team(t
         block["text"]["text"] for block in slack.calls[0][1]["blocks"]
         if block["type"] == "section"
     )
-    assert "*Promotion Gates IC:* `@rhai-promotion-gates-ic`" in block_text
-    assert "*Owning team:* `@api-team`" in block_text
+    assert "*Build guardian:* @openshift-ai-devops-build-guardian" in block_text
+    assert "*Owning team:* @api-team" in block_text
