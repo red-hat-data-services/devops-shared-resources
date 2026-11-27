@@ -9,6 +9,7 @@ from lib.gap_notifications.bulk_aggregation import (
     BULK_COMPONENT,
     aggregate_bulk_build_failures,
 )
+from lib.gap_notifications.dispatch_incidents import _summary
 from lib.gap_notifications.notify_tools import description, issue_summary, render_markdown
 
 
@@ -58,6 +59,11 @@ def build_observation(component, status="failure", *, oid=None, evidence=None):
     )
 
 
+def _bulk_observation(**overrides):
+    """Build an observation whose evidence includes the bulk flag."""
+    return observation(evidence={'bulk': True, 'test_only': True, 'synthetic': True}, **overrides)
+
+
 def test_majority_build_failures_are_replaced_by_one_bulk_observation():
     failed_a = build_observation("api")
     failed_b = build_observation("web")
@@ -74,7 +80,7 @@ def test_majority_build_failures_are_replaced_by_one_bulk_observation():
     assert bulk["evidence"]["total_builds"] == 3
     assert bulk["evidence"]["failed_builds"] == 2
     assert [item["component"] for item in bulk["evidence"]["affected_components"]] == ["api", "web"]
-    assert issue_summary(bulk) == "Promotion Gates Bulk PR Build Failures"
+    assert issue_summary(bulk) == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
 
 
 def test_non_majority_and_small_batches_are_unchanged():
@@ -147,7 +153,7 @@ def test_monitor_hook_aggregates_majority_build_failures(hook):
     assert result["status"] == "settled"
     assert result["counts"] == {"failure": 1, "success": 1, "unknown": 0}
     assert len(jira.issues) == 1
-    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
     assert len(slack.calls) == 1
 
 
@@ -209,7 +215,7 @@ def test_all_success_batch_adds_bulk_recovery_observation():
     assert recovery["component"] == BULK_COMPONENT
     assert recovery["status"] == "success"
     assert recovery["evidence"]["bulk_recovery"] is True
-    assert issue_summary(recovery) == "Promotion Gates Bulk PR Build Failures"
+    assert issue_summary(recovery) == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
 
 
 def test_recovered_component_builds_close_existing_bulk_jira(hook):
@@ -232,7 +238,7 @@ def test_recovered_component_builds_close_existing_bulk_jira(hook):
         ownership_fetch=ownership_fetch,
     )
     assert len(jira.issues) == 1
-    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
 
     recovery_observations = [
         build_observation("api", "success"),
@@ -339,7 +345,7 @@ def test_large_majority_failure_creates_one_bulk_jira(hook):
     assert result["status"] == "settled"
     assert result["counts"] == {"failure": 1, "success": 0, "unknown": 0}
     assert len(jira.issues) == 1
-    assert jira.issues["RHAI-1"]["fields"]["summary"] == "Promotion Gates Bulk PR Build Failures"
+    assert jira.issues["RHAI-1"]["fields"]["summary"] == "JIRA STAGE - Promotion Gates Bulk PR Build Failures"
     assert len(slack.calls) == 1
 
     invoke(
@@ -349,3 +355,33 @@ def test_large_majority_failure_creates_one_bulk_jira(hook):
     )
     assert len(jira.issues) == 1
     assert len(slack.calls) == 1
+
+
+# --- Title-focused tests for issue_summary bulk path ---
+
+def test_bulk_stage_title_includes_jira_stage_prefix():
+    title = _summary(_bulk_observation())
+    assert title == 'JIRA STAGE - Promotion Gates Bulk PR Build Failures'
+
+
+def test_bulk_production_title_has_no_prefix():
+    title = issue_summary(_bulk_observation(), jira_environment='production')
+    assert title == 'Promotion Gates Bulk PR Build Failures'
+
+
+def test_bulk_flag_takes_precedence_over_category():
+    """The bulk flag overrides per-category titles regardless of category value."""
+    for category in ('build', 'feasibility', 'conflict'):
+        title = _summary(_bulk_observation(category=category))
+        assert title == 'JIRA STAGE - Promotion Gates Bulk PR Build Failures'
+
+
+def test_bulk_false_falls_through_to_category_title():
+    obs = observation(evidence={'bulk': False, 'test_only': True, 'synthetic': True})
+    title = _summary(obs)
+    assert title == 'JIRA STAGE - Promotion Gate PR Build Failure in cpu'
+
+
+def test_bulk_title_length_is_within_limit():
+    title = _summary(_bulk_observation())
+    assert 1 <= len(title) <= 250
