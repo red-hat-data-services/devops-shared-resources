@@ -406,10 +406,10 @@ class JiraNotifier:
         return [self._issue_fields(issue) for issue in self._client.search(jql, fields=SEARCH_FIELDS)]
 
     def find_by_summary(self, summary: str) -> list[dict[str, Any]]:
-        """Find issues by exact summary match (open issues only)."""
+        """Find issues by exact phrase match (open issues only)."""
         summary = self._summary(summary)
         escaped = self._escape_jql(summary)
-        jql = f'project = {self.project} AND summary = "{escaped}" AND statusCategory != "Done" ORDER BY key ASC'
+        jql = f'project = {self.project} AND summary ~ "\\"{escaped}\\"" AND statusCategory != "Done" ORDER BY key ASC'
         return [self._issue_fields(issue) for issue in self._client.search(jql, fields=SEARCH_FIELDS)]
 
     def create_bug(
@@ -921,6 +921,7 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
                    title_context=literal(title_context), title_object=literal(title_object),
                    title_category=observation['category'], title_repository=observation['repository'],
                    pipeline=literal(observation.get("pipeline") or run.get("pipeline")),
+                   pipeline_url=https_url(e.get("build_url")) if e.get("build_url") else None,
                    reason=literal(e.get("reason") or run.get("reason") or creator.get("reason")),
                    bulk=e.get("bulk") is True,
                    total_builds=e.get("total_builds") if e.get("bulk") is True else None,

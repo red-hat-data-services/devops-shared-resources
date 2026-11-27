@@ -17,8 +17,12 @@ def test_first_h1_supplies_jira_title_with_literal_escaping(environment):
     body = notify_tools.description(obs, jira_environment=environment)
     h1 = next(node for node in body['content'] if node['type'] == 'heading' and node['attrs']['level'] == 1)
     assert title == ''.join(node['text'] for node in h1['content'])
-    # Title-based dedup: build titles use component, others use repository
-    assert obs['component'] in title
+    expected = (
+        'JIRA STAGE - Promotion Gate PR Build Failure in cpu_[test]'
+        if environment == 'stage'
+        else 'Promotion Gate PR Build Failure in cpu_[test]'
+    )
+    assert title == expected
     assert not any(node.get('marks') for node in h1['content'])
 
 
@@ -41,6 +45,26 @@ def replace_template(monkeypatch, name, transform):
             return transform(source)
 
     monkeypatch.setattr(notify_tools, 'files', lambda package: Resources())
+
+
+def test_actionable_summary_and_key_links_appear_before_technical_details():
+    obs = observation(evidence={
+        'pr_url': 'https://github.com/acme/repo/pull/1',
+        'build_url': 'https://build.example/run/1',
+    })
+    markdown = notify_tools.render_markdown(
+        obs, discussion_url='https://slack.example/archives/C123/p456'
+    )
+    what_happened = markdown.index('## What happened')
+    key_links = markdown.index('## Key links')
+    slack_links = markdown.index('## Slack discussion')
+    what_to_do = markdown.index('## What to do next')
+    technical = markdown.index('## Failure Details')
+    assert what_happened < key_links < slack_links < what_to_do < technical
+    key_section = markdown[key_links:slack_links]
+    assert '[Child PR](https://github.com/acme/repo/pull/1)' in key_section
+    assert '[Build logs or PipelineRun](https://build.example/run/1)' in key_section
+    assert '[Open Slack discussion](https://slack.example/archives/C123/p456)' in markdown[slack_links:what_to_do]
 
 
 def test_title_is_extracted_from_first_h1_not_rebuilt_in_python(monkeypatch):

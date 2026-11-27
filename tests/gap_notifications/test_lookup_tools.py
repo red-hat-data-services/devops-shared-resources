@@ -133,10 +133,58 @@ def test_pending_slack_and_held_do_not_hide_confirmed_jira(populated):
     assert '[RHAI-2]' in cell and '[Slack thread]' in cell and 'delivery held' in cell
 
 
-# Damaged registry records must yield unavailable tracking without unsafe links or leaked
-# evidence.
-@pytest.mark.parametrize('damage', ['trial', 'identity', 'channel', 'origin', 'unconfirmed_root', 'summary', 'episode', 'duplicate', 'two-open', 'error'])
-def test_registry_damage_cannot_publish_links(populated, damage, monkeypatch):
+# Structural damage (find_by_label failures, duplicate/ambiguous results) must yield
+# unavailable tracking without unsafe links or leaked evidence.
+@pytest.mark.parametrize('damage', ['duplicate', 'error'])
+def test_structural_damage_cannot_publish_links(populated, damage, monkeypatch):
+    jira, _, observations = populated
+    if damage == 'duplicate':
+        original = jira.find_by_label
+        def find(label):
+            found = original(label)
+            if found and found[0]['key'] == 'RHAI-1':
+                found.append(copy.deepcopy(found[0]))
+            return found
+        monkeypatch.setattr(jira, 'find_by_label', find)
+    else:
+        def fail(*args):
+            raise RuntimeError('SECRET transport data')
+        monkeypatch.setattr(jira, 'find_by_label', fail)
+    projected = project_tracking(observations[:1], jira, trial_id='trial')
+    assert projected['rows'][PR][0]['status'] == 'unavailable'
+    cell = tracking_cell(projected, PR)
+    assert 'Unavailable' in cell and 'https://' not in cell and 'SECRET' not in cell
+
+
+# Ambiguous open incidents (multiple open issues for the same identity) must resolve
+# to the newest issue key rather than becoming unavailable.
+def test_ambiguous_open_selects_newest(populated, monkeypatch):
+    jira, _, observations = populated
+    original = jira.find_by_label
+    def find(label):
+        found = original(label)
+        if found and found[0]['key'] == 'RHAI-1':
+            issue = copy.deepcopy(jira.issues['RHAI-1'])
+            issue['key'] = 'RHAI-3'
+            state = copy.deepcopy(jira.properties['RHAI-1'])
+            state['episode_id'] = '11111111-1111-4111-8111-111111111111'
+            issue['fields']['labels'].append('gap-episode-11111111111141118111111111111111')
+            jira.issues['RHAI-3'], jira.properties['RHAI-3'] = issue, state
+            found.append(issue)
+        return found
+    monkeypatch.setattr(jira, 'find_by_label', find)
+    projected = project_tracking(observations[:1], jira, trial_id='trial')
+    entry = projected['rows'][PR][0]
+    assert entry['jira_key'] == 'RHAI-3'
+    cell = tracking_cell(projected, PR)
+    assert '[RHAI-3]' in cell
+    assert 'Unavailable' not in cell
+
+
+# Property damage (validated_property failures) must show degraded Jira key without
+# unsafe Slack links or leaked evidence.
+@pytest.mark.parametrize('damage', ['trial', 'identity', 'channel', 'origin', 'unconfirmed_root', 'summary', 'episode'])
+def test_property_damage_shows_degraded_jira_key(populated, damage, monkeypatch):
     jira, _, observations = populated
     if damage == 'trial':
         jira.properties['RHAI-1']['trial_id'] = 'wrong'
@@ -152,31 +200,13 @@ def test_registry_damage_cannot_publish_links(populated, damage, monkeypatch):
         jira.issues['RHAI-1']['fields']['project']['key'] = 'OTHER'
     elif damage == 'episode':
         jira.properties['RHAI-1']['episode_id'] = 'not-a-uuid'
-    elif damage in ('duplicate', 'two-open'):
-        original = jira.find_by_label
-        def find(label):
-            found = original(label)
-            if found and found[0]['key'] == 'RHAI-1':
-                if damage == 'duplicate':
-                    found.append(copy.deepcopy(found[0]))
-                else:
-                    issue = copy.deepcopy(jira.issues['RHAI-1'])
-                    issue['key'] = 'RHAI-3'
-                    state = copy.deepcopy(jira.properties['RHAI-1'])
-                    state['episode_id'] = '11111111-1111-4111-8111-111111111111'
-                    issue['fields']['labels'].append('gap-episode-11111111111141118111111111111111')
-                    jira.issues['RHAI-3'], jira.properties['RHAI-3'] = issue, state
-                    found.append(issue)
-            return found
-        monkeypatch.setattr(jira, 'find_by_label', find)
-    else:
-        def fail(*args):
-            raise RuntimeError('SECRET transport data')
-        monkeypatch.setattr(jira, 'find_by_label', fail)
     projected = project_tracking(observations[:1], jira, trial_id='trial')
-    assert projected['rows'][PR][0]['status'] == 'unavailable'
+    entry = projected['rows'][PR][0]
+    assert entry.get('jira_key') is not None
     cell = tracking_cell(projected, PR)
-    assert 'Unavailable' in cell and 'https://' not in cell and 'SECRET' not in cell
+    assert 'RHAI-' in cell
+    assert '[Slack thread]' not in cell
+    assert 'SECRET' not in cell
 
 
 # Search-lag hints must be revalidated, and mismatched issue hints must be rejected.
@@ -187,7 +217,11 @@ def test_known_key_search_lag_revalidated_and_wrong_hints_rejected(populated, mo
     projection = project_tracking(observations[:1], jira, trial_id='trial', known_keys={identity: ['RHAI-1']})
     assert projection['rows'][PR][0]['jira_key'] == 'RHAI-1'
     invalid = project_tracking(observations[:1], jira, trial_id='trial', known_keys={identity: ['RHAI-2']})
-    assert invalid['rows'][PR][0]['status'] == 'unavailable'
+    # Wrong hints now produce degraded entries (jira_key visible, no Slack thread)
+    # rather than unavailable, since the Jira issue exists.
+    entry = invalid['rows'][PR][0]
+    assert entry.get('jira_key') is not None
+    assert '[Slack thread]' not in tracking_cell(invalid, PR)
 
 
 # Name actionable missing matches while preserving held, closed and unavailable details.

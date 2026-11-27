@@ -16,8 +16,11 @@ mutation or resend is initiated here; display text is never routing authority.
 from __future__ import annotations
 
 import html
+import logging
 import re
 import json
+
+logger = logging.getLogger(__name__)
 
 
 def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_environment="stage", channel=None):
@@ -55,22 +58,39 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
                     raise ValueError("duplicate search result")
                 keys = sorted(set(keys) | set((known_keys or {}).get(identity, [])))
                 records = []
+                degraded_issues = []
                 for key in keys:
                     issue = jira.get_issue(key)
                     if issue.get("key") != key:
                         raise ValueError("issue mismatch")
-                    state = validated_property(issue, jira.get_notification_state(key),
-                                               trial=trial_id, identity=identity, **target.options)
-                    records.append((issue, state))
-                if len({s["episode_id"] for _, s in records}) != len(records):
-                    raise ValueError("duplicate episodes")
-                opened = [(i, s) for i, s in records
-                          if i["fields"]["status"]["statusCategory"]["key"] != "done"]
-                if len(opened) > 1:
-                    raise ValueError("ambiguous open incidents")
-                if not records:
-                    projected = {"status": "not_found"}
-                else:
+                    try:
+                        state = validated_property(issue, jira.get_notification_state(key),
+                                                   trial=trial_id, identity=identity, **target.options)
+                        records.append((issue, state))
+                    except Exception as prop_exc:
+                        logger.warning(
+                            "tracking: validated_property failed for key=%s identity=%s trial=%s: %s",
+                            key, identity, trial_id, prop_exc,
+                        )
+                        degraded_issues.append(issue)
+                if not records and degraded_issues:
+                    issue = degraded_issues[-1]
+                    closed = issue["fields"]["status"]["statusCategory"]["key"] == "done"
+                    projected = {"jira_key": issue["key"], "closed": closed,
+                                 "status": "closed" if closed else "slack_pending"}
+                elif records:
+                    if len({s["episode_id"] for _, s in records}) != len(records):
+                        raise ValueError("duplicate episodes")
+                    opened = [(i, s) for i, s in records
+                              if i["fields"]["status"]["statusCategory"]["key"] != "done"]
+                    if len(opened) > 1:
+                        logger.warning(
+                            "tracking: %d ambiguous open incidents for identity=%s trial=%s keys=%s; using newest",
+                            len(opened), identity, trial_id,
+                            [i["key"] for i, _ in opened],
+                        )
+                        # Pick the newest (highest key number) among the open issues.
+                        opened = [max(opened, key=lambda p: int(p[0]["key"].split("-")[1]))]
                     issue, state = (opened or sorted(records, key=lambda p: int(p[0]["key"].split("-")[1])))[-1]
                     root = state["delivery"]["root"]
                     closed = issue["fields"]["status"]["statusCategory"]["key"] == "done"
@@ -80,8 +100,14 @@ def project_tracking(observations, jira, *, trial_id, known_keys=None, jira_envi
                         projected["slack_url"] = discussion_url(root, channel=target.channel)
                     if state["jira_intent"] or state["delivery"]["intent"]:
                         projected["status"] = "held"
+                else:
+                    projected = {"status": "not_found"}
                 cache[identity] = projected
-            except Exception:
+            except Exception as exc:
+                logger.warning(
+                    "tracking: lookup failed for identity=%s trial=%s: %s",
+                    identity, trial_id, exc,
+                )
                 cache[identity] = {"status": "unavailable"}
         entry.update(cache[identity])
         if entry not in rows.setdefault(pr, []):
