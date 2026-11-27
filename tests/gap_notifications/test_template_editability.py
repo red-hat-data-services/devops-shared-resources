@@ -11,19 +11,19 @@ from lib.gap_notifications.lookup_tools import inspect_issue
 
 
 @pytest.mark.parametrize('environment', ['stage', 'production'])
-def test_first_h1_supplies_jira_title_with_literal_escaping(environment):
+def test_issue_summary_constructs_title_with_raw_component(environment):
     obs = observation(repository='acme/[repo]_*{{ literal }}', component='cpu_[test]')
     title = _summary(obs, jira_environment=environment)
-    body = notify_tools.description(obs, jira_environment=environment)
-    h1 = next(node for node in body['content'] if node['type'] == 'heading' and node['attrs']['level'] == 1)
-    assert title == ''.join(node['text'] for node in h1['content'])
     expected = (
         'JIRA STAGE - Promotion Gate PR Build Failure in cpu_[test]'
         if environment == 'stage'
         else 'Promotion Gate PR Build Failure in cpu_[test]'
     )
     assert title == expected
-    assert not any(node.get('marks') for node in h1['content'])
+    # Template body should have no H1; the title lives only in the Jira summary.
+    body = notify_tools.description(obs, jira_environment=environment)
+    assert not any(node['type'] == 'heading' and node['attrs']['level'] == 1
+                   for node in body['content'])
 
 
 def test_overlong_rendered_title_is_rejected():
@@ -67,19 +67,18 @@ def test_actionable_summary_and_key_links_appear_before_technical_details():
     assert '[Open Slack discussion](https://slack.example/archives/C123/p456)' in markdown[slack_links:what_to_do]
 
 
-def test_title_is_extracted_from_first_h1_not_rebuilt_in_python(monkeypatch):
+def test_title_is_constructed_from_observation_not_template(monkeypatch):
     replace_template(monkeypatch, 'issue.md.j2', lambda source: '# Custom title\n' + source)
-    assert _summary(observation()) == 'Custom title'
+    # Template H1 no longer controls the Jira summary.
+    assert _summary(observation()) == 'JIRA STAGE - Promotion Gate PR Build Failure in cpu'
 
 
 @pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])
-@pytest.mark.parametrize('title_change', ['template', 'human', 'legacy'])
+@pytest.mark.parametrize('title_change', ['human', 'legacy'])
 def test_title_changes_preserve_incident_updates_recovery_and_replay(tmp_path, monkeypatch, category, title_change):
     runner, jira, slack = make_runner(tmp_path)
     runner().run([observation(category=category)])
-    if title_change == 'template':
-        replace_template(monkeypatch, 'issue.md.j2', lambda source: '# New title format\n' + source)
-    elif title_change == 'legacy':
+    if title_change == 'legacy':
         jira.issues['RHAI-1']['fields']['summary'] = f'[GAP STAGING TEST] {category} failure: acme/repo'
     else:
         jira.issues['RHAI-1']['fields']['summary'] = 'Title edited by a human'
@@ -131,11 +130,15 @@ def test_identity_tampering_skips_unverifiable_issue(tmp_path, tamper):
     assert len(jira.issues) == 2
 
 
-@pytest.mark.parametrize('source', ['## No H1', '# ', '# ' + 'x' * 251, '# [Linked title](https://example.test)'])
-def test_invalid_title_fails_closed(monkeypatch, source):
-    replace_template(monkeypatch, 'issue.md.j2', lambda _: source)
-    with pytest.raises(ValueError):
-        _summary(observation())
+@pytest.mark.parametrize('category,field,context', [
+    ('build', 'component', 'PR Build'),
+    ('feasibility', 'repository', 'merge-feasibility'),
+    ('conflict', 'repository', 'merge-conflict'),
+])
+def test_issue_summary_per_category(category, field, context):
+    obs = observation(category=category, **{field: 'my-comp'})
+    title = _summary(obs)
+    assert title == f'JIRA STAGE - Promotion Gate {context} Failure in my-comp'
 
 
 @pytest.mark.parametrize('category', ['build', 'conflict', 'feasibility'])

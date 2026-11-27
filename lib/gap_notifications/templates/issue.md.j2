@@ -1,7 +1,3 @@
-{# The first H1 supplies the Jira summary. Keep this format compatible with existing issues. -#}
-{% set banner = 'JIRA STAGE - ' if jira_environment == 'stage' else '' -%}
-# {{ banner }}Promotion Gate {{ title_context }} Failure in {{ title_object }}
-
 {% if jira_environment == 'stage' %}
 STAGE JIRA ENVIRONMENT
 {% endif %}

@@ -943,15 +943,17 @@ def render_markdown(observation, *, discussion_url=None, metadata_url=None, jira
 
 
 def issue_summary(observation, *, jira_environment="stage", channel=None):
-    """Derive the Jira title from the first rendered H1, decoding literal escapes."""
-    markdown = render_markdown(observation, jira_environment=jira_environment, channel=channel)
-    heading = next((line[2:] for line in markdown.splitlines() if line.startswith('# ')), None)
-    if heading is None:
-        raise ValueError("issue template requires an H1 title")
-    nodes = _inline(heading)
-    if any(node.get('marks') for node in nodes):
-        raise ValueError("issue title must contain only literal text")
-    title = ''.join(node['text'] for node in nodes)
+    """Construct the Jira title directly from observation fields."""
+    banner = 'JIRA STAGE - ' if jira_environment == 'stage' else ''
+    evidence = observation.get('evidence', {})
+    if evidence.get('bulk'):
+        title = f'{banner}Promotion Gates Bulk PR Build Failures'
+    elif observation['category'] == 'build':
+        title = f'{banner}Promotion Gate PR Build Failure in {observation["component"]}'
+    elif observation['category'] == 'feasibility':
+        title = f'{banner}Promotion Gate merge-feasibility Failure in {observation["repository"]}'
+    else:  # conflict
+        title = f'{banner}Promotion Gate merge-conflict Failure in {observation["repository"]}'
     if not title.strip() or len(title) > 250:
         raise ValueError("issue title must contain 1–250 characters")
     return title
