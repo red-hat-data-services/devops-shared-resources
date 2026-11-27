@@ -7,7 +7,7 @@
 *Component:* `{{ component }}`
 {% endif %}
 {% if status == 'failure' and not reply %}
-*Build guardian:* `@{{ build_guardian | default('openshift-ai-devops-build-guardian') }}`
+*Promotion Gates IC:* `@{{ promotion_gates_ic | default('rhai-promotion-gates-ic') }}`
 {% endif %}
 {% if owning_team %}
 *Owning team:* `@{{ owning_team }}`

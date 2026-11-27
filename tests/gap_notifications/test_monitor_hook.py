@@ -150,7 +150,7 @@ def test_creation_fields_and_existing_ownership_unchanged(hook):
         block["text"]["text"] for block in slack.calls[0][1]["blocks"]
         if block["type"] == "section"
     )
-    assert "*Build guardian:* `@openshift-ai-devops-build-guardian`" in block_text
+    assert "*Promotion Gates IC:* `@rhai-promotion-gates-ic`" in block_text
     assert "*Owning team:* `@devops`" in block_text
     jira.issues['RHAI-1']['fields']['components'] = [{'name': 'Manual'}]
     invoke()
