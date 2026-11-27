@@ -41,9 +41,10 @@ handles, including explicit `unknown` handles. `slack_team_channel` is ignored: 
 is unchanged. Root failures use a single-column layout: failure summary/component,
 then **Owning team:** @mapped-handle on its own full-width line, followed by
 repository and failure details. Explicit line endings keep these sections
-separate when copied. Handles are emitted as plain `@handle` text and
-`chat.postMessage` is called with `link_names: true`, so Slack resolves and
-notifies the named user groups. All sections use `verbatim: true`.
+separate when copied. Handles are emitted as plain `@handle` text in one dedicated block with
+`verbatim: false`; `chat.postMessage` is called with `link_names: true`, so
+Slack resolves and notifies the named user groups. All non-mention sections
+remain `verbatim: true`.
 A compact context footer links directly to the Slack-team and Jira-component
 mapping YAML files on GitLab, so readers can find where ownership is maintained.
 Replies and recovery do not add this ownership/footer layout or re-ping teams.
