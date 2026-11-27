@@ -789,7 +789,10 @@ def _slack_merge_links(observation):
     return links
 
 
-def slack_message(observation, *, jira_url, reply=False, jira_environment="stage", channel=None):
+BUILD_GUARDIAN_SLACK_HANDLE = "openshift-ai-devops-build-guardian"
+
+
+def slack_message(observation, *, jira_url, reply=False, jira_environment="stage", channel=None, owning_team=None):
     """Render an explicitly scoped notification without clients, lookups or delivery-state changes.
 
     Only selected evidence is displayed; this is not a general secret scrubber.
@@ -825,7 +828,8 @@ def slack_message(observation, *, jira_url, reply=False, jira_environment="stage
         component=_slack_text(observation.get("component")),
         repository=_slack_text(observation.get("repository")),
         build_time=f"*{'Build failed at' if status == 'failure' else 'Build completed at'}:* {_slack_build_time(run)}",
-        reason=reported_reason, owning_team=None,
+        reason=reported_reason, owning_team=owning_team,
+        build_guardian=BUILD_GUARDIAN_SLACK_HANDLE,
         links=_slack_links_context(links), synthetic=evidence.get("synthetic") is True,
     )
     return slack_template().render(**context).removesuffix("\n")
@@ -856,7 +860,8 @@ def slack_ownership(handle, category):
     template = slack_template()
     context = dict(status='failure', category=category, reply=False,
                    jira_environment='stage', component='', repository='',
-                   build_time='', reason=None, links=_slack_links_context([]), synthetic=False)
+                   build_time='', reason=None, build_guardian=BUILD_GUARDIAN_SLACK_HANDLE,
+                   links=_slack_links_context([]), synthetic=False)
     plain = template.render(**context, owning_team=None).splitlines()
     owned = template.render(**context, owning_team=handle).splitlines()
     additions = []

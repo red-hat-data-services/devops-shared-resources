@@ -1273,3 +1273,24 @@ def test_other_categories_do_not_use_build_metadata(category):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_slack_failure_tags_build_guardian_and_component_team():
+    from lib.gap_notifications.notify_tools import slack_message, slack_ownership
+    observation = {
+        "environment": "stage-redhat.atlassian.net/RHAI/C0883L8FARE",
+        "repository": "acme/repo", "source_branch": "main", "destination_branch": "stable",
+        "category": "build", "component": "api", "status": "failure", "observation_id": "run-1",
+        "evidence": {"reason": "Failed"},
+    }
+    text = slack_message(
+        observation,
+        jira_url="https://stage-redhat.atlassian.net/browse/RHAI-1",
+        owning_team="api-team",
+    )
+    assert "*Build guardian:* `@openshift-ai-devops-build-guardian`" in text
+    assert "*Owning team:* `@api-team`" in text
+
+    _, owner_line, mappings = slack_ownership("api-team", "build")
+    assert owner_line == "*Owning team:* `@api-team`"
+    assert "Slack teams" in mappings

@@ -6,6 +6,9 @@
 {% if category == 'build' %}
 *Component:* `{{ component }}`
 {% endif %}
+{% if status == 'failure' and not reply %}
+*Build guardian:* `@{{ build_guardian | default('openshift-ai-devops-build-guardian') }}`
+{% endif %}
 {% if owning_team %}
 *Owning team:* `@{{ owning_team }}`
 {% endif %}

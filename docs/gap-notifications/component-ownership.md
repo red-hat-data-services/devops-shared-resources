@@ -33,7 +33,9 @@ Metadata, task-routing, and suppression keys are ignored. Missing
 components (including repository-scoped conflict/feasibility incidents) use
 `_default`, or DevOps when absent.
 
-Slack uses `components.<name>.slack_team_handle`, falling back to
+Slack always tags `@openshift-ai-devops-build-guardian` on root failure
+notifications. It also tags the mapped component team using
+`components.<name>.slack_team_handle`, falling back to
 `components.default.slack_team_handle` for absent/unknown components or missing
 handles, including explicit `unknown` handles. `slack_team_channel` is ignored: explicit notification channel routing
 is unchanged. Root failures use a single-column layout: failure summary/component,
