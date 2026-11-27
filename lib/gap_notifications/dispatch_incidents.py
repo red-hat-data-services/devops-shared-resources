@@ -485,8 +485,15 @@ class Dispatcher:
         if (len({i["key"] for i, p in records}) != len(records)
                 or len({p["episode_id"] for i, p in records}) != len(records)):
             raise RegistryHold("duplicate registry results or episodes")
-        if len([i for i, p in records if not _closed(i)]) > 1:
-            raise RegistryHold("multiple open incidents")
+        open_records = [(i, p) for i, p in records if not _closed(i)]
+        if len(open_records) > 1:
+            logger.warning(
+                "registry: %d ambiguous open incidents for identity=%s trial=%s keys=%s; using newest",
+                len(open_records), identity, self.trial_id,
+                [i["key"] for i, _ in open_records],
+            )
+            newest_key = max(open_records, key=lambda p: int(p[0]["key"].split("-")[1]))[0]["key"]
+            records = [(i, p) for i, p in records if _closed(i) or i["key"] == newest_key]
         return sorted(records, key=lambda pair: int(pair[0]["key"].split("-")[1]))
 
     def _new_state(self, task, previous):

@@ -237,8 +237,8 @@ def test_create_cooldown_allows_positive_reconciliation_without_new_events(tmp_p
     assert jira.calls.count('create') == 1 and len(slack.calls) == 1
 
 
-# Successful no-match may duplicate under indexing delay; later multiple matches fail closed.
-def test_delayed_index_duplicate_preference_and_later_hold(tmp_path, monkeypatch):
+# Successful no-match may duplicate under indexing delay; later multiple matches pick newest.
+def test_delayed_index_duplicate_preference_picks_newest(tmp_path, monkeypatch):
     runner, jira, slack = make_runner(tmp_path)
     clock = [1000.0]
     monkeypatch.setattr('lib.gap_notifications.dispatch_incidents.time.time', lambda: clock[0])
@@ -254,11 +254,12 @@ def test_delayed_index_duplicate_preference_and_later_hold(tmp_path, monkeypatch
     clock[0] += 60
     runner().run([observation()])
     assert len(jira.issues) == 2
-    before = copy.deepcopy((jira.calls, slack.calls))
+    slack_before = len(slack.calls)
     jira.find_by_summary = search
     result = runner().run([observation()])
-    assert result['outbox'][0]['state'] == 'reconciliation_required'
-    assert (jira.calls, slack.calls) == before
+    # With both visible, picks newest (RHAI-2) and succeeds; event already delivered.
+    assert result['outbox'][0]['state'] == 'confirmed'
+    assert len(slack.calls) == slack_before
 
 
 # Read failures are not no-match, and repeated events cannot bypass durable backoff.

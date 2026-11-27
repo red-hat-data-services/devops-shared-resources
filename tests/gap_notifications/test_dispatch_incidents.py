@@ -290,22 +290,13 @@ def test_known_create_key_reconciles_when_search_lags(setup):
     assert jira.calls.count("create") == 1 and len(slack.calls) == 1
 
 
-# Duplicate or competing open episodes must hold without changing Jira state or sending Slack.
-@pytest.mark.parametrize("distinct_episodes", [False, True], ids=["duplicate-episode", "distinct-open-episodes"])
-def test_ambiguous_registry_episodes_hold_without_mutation(setup, distinct_episodes):
+# Duplicate episodes must hold without changing Jira state or sending Slack.
+def test_duplicate_registry_episodes_hold_without_mutation(setup):
     runner, jira, slack = setup
     runner().run([observation()])
     jira.issues["RHAI-2"] = copy.deepcopy(jira.issues["RHAI-1"])
     jira.issues["RHAI-2"]["key"] = "RHAI-2"
     jira.properties["RHAI-2"] = copy.deepcopy(jira.properties["RHAI-1"])
-    if distinct_episodes:
-        episode = "00000000-0000-4000-8000-000000000002"
-        assert episode != jira.properties["RHAI-1"]["episode_id"]
-        jira.properties["RHAI-2"]["episode_id"] = episode
-        labels = jira.issues["RHAI-2"]["fields"]["labels"]
-        labels[:] = [label for label in labels if not label.startswith("gap-episode-")]
-        labels.append("gap-episode-" + episode.replace("-", ""))
-    # Both individual records are valid: the collection-level guard must hold.
     for key in ("RHAI-1", "RHAI-2"):
         validated_property(jira.issues[key], jira.properties[key], trial="trial")
         assert not jira.closed(key)
@@ -315,10 +306,32 @@ def test_ambiguous_registry_episodes_hold_without_mutation(setup, distinct_episo
     task = result["outbox"][0]
     assert task["state"] == "reconciliation_required"
     assert task["hold"] == "registry_or_delivery_unavailable"
-    expected = "multiple open incidents" if distinct_episodes else "duplicate registry results or episodes"
-    with pytest.raises(RegistryHold, match=expected):
+    with pytest.raises(RegistryHold, match="duplicate registry results or episodes"):
         dispatch._registry(task)
     assert (jira.calls, jira.properties) == before and len(slack.calls) == 1
+
+
+# Multiple open incidents with distinct episodes pick the newest and continue processing.
+def test_multiple_open_incidents_picks_newest(setup):
+    runner, jira, slack = setup
+    runner().run([observation()])
+    jira.issues["RHAI-2"] = copy.deepcopy(jira.issues["RHAI-1"])
+    jira.issues["RHAI-2"]["key"] = "RHAI-2"
+    jira.properties["RHAI-2"] = copy.deepcopy(jira.properties["RHAI-1"])
+    episode = "00000000-0000-4000-8000-000000000002"
+    assert episode != jira.properties["RHAI-1"]["episode_id"]
+    jira.properties["RHAI-2"]["episode_id"] = episode
+    labels = jira.issues["RHAI-2"]["fields"]["labels"]
+    labels[:] = [label for label in labels if not label.startswith("gap-episode-")]
+    labels.append("gap-episode-" + episode.replace("-", ""))
+    for key in ("RHAI-1", "RHAI-2"):
+        validated_property(jira.issues[key], jira.properties[key], trial="trial")
+        assert not jira.closed(key)
+    dispatch = runner("fresh")
+    result = dispatch.run([observation(oid="new")])
+    task = result["outbox"][0]
+    assert task["state"] == "confirmed"
+    assert task["jira_key"] == "RHAI-2"
 
 
 # A registry property from another scope must not authorize delivery.
