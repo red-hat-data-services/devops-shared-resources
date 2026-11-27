@@ -114,6 +114,10 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
         from lib.gap_notifications.notify_tools import routing_target
         target = routing_target(config.jira_environment, config.channel)
         observations = collector(filtered, environment=target.scope, leader_url=leader_url, state_url=link)
+        from lib.gap_notifications.bulk_aggregation import aggregate_bulk_build_failures
+        observations = aggregate_bulk_build_failures(
+            observations, jira_environment=target.name, channel=target.channel
+        )
         validate_observations(observations, **target.options)
         ownership = None
         if config.team_tagging:
@@ -133,7 +137,14 @@ def notify_after_publish(payload, *, accepted_urls, config=None, leader_url=None
                     environ = os.environ
                 ownership_options['github_token'] = environ.get('GH_TOKEN') or environ.get('GITHUB_TOKEN')
             ownership = OwnershipPolicy.load(ownership_fetch, **ownership_options) if observations else None
-        counts = {s: sum(o["status"] == s for o in observations) for s in ("failure", "success", "unknown")}
+        counts = {
+            s: sum(
+                o["status"] == s
+                for o in observations
+                if not (o.get("evidence") or {}).get("bulk_recovery")
+            )
+            for s in ("failure", "success", "unknown")
+        }
         if config.mode == "preview" or not observations:
             result = {"status": "preview" if config.mode == "preview" else "no-observations", "counts": counts}
         else:
