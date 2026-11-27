@@ -375,7 +375,7 @@ class JiraNotifierTests(unittest.TestCase):
         self.assertEqual(session.calls[0][0], "post")
         self.assertEqual(session.calls[0][1], f"{STAGING_JIRA_ORIGIN}/rest/api/3/search/jql")
         self.assertEqual(session.calls[0][2]["json"], {
-            "jql": 'project = RHAI AND labels = "gap-staging" ORDER BY key ASC',
+            "jql": 'project = RHAI AND labels = "gap-staging" AND statusCategory != "Done" ORDER BY key ASC',
             "fields": ["summary", "description", "labels", "status", "project", "issuetype"],
             "maxResults": 50,
         })
@@ -400,7 +400,7 @@ class JiraNotifierTests(unittest.TestCase):
         self.assertEqual(result, [first, second])
         self.assertEqual(session.calls[0][0], "post")
         self.assertEqual(session.calls[0][1], f"{STAGING_JIRA_ORIGIN}/rest/api/3/search/jql")
-        self.assertEqual(session.calls[0][2]["json"]["jql"], 'project = RHAI AND labels = "gap-staging" ORDER BY key ASC')
+        self.assertEqual(session.calls[0][2]["json"]["jql"], 'project = RHAI AND labels = "gap-staging" AND statusCategory != "Done" ORDER BY key ASC')
         self.assertEqual(session.calls[0][2]["json"]["fields"], ["summary", "description", "labels", "status", "project", "issuetype"])
         self.assertEqual(session.calls[0][2]["json"]["maxResults"], 50)
         self.assertNotIn("nextPageToken", session.calls[0][2]["json"])
@@ -416,7 +416,7 @@ class JiraNotifierTests(unittest.TestCase):
                 notifier.find_by_label("gap-staging")
             self.assertIs(raised.exception, error)
             search.assert_called_once_with(
-                'project = RHAI AND labels = "gap-staging" ORDER BY key ASC',
+                'project = RHAI AND labels = "gap-staging" AND statusCategory != "Done" ORDER BY key ASC',
                 fields=["summary", "description", "labels", "status", "project", "issuetype"])
         self.assertEqual(session.calls, [])
 
