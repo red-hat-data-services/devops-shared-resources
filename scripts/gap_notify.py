@@ -43,6 +43,8 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
     parser.add_argument("--issue-type", default="Bug", choices=["Bug", "10016"])
     parser.add_argument("--channel", help="Matching assertion of GAP_SLACK_CHANNEL, never a routing override")
     parser.add_argument("--transition-id", help="Explicit verified transition to done for the selected Jira environment")
+    parser.add_argument("--team-tagging", choices=("enabled", "disabled"), default="disabled",
+                        help="Load ownership mappings and tag Jira components plus Slack teams")
     parser.add_argument("--transition-fields", default="{}", help="JSON fields required for closure")
     parser.add_argument("--resolve-receipt", help="JSON file containing task_id and operator-attested receipt/reason")
     args = parser.parse_args(argv)
@@ -120,8 +122,17 @@ def main(argv=None, *, environ=None, jira_factory=None, slack_factory=None, stdo
                 slack_factory = SlackNotifier
             jira = jira_factory(destination.url, "RHAI", args.issue_type, email, token, **destination.options)
             slack = slack_factory(slack_token, channel)
+            ownership = None
+            if args.team_tagging == "enabled":
+                from lib.gap_notifications.ownership import OwnershipPolicy
+                ownership = OwnershipPolicy.load(
+                    None,
+                    ca_bundle=env.get("GAP_OWNERSHIP_CA_BUNDLE"),
+                    github_token=env.get("GH_TOKEN") or env.get("GITHUB_TOKEN"),
+                )
             result = Dispatcher(ledger, jira, slack, transition_id=args.transition_id,
-                                transition_fields=fields, trial_id=args.trial_id, **route.options).run(observations, receipt=receipt)
+                                transition_fields=fields, trial_id=args.trial_id,
+                                ownership=ownership, **route.options).run(observations, receipt=receipt)
             summary = {"dry_run": False, "registry_version": 2,
                        "incidents": len({t["incident_key"] for t in result.get("outbox", [])}),
                        "deliveries": [{"id": t["id"], "system": t["system"], "state": t["state"],

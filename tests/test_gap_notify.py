@@ -260,3 +260,41 @@ def test_cli_requires_configured_destination(env):
         raise AssertionError("invalid configuration must not construct clients")
     assert main(["--observations", "/nonexistent", "--ledger", "/nonexistent-journal"],
                 environ=env, jira_factory=forbidden, slack_factory=forbidden, stdout=io.StringIO()) == 1
+
+
+def test_team_tagging_cli_loads_ownership_and_tags_guardian_and_component_team(tmp_path, monkeypatch):
+    from gap_notification_fakes import Jira, Slack
+    from lib.gap_notifications.ownership import OwnershipPolicy
+
+    policy = OwnershipPolicy(
+        {"mappings": {"api": ["API"]}},
+        {"components": {"default": {"slack_team_handle": "api-team"}}},
+    )
+    monkeypatch.setattr(
+        OwnershipPolicy,
+        "load",
+        classmethod(lambda cls, *args, **kwargs: policy),
+    )
+    jira, slack = Jira(), Slack()
+    env = {
+        "GAP_SLACK_CHANNEL": "C0883L8FARE",
+        "JIRA_USER_EMAIL": "fixture",
+        "JIRA_API_TOKEN": "fake",
+        "SLACK_TOKEN": "fake",
+        "GH_TOKEN": "fake-github-token",
+    }
+    values = args(tmp_path, [observation(component="api")]) + ["--write", "--team-tagging", "enabled"]
+    assert main(
+        values,
+        environ=env,
+        jira_factory=lambda *a, **kw: jira,
+        slack_factory=lambda *a, **kw: slack,
+        stdout=io.StringIO(),
+    ) == 0
+    assert jira.issues["RHAI-1"]["fields"]["components"] == [{"name": "API"}]
+    block_text = "\n".join(
+        block["text"]["text"] for block in slack.calls[0][1]["blocks"]
+        if block["type"] == "section"
+    )
+    assert "*Build guardian:* `@openshift-ai-devops-build-guardian`" in block_text
+    assert "*Owning team:* `@api-team`" in block_text
