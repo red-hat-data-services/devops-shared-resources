@@ -139,7 +139,7 @@ class SlackClient:
         try:
             sdk.chat_postMessage(
                 channel=channel, text=text, thread_ts=thread_ts,
-                client_msg_id=client_msg_id, unfurl_links=False, unfurl_media=False,
+                client_msg_id=client_msg_id, unfurl_links=False, unfurl_media=False, link_names=True,
                 **({"blocks": blocks} if blocks is not None else {}),
             )
         except Exception:

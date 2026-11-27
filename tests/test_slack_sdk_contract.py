@@ -63,7 +63,7 @@ def test_real_sdk_post_message_request_and_receipt(monkeypatch):
     session = session_for({"ok": True, "channel": "C123", "ts": "1.2"})
     client = SlackClient("dummy-token", session=session, timeout=7)
     assert client.post_message("C123", "hello", thread_ts="1.1", client_msg_id="d7a85bb7-329a-49fd-9a16-e03c53b80656") == {"channel": "C123", "ts": "1.2"}
-    expected = {"channel": "C123", "text": "hello", "thread_ts": "1.1", "client_msg_id": "d7a85bb7-329a-49fd-9a16-e03c53b80656", "unfurl_links": False, "unfurl_media": False}
+    expected = {"channel": "C123", "text": "hello", "thread_ts": "1.1", "client_msg_id": "d7a85bb7-329a-49fd-9a16-e03c53b80656", "unfurl_links": False, "unfurl_media": False, "link_names": True}
     assert called == [expected]
     session.post.assert_called_once()
     args, kwargs = session.post.call_args

@@ -157,11 +157,18 @@ class OwnershipPolicy:
                 if len(summary) + len(component) + 2 <= 3000:
                     summary, body = summary + "\n" + component, remaining
             # Full-width sections avoid long names squeezing the ownership label.
-            # Explicit newlines also separate sections when their text is copied.
+            # Explicit newlines also separate sections when copied.
             blocks.append({"type": "section", "text": {
                 "type": "mrkdwn", "text": (summary or fallback) + "\n", "verbatim": True}})
+            guardian_line = None
+            if body.startswith("*Build guardian:* "):
+                guardian_line, _, body = body.partition("\n")
+            # Automatic parsing is enabled only in this dedicated, validated-mention
+            # block. Slack's per-block verbatim setting otherwise suppresses
+            # link_names resolution for @handle text.
+            mention_text = "\n".join(line for line in (guardian_line, owner_text) if line)
             blocks.append({"type": "section", "text": {
-                "type": "mrkdwn", "text": owner_text + "\n", "verbatim": True}})
+                "type": "mrkdwn", "text": mention_text + "\n", "verbatim": False}})
             text = body
         blocks.extend({"type": "section", "text": {
             "type": "mrkdwn", "text": text[i:i + 3000], "verbatim": True}}

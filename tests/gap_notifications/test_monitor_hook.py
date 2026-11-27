@@ -146,6 +146,26 @@ def test_creation_fields_and_existing_ownership_unchanged(hook):
     invoke, jira, slack, _, _ = hook
     assert invoke()['status'] == 'settled'
     assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'API'}, {'name': 'Serving'}]
+    block_text = "\n".join(
+        block["text"]["text"] for block in slack.calls[0][1]["blocks"]
+        if block["type"] == "section"
+    )
+    assert "*Build guardian:* @openshift-ai-devops-build-guardian" in block_text
+    assert "*Owning team:* @devops" in block_text
+    mention_blocks = [
+        block for block in slack.calls[0][1]["blocks"]
+        if block["type"] == "section"
+        and "*Build guardian:*" in block["text"]["text"]
+    ]
+    assert len(mention_blocks) == 1
+    assert mention_blocks[0]["text"]["verbatim"] is False
+    assert "*Owning team:* @devops" in mention_blocks[0]["text"]["text"]
+    assert all(
+        block["text"]["verbatim"] is True
+        for block in slack.calls[0][1]["blocks"]
+        if block["type"] == "section"
+        and "*Build guardian:*" not in block["text"]["text"]
+    )
     jira.issues['RHAI-1']['fields']['components'] = [{'name': 'Manual'}]
     invoke()
     assert jira.issues['RHAI-1']['fields']['components'] == [{'name': 'Manual'}]

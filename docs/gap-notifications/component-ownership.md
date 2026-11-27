@@ -33,26 +33,30 @@ Metadata, task-routing, and suppression keys are ignored. Missing
 components (including repository-scoped conflict/feasibility incidents) use
 `_default`, or DevOps when absent.
 
-Slack uses `components.<name>.slack_team_handle`, falling back to
+Slack always mentions `@openshift-ai-devops-build-guardian` on root failure
+notifications. It also tags the mapped component team using
+`components.<name>.slack_team_handle`, falling back to
 `components.default.slack_team_handle` for absent/unknown components or missing
 handles, including explicit `unknown` handles. `slack_team_channel` is ignored: explicit notification channel routing
 is unchanged. Root failures use a single-column layout: failure summary/component,
-then **Owning team:** `@mapped-handle` on its own full-width line, followed by
+then **Owning team:** @mapped-handle on its own full-width line, followed by
 repository and failure details. Explicit line endings keep these sections
-separate when copied. The handle is display-only inline code, and all sections
-use `verbatim: true`; no ownership mention parsing is enabled.
+separate when copied. Handles are emitted as plain `@handle` text in one dedicated block with
+`verbatim: false`; `chat.postMessage` is called with `link_names: true`, so
+Slack resolves and notifies the named user groups. All non-mention sections
+remain `verbatim: true`.
 A compact context footer links directly to the Slack-team and Jira-component
 mapping YAML files on GitLab, so readers can find where ownership is maintained.
 Replies and recovery do not add this ownership/footer layout or re-ping teams.
 All section text respects Slack's 3000-character limit, with oversized summary
 text retained in the body. Two-column fields are avoided so long component
 names do not squeeze or run into the ownership label.
-Top-level text is unchanged fallback text; global `link_names` parsing is not enabled.
-Reserved broadcast handles (`here`, `channel`, `everyone`) and malformed handles
-are rejected before delivery. No usergroup lookup API or `usergroups:read` scope
-is required; the bot retains its existing message-posting permissions. Slack-side
-handle existence is not verified by offline tests. Ownership is currently
-informational only, not a team ping, for roots as well as replies and recovery.
+Top-level fallback text is unchanged. Reserved broadcast handles (`here`,
+`channel`, `everyone`) and malformed handles are rejected before delivery. No
+usergroup lookup API or `usergroups:read` scope is required; `link_names: true`
+lets Slack resolve the validated group handles while posting. Slack-side handle
+existence is not verified by offline tests. Root failures notify the build
+guardian and mapped component team; replies and recovery do not re-ping teams.
 Existing replay suppression is unchanged. Runner Python HTTPS trust/access to
 internal GitLab is assumed; no CA provisioning or trust-store changes are made.
 TLS verification and the optional CA override remain in place. Tests inject

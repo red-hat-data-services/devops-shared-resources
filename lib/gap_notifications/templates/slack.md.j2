@@ -1,13 +1,20 @@
 {% if status == 'success' %}
-🟢 *GAP · Recovery observed*
+🟢 *Promotion Gates · Recovery observed*
+{% elif category == 'build' %}
+🔴 *Promotion Gates · Build Failure*
+{% elif category == 'feasibility' %}
+🔴 *Promotion Gates · Merge-Feasibility Failure*
 {% else %}
-🔴 *GAP · Promotion gate failure*
+🔴 *Promotion Gates · Merge-Conflict Failure*
 {% endif %}
 {% if category == 'build' %}
 *Component:* `{{ component }}`
 {% endif %}
+{% if status == 'failure' and not reply %}
+*Build guardian:* @{{ build_guardian | default('openshift-ai-devops-build-guardian') }}
+{% endif %}
 {% if owning_team %}
-*Owning team:* `@{{ owning_team }}`
+*Owning team:* @{{ owning_team }}
 {% endif %}
 {% if not reply %}
 *Repository:* `{{ repository }}`
